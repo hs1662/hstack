@@ -5,16 +5,18 @@ import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
-import { GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
+import { analyzeField } from "../scripts/analyzer.mjs";
+import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
 import { classifyCommand, readFactLedger, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
-import { resolveSessionStatePath } from "../scripts/governance/handoff-store.mjs";
+import { resolveSessionStatePath, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
+import { readTranscriptSteps } from "../scripts/hook-io.mjs";
 import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
 import { handleStop } from "../scripts/stop.mjs";
-import { GATE_STOP_MARKER } from "../scripts/transcript.mjs";
-import { createTempDir, toJsonl, withCpuLock } from "./helpers.mjs";
+import { GATE_STOP_MARKER, buildCorrectionMessage, decideHookAction } from "../scripts/transcript.mjs";
+import { createTempDir, toJsonl, withCpuLock, wrapAntigravityHookMessage } from "./helpers.mjs";
 
 for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) delete process.env[key];
 const DATA_DIR = createTempDir("hstack-p10-data-");
@@ -442,5 +444,110 @@ describe("H3 sequential pipefail state tracking", () => {
 
     const good = runPipeGate("set -o pipefail && npm test | head -3");
     assert.equal(good.verdict, "PASS", good.blockedRules.join(","));
+  });
+});
+
+describe("H4 long-session Korean thinking anchor and error-step cooldown recovery", () => {
+  it("re-anchors Korean thinking once per turn on high-context main sessions even when autonomyMode is off", () => {
+    const dir = createTempDir("hstack-p10-h4-anchor-");
+    const makeTranscript = (name, tokens) => {
+      const tp = join(dir, name);
+      writeFileSync(
+        tp,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "초기 요청" },
+          {
+            step_index: 1,
+            type: "PLANNER_RESPONSE",
+            thinking: "한국어로 상태를 확인합니다.",
+            usage: tokens,
+          },
+          { step_index: 2, type: "USER_INPUT", content: "이어서 계속 진행해 줘" },
+        ]),
+      );
+      return tp;
+    };
+
+    const highTp = makeTranscript("high.jsonl", { input_tokens: 5000, cache_read_tokens: 130000, output_tokens: 200 });
+    const first = handlePreInvocation(
+      JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: "p10-h4-high", cwd: dir, transcriptPath: highTp, lastUserInput: "이어서 계속 진행해 줘" }),
+      { dataDir: dir, skipAuditLog: true, governanceConfig: { autonomyMode: "off" } },
+    );
+    assert.equal(first.injectSteps?.length, 1, JSON.stringify(first));
+    const anchorMsg = first.injectSteps[0].systemMessage.systemMessage;
+    assert.ok(anchorMsg.includes("이 추론과 생각 요약은 반드시 한국어로만 작성한다."), anchorMsg);
+    assert.equal(analyzeField("content", anchorMsg).status, "korean", anchorMsg);
+
+    const dup = handlePreInvocation(
+      JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: "p10-h4-high", cwd: dir, transcriptPath: highTp, lastUserInput: "이어서 계속 진행해 줘" }),
+      { dataDir: dir, skipAuditLog: true, governanceConfig: { autonomyMode: "off" } },
+    );
+    assert.deepEqual(dup, {});
+
+    const lowTp = makeTranscript("low.jsonl", { input_tokens: 1000, cache_read_tokens: 2000, output_tokens: 100 });
+    updateSessionPollutionState({
+      conversationId: "p10-h4-alert",
+      turnStartStepIndex: 2,
+      inputTokens: 130000,
+      failedExecutionsInTurn: 0,
+      maxSingleFileEdits: 0,
+      dataDir: dir,
+    });
+    const alertTriggered = handlePreInvocation(
+      JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: "p10-h4-alert", cwd: dir, transcriptPath: lowTp, lastUserInput: "이어서 계속 진행해 줘" }),
+      { dataDir: dir, skipAuditLog: true, governanceConfig: { autonomyMode: "off" } },
+    );
+    assert.equal(alertTriggered.injectSteps?.length, 1);
+
+    const lowOnly = handlePreInvocation(
+      JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: "p10-h4-low", cwd: dir, transcriptPath: lowTp, lastUserInput: "이어서 계속 진행해 줘" }),
+      { dataDir: dir, skipAuditLog: true, governanceConfig: { autonomyMode: "smart" } },
+    );
+    assert.deepEqual(lowOnly, {});
+
+    for (const [idx, marker] of [AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER].entries()) {
+      const subTp = join(dir, `sub-${idx}.jsonl`);
+      writeFileSync(
+        subTp,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: `검토해 줘\n${marker}\n작업 경로: \`${dir}\`\n세션 기록 경로: \`/x\`` },
+          { step_index: 1, type: "PLANNER_RESPONSE", thinking: "검토 시작", usage: { input_tokens: 150000, cache_read_tokens: 50000 } },
+          { step_index: 2, type: "USER_INPUT", content: "계속" },
+        ]),
+      );
+      const subOut = handlePreInvocation(
+        JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: `p10-h4-sub-${idx}`, cwd: dir, transcriptPath: subTp, lastUserInput: "계속" }),
+        { dataDir: dir, skipAuditLog: true, governanceConfig: { autonomyMode: "smart" } },
+      );
+      assert.deepEqual(subOut, {});
+    }
+  });
+
+  it("does not let an empty ERROR_MESSAGE step consume PostInvocation thinking cooldown", () => {
+    const dir = createTempDir("hstack-p10-h4-err-");
+    const tp = join(dir, "err-cooldown.jsonl");
+    const englishThinking = "Test execution completed cleanly and I will summarize the verified code path in detail.";
+    writeFileSync(
+      tp,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "계속해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", thinking: englishThinking, tool_calls: [{ name: "read_file", args: { Path: "a.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "SYSTEM_MESSAGE", source: "SYSTEM_SDK", content: wrapAntigravityHookMessage(buildCorrectionMessage(["thinking"])) },
+        { step_index: 4, type: "PLANNER_RESPONSE", thinking: englishThinking, content: "" },
+        {
+          step_index: 5,
+          type: "ERROR_MESSAGE",
+          source: "SYSTEM",
+          content: "Error: model output error: model output must contain either output text or tool calls, these cannot both be empty, please try again",
+        },
+        { step_index: 6, type: "PLANNER_RESPONSE", thinking: englishThinking, tool_calls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+      ]),
+    );
+    const steps = readTranscriptSteps(tp);
+    const decision = decideHookAction(steps);
+    assert.equal(decision.action, "inject", JSON.stringify(decision));
+    assert.deepEqual(decision.driftedFields, ["thinking"]);
+    assert.equal(decision.stepIndex, 6);
   });
 });
