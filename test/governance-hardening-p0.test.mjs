@@ -14,7 +14,7 @@ import {
   WORKER_SESSION_MARKER,
 } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
-import { readFactLedger } from "../scripts/governance/fact-ledger.mjs";
+import { classifyCommand, readFactLedger } from "../scripts/governance/fact-ledger.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
 import { handleStop } from "../scripts/stop.mjs";
@@ -346,5 +346,93 @@ describe("#4 run_command file edits reach the Stop evidence gate", () => {
     writeFileSync(join(repo, "src", "old.mjs"), "export const old = 2;\n");
     writeFileSync(join(repo, "src", "untracked.mjs"), "export const u = 1;\n");
     assert.deepEqual(turn(repo, "conv-p0-ro", "git status && cat app.mjs"), {});
+  });
+});
+
+// An inline interpreter body is code the classifier never reads: `bash -c "sed -i …"` must not pass as a test run
+// or slip past the read-only auditor and challenger roles. A shell `-c` body is shell, so it keeps its
+// verification kind only when the same rules classify the body itself as verification.
+describe("v0.1.2 inline interpreter bodies are not verification unless the body is", () => {
+  it("classifies inline interpreter commands as other", () => {
+    for (const cmd of [
+      'bash -c "sed -i s/a/b/ app.mjs"',
+      "sh -c 'echo x > app.mjs'",
+      'bash -lc "rm -rf src"',
+      'bash -o pipefail -c "sed -i s/a/b/ app.mjs"',
+      'env FOO=1 bash -c "sed -i s/a/b/ app.mjs"',
+      'bash -c "ls"',
+      'bash -c "npm test || true"',
+      'bash -c',
+      `node -e "require('fs').writeFileSync('app.mjs', '')"`,
+      "node --eval=process.exit(0)",
+      "node -p 1",
+      `python -c "open('app.mjs', 'w')"`,
+      'python3 -Bc "print(1)"',
+      'python -W ignore -c "print(1)"',
+      'deno eval "Deno.writeTextFileSync(\'a\', \'\')"',
+      'bun -e "1"',
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+  });
+
+  it("keeps real test runs, including a shell -c body that is a test run, as verification", () => {
+    for (const cmd of [
+      'bash -c "npm test"',
+      "sh -c 'node --test'",
+      'bash -lc "npm run test && npm run lint"',
+      "bash scripts/test.sh",
+      "node --test",
+      "node test/run.mjs",
+      "python -m pytest",
+      "python -m pytest -c pytest.ini",
+      "python3 tests/run.py",
+    ]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+  });
+
+  it("denies an inline-interpreter write from auditor and challenger sessions and still allows their test runs", () => {
+    const repo = makeRepo();
+    const mainPath = writeTranscript(repo, "main.jsonl", [{ step_index: 0, type: "USER_INPUT", content: "검토해 줘" }]);
+    for (const TypeName of [AUDITOR_AGENT_NAME, CHALLENGER_AGENT_NAME]) {
+      const injected = preTool(repo, mainPath, { name: "invoke_subagent", args: { TypeName, Prompt: "검토" } }).overwrite.Prompt;
+      const subPath = writeTranscript(repo, `${TypeName}-inline.jsonl`, [{ step_index: 0, type: "USER_INPUT", content: injected }]);
+      for (const CommandLine of ['bash -c "sed -i s/1/2/ app.mjs"', `node -e "require('fs').writeFileSync('app.mjs', '')"`]) {
+        const out = preTool(repo, subPath, { name: "run_command", args: { CommandLine } }, OFF);
+        assert.equal(out.decision, "deny", `${TypeName} ${CommandLine}`);
+      }
+      assert.equal(preTool(repo, subPath, { name: "run_command", args: { CommandLine: 'bash -c "npm test"' } }, OFF).decision, "allow");
+    }
+  });
+
+  it("never counts an inline interpreter run as the post-write verification", () => {
+    const dir = createTempDir("hstack-p0-inline-");
+    const recs = [
+      { step_index: 0, type: "USER_INPUT", content: "구현해 줘" },
+      { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/src/a.mjs" } }] },
+      { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: 'node -e "process.exit(0)"' } }] },
+      { step_index: 4, type: "GENERIC", status: "DONE", content: "ok" },
+    ];
+    const ledger = readFactLedger(writeTranscript(dir, "inline.jsonl", recs), "/repo", "/repo");
+    assert.equal(ledger.turnExecutions[0].kind, "other");
+    const r = decideGate(
+      {
+        modified_files: ["src/a.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: 'node -e "process.exit(0)"', outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "",
+      },
+      {
+        cwd: "/repo",
+        ledger,
+        gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+        testInfra: { hasTestSuite: true },
+        auditEscalation: "off",
+      },
+    );
+    assert.equal(r.verdict, "REJECT", JSON.stringify(r.blockedRules));
   });
 });

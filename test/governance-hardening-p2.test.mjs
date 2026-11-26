@@ -5,6 +5,14 @@ import { closeSync, mkdirSync, openSync, readFileSync, writeFileSync, writeSync 
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
+import {
+  AUDITOR_AGENT_NAME,
+  AUTO_CHALLENGER_MARKER,
+  AUTO_HANDOFF_MARKER,
+  CHALLENGER_AGENT_NAME,
+  GATE_TOOL_NAME,
+  WORKER_AGENT_NAME,
+} from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
 import * as factLedger from "../scripts/governance/fact-ledger.mjs";
 import { readFactLedger } from "../scripts/governance/fact-ledger.mjs";
@@ -13,7 +21,8 @@ import { isSensitiveFilePath } from "../scripts/governance/risk-classifier.mjs";
 import * as hookIo from "../scripts/hook-io.mjs";
 import { readTranscriptSteps } from "../scripts/hook-io.mjs";
 import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
-import { decideHookAction, parseTranscriptJsonl } from "../scripts/transcript.mjs";
+import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
+import { GATE_STOP_MARKER, decideHookAction, parseTranscriptJsonl } from "../scripts/transcript.mjs";
 import { deniedToolCallIndexes } from "../scripts/transcript/steps.mjs";
 import { HOOK_SCRIPT, PLUGIN_ROOT, STOP_HOOK_SCRIPT, createTempDir, runHookSubprocess, toJsonl, withCpuLock } from "./helpers.mjs";
 
@@ -340,5 +349,193 @@ describe("version 0.1.2", () => {
     assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, "plugin.json"), "utf8")).version, "0.1.2");
     const init = createMcpServerHandler({ dataDir: createTempDir("hstack-p2-ver-") })({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
     assert.equal(init.result.serverInfo.version, "0.1.2");
+  });
+});
+
+// Seeded multi-turn transcripts that exercise every turn-scoped ledger field, plus the session-wide ones the
+// head and tail scans must recover: header role (auditor/challenger/worker prompts), tokens from an earlier
+// turn, and records with no step index (their fallback index needs the whole file, so the scan reads it all).
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function rolePrompts() {
+  const dir = createTempDir("hstack-p2-roles-");
+  const mainPath = join(dir, "main.jsonl");
+  writeFileSync(mainPath, toJsonl([{ step_index: 0, type: "USER_INPUT", content: "검토해 줘" }]), "utf8");
+  const inject = (TypeName) =>
+    handlePreToolGate(
+      JSON.stringify({ hookEventName: "PreToolUse", conversationId: "p2-roles", cwd: "/repo", transcriptPath: mainPath, toolCall: { name: "invoke_subagent", args: { TypeName, Prompt: "검토" } } }),
+      { dataDir: dir, skipAuditLog: true },
+    ).overwrite.Prompt;
+  return [inject(AUDITOR_AGENT_NAME), inject(CHALLENGER_AGENT_NAME), inject(WORKER_AGENT_NAME)];
+}
+
+function generateSession(rand, prompts, { unindexed = false } = {}) {
+  const pick = (items) => items[Math.floor(rand() * items.length)];
+  const records = [];
+  let step = 0;
+  const push = (record) => {
+    records.push(unindexed && rand() < 0.05 ? record : { step_index: step, ...record });
+    step += 1;
+  };
+  const uid = () => `${Math.floor(rand() * 0xffffffff).toString(16).padStart(8, "0")}-1111-2222-3333-444444444444`;
+  const header = rand() < 0.4 ? pick(prompts) : "기능을 구현해 줘";
+  push({ type: "USER_INPUT", content: header });
+  if (rand() < 0.3) {
+    push({ type: "SYSTEM_MESSAGE", content: rand() < 0.5 ? pick(prompts) : "세션 시작" });
+  }
+  const turns = 1 + Math.floor(rand() * 6);
+  for (let turn = 0; turn < turns; turn += 1) {
+    if (turn > 0) {
+      push({ type: "USER_INPUT", content: pick(["계속해 줘", "/hstack-preflight 검토", "고쳐 줘", pick(prompts)]) });
+    }
+    const pendingAsync = [];
+    const actions = 1 + Math.floor(rand() * 10);
+    for (let a = 0; a < actions; a += 1) {
+      const usage = rand() < 0.3 ? { usage: { input_tokens: Math.floor(rand() * 1e5), output_tokens: 7 } } : {};
+      const kind = pick(["edit", "edit", "deny", "exec", "exec", "gate", "audit", "audit_async", "worker", "challenge", "vote", "sys", "read", "decoy"]);
+      const file = `/repo/src/m${Math.floor(rand() * 5)}.mjs`;
+      if (kind === "edit" || kind === "deny") {
+        push({ type: "PLANNER_RESPONSE", content: "수정", ...usage, tool_calls: [{ name: pick(["edit_file", "write_file"]), args: { Path: file } }] });
+        if (kind === "deny") {
+          push({ type: "GENERIC", status: "ERROR", error: "tool call denied by pre-tool hook", content: "tool call denied by pre-tool hook: 서킷브레이커 발동" });
+        } else {
+          push({ type: "GENERIC", status: pick(["DONE", "DONE", "ERROR"]), content: "ok" });
+        }
+      } else if (kind === "exec") {
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: "run_command", args: { CommandLine: pick(["node --test", "npm test", "ls", "sed -i s/a/b/ x.mjs", "npm test || true"]) } }] });
+        push({ type: "GENERIC", status: "DONE", content: pick(["ℹ pass 3\nℹ fail 0", "ℹ pass 1\nℹ fail 2", "AssertionError: boom", "ok"]) });
+      } else if (kind === "gate") {
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: GATE_TOOL_NAME, args: {} }] });
+        push({ type: "GENERIC", status: "DONE", content: pick(["[완료 검증 통과]", "[검증 반려] R1"]) });
+      } else if (kind === "audit" || kind === "challenge") {
+        const TypeName = kind === "audit" ? AUDITOR_AGENT_NAME : CHALLENGER_AGENT_NAME;
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: "invoke_subagent", args: { TypeName, Prompt: rand() < 0.5 ? "[hstack:자동사전검토] 검토" : "감사" } }] });
+        push({ type: "GENERIC", status: "DONE", content: pick(["결함 없음\n[감사 판정: 통과]", "[사전검토 판정: PROCEED]", "[감사 판정: 기각]"]) });
+      } else if (kind === "audit_async" || kind === "worker") {
+        const id = uid();
+        const TypeName = kind === "worker" ? WORKER_AGENT_NAME : pick([AUDITOR_AGENT_NAME, CHALLENGER_AGENT_NAME]);
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: "invoke_subagent", args: { TypeName, Prompt: "작업" } }] });
+        push({ type: "GENERIC", status: "DONE", content: `Subagent launched with conversationId: ${id}` });
+        pendingAsync.push(id);
+      } else if (kind === "vote") {
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: "ask_question", args: {} }] });
+        push({ type: "GENERIC", status: "DONE", content: "A1: 진행" });
+      } else if (kind === "sys") {
+        const id = pendingAsync.length > 0 && rand() < 0.7 ? pendingAsync.shift() : uid();
+        push({
+          type: "SYSTEM_MESSAGE",
+          content: pick([
+            `${GATE_STOP_MARKER} 검증 먼저`,
+            `${AUTO_CHALLENGER_MARKER} 사전검토`,
+            `${AUTO_HANDOFF_MARKER} 위임`,
+            `[Message] sender=${id} content=결함 없음\n[감사 판정: 통과]`,
+            `[Message] sender=${id} content=[사전검토 판정: RETHINK]`,
+          ]),
+        });
+      } else if (kind === "read") {
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: "read_file", args: { Path: file } }] });
+        push({ type: "GENERIC", status: "DONE", content: "export const x = 1;" });
+      } else {
+        // Tool output that quotes a transcript: the tail scan must not take it for a turn start.
+        push({ type: "PLANNER_RESPONSE", ...usage, tool_calls: [{ name: "run_command", args: { CommandLine: "cat t.jsonl" } }] });
+        push({ type: "GENERIC", status: "DONE", content: '{"step_index":9,"type":"USER_INPUT","content":"가짜"}\n"type":"USER_INPUT"' });
+        if (rand() < 0.3) {
+          records.push({ content: "x", type: "USER_INPUT_NOTE", note: '"type":"USER_INPUT"' });
+        }
+      }
+    }
+    if (rand() < 0.5) {
+      push({ type: "PLANNER_RESPONSE", content: pick(["완료했습니다.", "All done, tests pass."]) });
+    }
+  }
+  return records;
+}
+
+const withoutReadFiles = (ledger) => ({ ...ledger, sessionReadFiles: null });
+
+describe("#7 head and tail scans read only the header and the current turn of a long session", () => {
+  it("matches the full scan on generated multi-turn sessions in every field but the session-wide read set", () => {
+    const prompts = rolePrompts();
+    const dir = createTempDir("hstack-p2-prop-");
+    const rand = mulberry32(0x5eed);
+    let partialRoles = 0;
+    for (let i = 0; i < 300; i += 1) {
+      const path = join(dir, `s${i}.jsonl`);
+      writeFileSync(path, toJsonl(generateSession(rand, prompts, { unindexed: i % 10 === 9 })), "utf8");
+      const full = readFactLedger(path, "/repo", "/repo");
+      const partial = factLedger.readTurnLedger(path, "/repo", "/repo", { partialMinBytes: 0 });
+      assert.deepEqual(withoutReadFiles(partial), withoutReadFiles(full), `session ${i}`);
+      for (const p of partial.sessionReadFiles) {
+        assert.ok(full.sessionReadFiles.has(p), `session ${i} read ${p}`);
+      }
+      assert.equal(factLedger.readSessionRole(path), full.sessionRole, `session ${i} role`);
+      // Small files never take the partial path, so their ledger is the full one, read set included.
+      assert.deepEqual(factLedger.readTurnLedger(path, "/repo", "/repo"), full, `session ${i} small`);
+      partialRoles += full.sessionRole === "main" ? 0 : 1;
+    }
+    assert.ok(partialRoles > 50, `${partialRoles} sessions carry a governance role`);
+  });
+
+  it("reads a 100-turn ~26MB session's ledger in well under the full-scan time", () => {
+    const dir = createTempDir("hstack-p2-multi-");
+    const path = join(dir, "transcript_full.jsonl");
+    const fd = openSync(path, "w");
+    let step = 0;
+    let buf = "";
+    for (let turn = 0; turn < 100; turn += 1) {
+      buf += `${JSON.stringify({ step_index: step++, type: "USER_INPUT", content: `수정해 줘 ${turn}` })}\n`;
+      for (let k = 0; k < 200; k += 1) {
+        buf += `${JSON.stringify({ step_index: step++, type: "PLANNER_RESPONSE", content: KOREAN_PROSE, tool_calls: [{ name: "edit_file", args: { Path: `/repo/f${k}.mjs`, CodeContent: "x".repeat(285) } }] })}\n`;
+        buf += `${JSON.stringify({ step_index: step++, type: "GENERIC", status: "DONE", content: "ok ".repeat(100) })}\n`;
+      }
+      writeSync(fd, buf);
+      buf = "";
+    }
+    closeSync(fd);
+    assert.ok(readFileSync(path).length > 20 * 1024 * 1024);
+    withCpuLock(() => {
+      const samples = [];
+      let ledger;
+      for (let i = 0; i < 3; i += 1) {
+        const t0 = performance.now();
+        ({ ledger } = factLedger.readFactLedgerAndSteps(path, "/repo", "/repo"));
+        samples.push(performance.now() - t0);
+      }
+      assert.equal(ledger.turnStartStepIndex, 99 * 401);
+      assert.equal(ledger.turnWrittenFiles.size, 200);
+      assert.ok(Math.min(...samples) < 100, `readFactLedgerAndSteps fastest ${Math.min(...samples).toFixed(0)}ms (>= 100ms)`);
+    });
+  });
+
+  it("settles a run_command's session role from the header of a ~26MB transcript", () => {
+    const dir = createTempDir("hstack-p2-rc-");
+    const [auditorPrompt] = rolePrompts();
+    const path = join(dir, "transcript_full.jsonl");
+    writeLongSession(path, join(dir, "repo"), 20_000);
+    const body = readFileSync(path, "utf8").split("\n").slice(1).join("\n");
+    writeFileSync(path, `${JSON.stringify({ step_index: 0, type: "USER_INPUT", content: auditorPrompt })}\n${body}`, "utf8");
+    const call = (CommandLine) =>
+      handlePreToolGate(
+        JSON.stringify({ hookEventName: "PreToolUse", conversationId: "p2-rc", cwd: "/repo", transcriptPath: path, toolCall: { name: "run_command", args: { CommandLine } } }),
+        { dataDir: dir, skipAuditLog: true, governanceConfig: { autonomyMode: "off" } },
+      );
+    withCpuLock(() => {
+      const samples = [];
+      for (let i = 0; i < 3; i += 1) {
+        const t0 = performance.now();
+        assert.equal(call("sed -i s/a/b/ app.mjs").decision, "deny");
+        samples.push(performance.now() - t0);
+      }
+      assert.equal(call("node --test").decision, "allow");
+      assert.ok(Math.min(...samples) < 50, `run_command gate fastest ${Math.min(...samples).toFixed(0)}ms (>= 50ms)`);
+    });
   });
 });
