@@ -648,7 +648,7 @@ export function decideGate(input = {}, context = {}) {
         if (!later.passed) {
           continue;
         }
-        if (isExecutionResolvedBy(exec, later, cwd)) {
+        if (isExecutionResolvedBy(exec, later, cwd || gitRoot)) {
           resolvedByLaterPass = true;
           break;
         }
