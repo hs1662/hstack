@@ -585,6 +585,35 @@ describe("audit-report parser and aggregator", () => {
     assert.ok(table.includes("[8] 완전 자율 제어(Autonomy) 현황"));
     assert.ok(table.includes("서킷브레이커=1건, 프롬프트 라우팅=1건, 자가치유 위임=1건"));
     assert.ok(table.includes("safety_primitive_removed=1"));
+
+    // Latest preflight mode in same turn overrides earlier mode
+    const mergedModeSummary = summarizeAuditRecords(
+      parseAuditLines(
+        [
+          JSON.stringify({
+            ts: "2026-11-26T10:00:00.000Z",
+            eventType: "preflight_complete",
+            conversationId: "conv-same-turn",
+            turnStartStepIndex: 0,
+            mode: "auto",
+            verdict: "PROCEED",
+            voted: false,
+          }),
+          JSON.stringify({
+            ts: "2026-11-26T10:01:00.000Z",
+            eventType: "gate_verify",
+            conversationId: "conv-same-turn",
+            turnStartStepIndex: 0,
+            attemptInTurn: 1,
+            verdict: "PASS",
+            preflight: { used: true, verdict: "CONDITIONAL", voted: true, mode: "manual" },
+            blockedRules: [],
+            warnedRules: [],
+          }),
+        ].join("\n"),
+      ),
+    );
+    assert.deepEqual(mergedModeSummary.preflight.modes, { auto: 0, manual: 1, unknown: 0 });
   });
 });
 

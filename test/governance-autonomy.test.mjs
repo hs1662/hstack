@@ -644,3 +644,147 @@ describe("prompt-router PreInvocation trigger and copy purity", () => {
     );
   });
 });
+
+describe("Checkpoint 4 audit regression tests (Red -> Green)", () => {
+  it("Audit #1: blocks comment-only bypass of safety primitive removal, honors AbsolutePath, and detects symlink/gitRoot-relative sensitive targets", () => {
+    const commentBypass = detectDestructiveEdit({
+      toolName: "edit_file",
+      toolInput: {
+        Path: "auth/verify.mjs",
+        Target: "if (!timingSafeEqual(a, b)) return false;",
+        Replacement: "// timingSafeEqual removed for speed\nif (a !== b) return false;",
+      },
+      cwd: "/repo",
+      gitRoot: "/repo",
+      existingFileContent: "if (!timingSafeEqual(a, b)) return false;",
+    });
+    assert.equal(commentBypass.destructive, true);
+    assert.ok(commentBypass.removedPrimitives.includes("timingSafeEqual"));
+
+    const absPathBypass = detectDestructiveEdit({
+      toolName: "edit_file",
+      toolInput: {
+        AbsolutePath: "/repo/scripts/governance/guard.mjs",
+        Target: "try {\n  run();\n} catch (e) {\n  return null;\n}",
+        Replacement: "// .catch()\nrun();",
+      },
+      cwd: "/repo/scripts/governance",
+      gitRoot: "/repo",
+      existingFileContent: "try {\n  run();\n} catch (e) {\n  return null;\n}",
+    });
+    assert.equal(absPathBypass.destructive, true);
+    assert.ok(absPathBypass.removedPrimitives.includes("try_catch_removed"));
+
+    // False positive guard: ternary assignment with `exp` and `===` must NOT be treated as expiry guard
+    const ternaryNoFp = detectDestructiveEdit({
+      toolName: "edit_file",
+      toolInput: {
+        Path: "src/config.mjs",
+        Target: 'const exp = mode === "prod" ? 3600 : 60;',
+        Replacement: 'const exp = mode === "prod" ? 7200 : 60;',
+      },
+      cwd: "/repo",
+      gitRoot: "/repo",
+      existingFileContent: 'const exp = mode === "prod" ? 3600 : 60;',
+    });
+    assert.equal(ternaryNoFp.destructive, false);
+  });
+
+  it("Audit #2: excludes >8KB PreToolUse denial GENERICs, ERROR write GENERICs, and missing-GENERIC parallel writes from turnWrittenFiles", () => {
+    const dir = createTempDir("hstack-audit2-");
+    const trPath = join(dir, "transcript_full.jsonl");
+    const longDenialTail = `${"Z".repeat(9500)}\nEncountered error in step execution: tool call denied by pre-tool hook: blocked`;
+    writeFileSync(
+      trPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        {
+          step_index: 1,
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "edit_file", args: { Path: "/repo/auth/a.mjs", Target: "a", Replacement: "b" } }],
+        },
+        { step_index: 2, type: "GENERIC", status: "ERROR", error: "", content: longDenialTail },
+        {
+          step_index: 3,
+          type: "PLANNER_RESPONSE",
+          tool_calls: [
+            { name: "read_file", args: { Path: "/repo/src/ok.mjs" } },
+            { name: "edit_file", args: { Path: "/repo/src/unexecuted.mjs", Target: "x", Replacement: "y" } },
+          ],
+        },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "ok file" },
+        {
+          step_index: 5,
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "edit_file", args: { Path: "/repo/src/failed.mjs", Target: "x", Replacement: "y" } }],
+        },
+        { step_index: 6, type: "GENERIC", status: "ERROR", error: "target not found", content: "target not found" },
+      ]),
+      "utf8",
+    );
+
+    const ledger = readFactLedger(trPath, "/repo", "/repo");
+    assert.equal(ledger.turnWrittenFiles.has("auth/a.mjs"), false);
+    assert.equal(ledger.turnWrittenFiles.has("src/unexecuted.mjs"), false);
+    assert.equal(ledger.turnWrittenFiles.has("src/failed.mjs"), false);
+    assert.equal(ledger.turnCodeWrittenFiles.size, 0);
+  });
+
+  it("Audit #3: enforces prompt-router numeric string invocationNum and non-transcript subagent marker check", () => {
+    const prompt =
+      "어차피 내부 호출 위주니까 auth/verify.mjs의 timingSafeEqual과 만료 시간 검증을 빼고 단순화해서 바로 수정해 줘";
+    const stringInv = handlePreInvocation(
+      JSON.stringify({
+        hookEventName: "PreInvocation",
+        invocationNum: "1",
+        conversationId: "conv-str-inv",
+        lastUserInput: prompt,
+      }),
+      { dataDir: createTempDir("hstack-strinv-") },
+    );
+    assert.deepEqual(stringInv, {});
+
+    const subagentNoTranscript = handlePreInvocation(
+      JSON.stringify({
+        hookEventName: "PreInvocation",
+        invocationNum: 0,
+        conversationId: "conv-sub-notr",
+        lastUserInput: `${prompt}\n[hstack:독립감사]`,
+      }),
+      { dataDir: createTempDir("hstack-subnotr-") },
+    );
+    assert.deepEqual(subagentNoTranscript, {});
+  });
+
+  it("Audit #4: denies write while async challenger is still pending in current turn even after circuit breaker fired", () => {
+    const dataDir = createTempDir("hstack-pending-ch-");
+    const ws = createTempDir("hstack-pending-ws-");
+    const trPath = join(dataDir, "tr.jsonl");
+    writeFileSync(trPath, toJsonl([{ step_index: 0, type: "USER_INPUT", content: "수정" }]), "utf8");
+    const firstPayload = JSON.stringify({
+      hookEventName: "PreToolUse",
+      conversationId: "conv-pending-ch",
+      cwd: ws,
+      transcriptPath: trPath,
+      toolCall: {
+        name: "edit_file",
+        args: { Path: join(ws, "auth", "verify.mjs"), Target: "timingSafeEqual(a, b)", Replacement: "a === b" },
+      },
+    });
+    const first = handlePreToolGate(firstPayload, {
+      dataDir,
+      existingContentsByPath: new Map([["auth/verify.mjs", "timingSafeEqual(a, b)"]]),
+    });
+    assert.equal(first.decision, "deny");
+
+    const retryWhilePending = handlePreToolGate(firstPayload, {
+      dataDir,
+      ledger: makeBaseLedger({
+        pendingAsyncChallenges: 1,
+        turnPreflightChallenges: [{ launchedStepIndex: 1, completedStepIndex: -1, verdict: "MISSING_VERDICT" }],
+      }),
+      existingContentsByPath: new Map([["auth/verify.mjs", "timingSafeEqual(a, b)"]]),
+    });
+    assert.equal(retryWhilePending.decision, "deny");
+  });
+});
