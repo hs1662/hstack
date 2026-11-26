@@ -1906,6 +1906,20 @@ export function snapshotWorkingTree(cwd) {
   } catch {
     return null;
   }
+  let head = "";
+  try {
+    head = execFileSync("git", ["rev-parse", "-q", "--verify", "HEAD"], {
+      cwd: gitRoot,
+      timeout: SNAPSHOT_GIT_TIMEOUT_MS,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch (err) {
+    // An unborn HEAD exits 1 with no output; anything else leaves the snapshot unusable.
+    if (err?.status !== 1 || String(err.stdout ?? "").trim().length > 0) {
+      return null;
+    }
+  }
   const files = {};
   let count = 0;
   const tokens = out.split("\0");
@@ -1929,7 +1943,23 @@ export function snapshotWorkingTree(cwd) {
       files[relPath] = null;
     }
   }
-  return { gitRoot, files };
+  return { gitRoot, head, files };
+}
+
+const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+// Paths that commits between two snapshot HEADs touched ("" is an unborn HEAD), or null when git cannot say.
+export function listCommittedPaths(gitRoot, fromHead, toHead) {
+  try {
+    const out = execFileSync(
+      "git",
+      ["-c", "core.quotepath=false", "diff", "--name-only", "-z", fromHead || EMPTY_TREE_SHA, toHead || EMPTY_TREE_SHA, "--"],
+      { cwd: gitRoot, timeout: SNAPSHOT_GIT_TIMEOUT_MS, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    return new Set(out.split("\0").filter(Boolean));
+  } catch {
+    return null;
+  }
 }
 
 export function readGitLedger(cwd) {

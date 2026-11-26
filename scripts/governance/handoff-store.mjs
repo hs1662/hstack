@@ -394,7 +394,7 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
         ...prev,
         conversationId,
         updatedAt: new Date().toISOString(),
-        turnSnapshot: { turnStartStepIndex, gitRoot: snapshot.gitRoot, files: snapshot.files },
+        turnSnapshot: { turnStartStepIndex, gitRoot: snapshot.gitRoot, head: snapshot.head, files: snapshot.files },
       });
       return true;
     });
@@ -418,7 +418,7 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
       atomicWriteJson(filePath, {
         ...prev,
         updatedAt: new Date().toISOString(),
-        turnSnapshot: { ...prev.turnSnapshot, gate: { files: snapshot.files } },
+        turnSnapshot: { ...prev.turnSnapshot, gate: { head: snapshot.head, files: snapshot.files } },
       });
       return true;
     });
@@ -440,9 +440,12 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   ) {
     return null;
   }
+  // head is null for a snapshot that predates HEAD recording, so no commit range is checked.
+  const headOf = (raw) => (typeof raw?.head === "string" ? raw.head : null);
   const gateFiles = snap.gate?.files;
-  const gate = gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles) ? { files: gateFiles } : null;
-  return { gitRoot: snap.gitRoot, files: snap.files, gate };
+  const gate =
+    gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles) ? { head: headOf(snap.gate), files: gateFiles } : null;
+  return { gitRoot: snap.gitRoot, head: headOf(snap), files: snap.files, gate };
 }
 
 export function markPreflightChallengeLogged({

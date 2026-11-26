@@ -2,7 +2,13 @@
 
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { PASSING_VERDICTS, isExemptDocOrAssetPath } from "./governance/constants.mjs";
-import { readFactLedgerAndSteps, readGitLedger, resolveGitRootFast, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import {
+  listCommittedPaths,
+  readFactLedgerAndSteps,
+  readGitLedger,
+  resolveGitRootFast,
+  snapshotWorkingTree,
+} from "./governance/fact-ledger.mjs";
 import { readTurnSnapshot, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
 import { isDirectExecution, loadHookContext, parseHookPayload, payloadTranscriptPath, runHookCli } from "./hook-io.mjs";
 import { DRIFT_MARKER, GATE_STOP_MARKER, decideStopAction } from "./transcript.mjs";
@@ -50,23 +56,31 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
     turnStartStepIndex: ledger.turnStartStepIndex,
   });
   const current = baseline ? snapshotWorkingTree(cwd) : null;
-  if (!current || current.gitRoot !== baseline.gitRoot) {
+  // Commits made this turn leave a clean tree, so the files they touched count as changed too.
+  const committedSince = (head) =>
+    head === null || head === current.head ? new Set() : listCommittedPaths(current.gitRoot, head, current.head);
+  const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
+  const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
+  if (!sinceTurn || !sinceGate) {
     if (writers.length === 0 || !resolveGitRootFast(cwd)) {
       return false;
     }
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
     return true;
   }
+  const changedSince = (files, committed, relPath) =>
+    committed.has(relPath) ||
+    (relPath in files) !== (relPath in current.files) ||
+    (relPath in files && !sameFileSignature(files[relPath], current.files[relPath]));
   // A change the verify_completion snapshot did not see happened after it, whatever the command looked like.
   const lastGateStep = ledger.turnGateAttempts.at(-1)?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
-  const unchangedIn = (files, relPath) =>
-    (relPath in files) === (relPath in current.files) && (!(relPath in files) || sameFileSignature(files[relPath], current.files[relPath]));
-  for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files)])) {
-    if (unchangedIn(baseline.files, relPath) || isExemptDocOrAssetPath(relPath)) {
+  for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
+    if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
       continue;
     }
-    const step = postGateShell.length > 0 && !unchangedIn(baseline.gate.files, relPath) ? postGateShell.at(-1).stepIndex : writeStep;
+    const step =
+      postGateShell.length > 0 && changedSince(baseline.gate.files, sinceGate, relPath) ? postGateShell.at(-1).stepIndex : writeStep;
     ledger.turnWrittenFiles.add(relPath);
     ledger.turnCodeWrittenFiles.add(relPath);
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
