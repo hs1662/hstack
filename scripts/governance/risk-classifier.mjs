@@ -46,7 +46,8 @@ function quantifierAt(source, i) {
 // Unbounded quantifiers (`*`, `+`, `{n,}`) each add a factor of the input length to the worst-case run time,
 // plus one more when the top-level alternative is not anchored at `^`; each alternative is tried on its own, so
 // each pays its own cost. Optional repeats (`?`, `{n,m}`) multiply paths. Paths reach 4096 chars, so the
-// input-length degree is capped at 2 (n^2) and optional repeats at 10.
+// input-length degree is capped at 2 (n^2) and optional repeats at 10. A group of k alternatives multiplies paths by k,
+// worth log2(k) optional repeats, so `(a|a)` eleven times over (2^11 paths) is rejected like eleven `a?`.
 const MAX_POLYNOMIAL_DEGREE = 2;
 const MAX_OPTIONAL_REPEATS = 10;
 const GROUP_PREFIX_RE = /^\?(?:[:=!]|<[=!]|<[A-Za-z_]\w*>)/;
@@ -79,7 +80,7 @@ function isSafeCustomRegex(source) {
   if (trimmed.length === 0 || trimmed.length > 200) {
     return false;
   }
-  const groups = [{ quantified: false, alternation: false, adjacent: false }];
+  const groups = [{ quantified: false, alternation: false, adjacent: false, bars: 0 }];
   let i = 0;
   let unbounded = 0;
   let optional = 0;
@@ -116,7 +117,7 @@ function isSafeCustomRegex(source) {
       }
       i += 1;
     } else if (ch === "(") {
-      groups.push({ quantified: false, alternation: false, adjacent });
+      groups.push({ quantified: false, alternation: false, adjacent, bars: 0 });
       i += 1 + (GROUP_PREFIX_RE.exec(trimmed.slice(i + 1))?.[0].length ?? 0);
       // The group's first atom also follows the repeat before the group.
       unboundedEnd = adjacent ? i : unboundedEnd;
@@ -126,6 +127,7 @@ function isSafeCustomRegex(source) {
         return false;
       }
       const inner = groups.pop();
+      optional += Math.log2(inner.bars + 1);
       i += 1;
       const length = quantifierAt(trimmed, i);
       if (length > 0) {
@@ -140,6 +142,7 @@ function isSafeCustomRegex(source) {
       continue;
     } else if (ch === "|") {
       groups[groups.length - 1].alternation = true;
+      groups[groups.length - 1].bars += 1;
       i += 1;
       if (groups.length === 1) {
         if (!altFits()) {
