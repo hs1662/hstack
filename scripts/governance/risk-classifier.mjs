@@ -26,9 +26,26 @@ export function resolveAuditEscalationMode(dataDir = resolvePluginDataDir(), con
 }
 
 const MAX_CUSTOM_SENSITIVE_PATTERNS = 50;
-const NESTED_QUANTIFIER_RE = /\([^()]*[+*?][^()]*\)[+*?{]|\([^()]*\|[^()]*\)[+*?{]/;
-const BACKREFERENCE_RE = /\\[1-9]/;
 
+// Length of the quantifier at `i` ("*", "+", "?", "{n}", "{n,}", "{n,m}", each optionally lazy), or 0.
+function quantifierAt(source, i) {
+  const ch = source[i];
+  let end = 0;
+  if (ch === "*" || ch === "+" || ch === "?") {
+    end = i + 1;
+  } else if (ch === "{") {
+    const match = /^\{\d+(?:,\d*)?\}/.exec(source.slice(i));
+    end = match ? i + match[0].length : 0;
+  }
+  if (end === 0) {
+    return 0;
+  }
+  return (source[end] === "?" ? end + 1 : end) - i;
+}
+
+// Linear scan of a pattern's groups: a quantified group whose body already holds a quantifier or an
+// alternation (star height 2, as in `(a+)+`, `((a+))+`, `(a|a)+`, `([a-z]+){2,}`) can backtrack
+// exponentially, and so can a backreference. Character classes and escapes are opaque atoms.
 function isSafeCustomRegex(source) {
   if (typeof source !== "string") {
     return false;
@@ -37,10 +54,62 @@ function isSafeCustomRegex(source) {
   if (trimmed.length === 0 || trimmed.length > 200) {
     return false;
   }
-  if (NESTED_QUANTIFIER_RE.test(trimmed) || BACKREFERENCE_RE.test(trimmed)) {
-    return false;
+  const groups = [{ quantified: false, alternation: false }];
+  let i = 0;
+  const markQuantified = () => {
+    groups[groups.length - 1].quantified = true;
+  };
+  while (i < trimmed.length) {
+    const ch = trimmed[i];
+    if (ch === "\\") {
+      if (/[1-9k]/.test(trimmed[i + 1] ?? "")) {
+        return false;
+      }
+      i += 2;
+    } else if (ch === "[") {
+      i += 1;
+      if (trimmed[i] === "^") i += 1;
+      if (trimmed[i] === "]") i += 1;
+      while (i < trimmed.length && trimmed[i] !== "]") {
+        i += trimmed[i] === "\\" ? 2 : 1;
+      }
+      i += 1;
+    } else if (ch === "(") {
+      groups.push({ quantified: false, alternation: false });
+      i += 1;
+      continue;
+    } else if (ch === ")") {
+      if (groups.length === 1) {
+        return false;
+      }
+      const inner = groups.pop();
+      i += 1;
+      const length = quantifierAt(trimmed, i);
+      if (length > 0) {
+        if (inner.quantified || inner.alternation) {
+          return false;
+        }
+        markQuantified();
+        i += length;
+      }
+      const outer = groups[groups.length - 1];
+      outer.quantified ||= inner.quantified;
+      outer.alternation ||= inner.alternation;
+      continue;
+    } else if (ch === "|") {
+      groups[groups.length - 1].alternation = true;
+      i += 1;
+      continue;
+    } else {
+      i += 1;
+    }
+    const length = quantifierAt(trimmed, i);
+    if (length > 0) {
+      markQuantified();
+      i += length;
+    }
   }
-  return true;
+  return groups.length === 1;
 }
 
 function compileSensitivePatterns(rawPatterns) {
