@@ -15,7 +15,8 @@ import {
 import { resolveAuditEscalationMode } from "../governance/risk-classifier.mjs";
 import { isDirectExecution } from "../hook-io.mjs";
 
-const PROTOCOL_VERSION_DEFAULT = "2024-11-05";
+// Latest first. 2025-03-26 is what the Antigravity client sends; none of these needs batch requests from us.
+const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_INFO = { name: "hstack-gate", version: "0.1.1" };
 const PUBLIC_ARG_KEYS = new Set([
   "modified_files",
@@ -548,10 +549,9 @@ export function createMcpServerHandler(options = {}) {
     }
 
     if (method === "initialize") {
-      const protocolVersion =
-        typeof params?.protocolVersion === "string" && params.protocolVersion.trim().length > 0
-          ? params.protocolVersion.trim()
-          : PROTOCOL_VERSION_DEFAULT;
+      // MCP: echo a version the server supports, otherwise answer with the latest one it supports.
+      const requested = typeof params?.protocolVersion === "string" ? params.protocolVersion.trim() : "";
+      const protocolVersion = SUPPORTED_PROTOCOL_VERSIONS.includes(requested) ? requested : SUPPORTED_PROTOCOL_VERSIONS[0];
       return makeRpcResult(id, {
         protocolVersion,
         capabilities: { tools: {} },
