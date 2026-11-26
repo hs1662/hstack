@@ -49,17 +49,10 @@ function extractVerificationSegments(cmd) {
   return segments;
 }
 
+// Only the same runner with the same targets and flags clears a failure: whether a shorter
+// command covers more (`node --test`) or less (`go test` vs `go test ./...`) depends on the runner.
 function segmentResolvedBy(failedSeg, passedSeg) {
-  if (failedSeg.length === 0 || passedSeg.length === 0) {
-    return false;
-  }
-  if (failedSeg === passedSeg) {
-    return true;
-  }
-  if (isBareRuntimeLauncher(passedSeg)) {
-    return false;
-  }
-  return failedSeg.startsWith(`${passedSeg} `);
+  return failedSeg.length > 0 && failedSeg === passedSeg;
 }
 
 function isCommandResolvedBy(failedCmd, passedCmd) {

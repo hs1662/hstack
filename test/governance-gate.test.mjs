@@ -141,8 +141,8 @@ describe("decideGate core rules R1-R7", () => {
     assert.deepEqual(concealedPrior.details.failedVerifications, ["npm run lint"]);
   });
 
-  it("R3_CONCEALED_FAILURE resolves an earlier narrower failure when a broader superset verification passes later, but still blocks unrelated failures", () => {
-    const resolvedBySuperset = decideGate(
+  it("R3_CONCEALED_FAILURE resolves a failure only by rerunning the equivalent command, and still blocks unrelated failures", () => {
+    const notResolvedByBroaderRerun = decideGate(
       makeInput({
         verification_runs: [{ command: "node --test", outcome: "pass" }],
       }),
@@ -157,8 +157,27 @@ describe("decideGate core rules R1-R7", () => {
         testInfra: { hasTestSuite: true, indicators: ["test/"] },
       },
     );
-    assert.equal(resolvedBySuperset.verdict, "PASS");
-    assert.deepEqual(resolvedBySuperset.blockedRules, []);
+    assert.equal(notResolvedByBroaderRerun.verdict, "REJECT");
+    assert.deepEqual(notResolvedByBroaderRerun.blockedRules, ["R3_CONCEALED_FAILURE"]);
+    assert.deepEqual(notResolvedByBroaderRerun.details.failedVerifications, ["node --test test/app.test.mjs"]);
+
+    const resolvedBySameCommand = decideGate(
+      makeInput({
+        verification_runs: [{ command: "node --test test/app.test.mjs", outcome: "pass" }],
+      }),
+      {
+        ledger: makeLedger({
+          turnExecutions: [
+            { stepIndex: 5, command: "node --test test/app.test.mjs", kind: "verification", passed: false },
+            { stepIndex: 7, command: "node --test test/app.test.mjs", kind: "verification", passed: true },
+          ],
+        }),
+        gitLedger: makeGitLedger(),
+        testInfra: { hasTestSuite: true, indicators: ["test/"] },
+      },
+    );
+    assert.equal(resolvedBySameCommand.verdict, "PASS");
+    assert.deepEqual(resolvedBySameCommand.blockedRules, []);
 
     const unresolvedUnrelated = decideGate(
       makeInput({

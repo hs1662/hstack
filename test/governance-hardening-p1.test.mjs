@@ -301,7 +301,7 @@ describe("#3 follow-up: only an equivalent verification command clears a failure
   });
 
   it("a narrower or differently targeted rerun does not clear a failure on any runner", () => {
-    assert.equal(gate([["node --test test/a.test.mjs", "not ok 1"], ["node --test", "# pass 3"]], "node --test").verdict, "REJECT");
+    assert.equal(gate([["node --test test/a.test.mjs", "AssertionError: boom"], ["node --test", "# pass 3"]], "node --test").verdict, "REJECT");
     assert.equal(gate([["npm test -- --grep auth", "AssertionError: boom"], ["npm test", "ok"]], "npm test").verdict, "REJECT");
   });
 
