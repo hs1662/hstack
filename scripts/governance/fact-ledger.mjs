@@ -49,6 +49,8 @@ const CHALLENGER_MARKER_LINE_RE = /^\[hstack:사전검토\]$/;
 const WORKER_MARKER_LINE_RE = /^\[hstack:격리작업\]$/;
 const INJECTED_CONTEXT_LINE_RE =
   /^(?:작업 경로:|세션 기록 경로:|현재 턴 시작 스텝:|-\s*작업 디렉터리:|위 작업 경로의 실제 파일과 호출 관계를 직접 읽고)/;
+// `npm run` with no script name only lists scripts.
+const BARE_SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
 const ALLOWED_SUBAGENT_SYSTEM_SOURCES = new Set(["SYSTEM"]);
 const SESSION_ROLE_PRIORITY = { main: 0, worker: 1, challenger: 2, auditor: 3 };
 const ASYNC_LAUNCH_ACK_HINT_RE = /\b(?:launch(?:ed)?|start(?:ed)?|spawn(?:ed)?|creat(?:ed)?|subagent|background|async)\b/i;
@@ -201,8 +203,9 @@ export function normalizeWorkspacePath(rawPath, cwd = "", gitRoot = "") {
   return stripTrailingSlashes(normalized);
 }
 
-export function splitShellSegments(commandLine) {
-  const segments = [];
+// Quote-aware split into { text, op } pairs, where op is the shell operator that follows the segment.
+function splitShellChain(commandLine) {
+  const chain = [];
   let current = "";
   let quote = null;
   for (let i = 0; i < commandLine.length; i += 1) {
@@ -229,22 +232,43 @@ export function splitShellSegments(commandLine) {
     }
     const next = commandLine[i + 1];
     if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
-      segments.push(current);
+      chain.push({ text: current, op: ch + next });
       current = "";
       i += 1;
       continue;
     }
     if (ch === ";" || ch === "|" || ch === "\n") {
-      segments.push(current);
+      chain.push({ text: current, op: ch });
       current = "";
       continue;
     }
     current += ch;
   }
   if (current.length > 0) {
-    segments.push(current);
+    chain.push({ text: current, op: "" });
   }
-  return segments;
+  return chain;
+}
+
+export function splitShellSegments(commandLine) {
+  return splitShellChain(commandLine).map((seg) => seg.text);
+}
+
+const ALWAYS_SUCCESS_SEGMENT_RE = /^(?:true|:|exit\s+0|(?:echo|printf)(?:\s.*)?)$/;
+
+function isAlwaysSuccessSegment(text) {
+  return ALWAYS_SUCCESS_SEGMENT_RE.test(text.trim().replace(/^[(\s]+|[)\s]+$/g, ""));
+}
+
+// `true || npm test` never runs the test; `npm test || true` hides its exit status.
+function hasMaskedOrPair(commandLine) {
+  const chain = splitShellChain(commandLine);
+  for (let i = 0; i + 1 < chain.length; i += 1) {
+    if (chain[i].op === "||" && (isAlwaysSuccessSegment(chain[i].text) || isAlwaysSuccessSegment(chain[i + 1].text))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function tokenizeSegment(segment) {
@@ -404,6 +428,12 @@ function classifySingleSegment(segment) {
   if (READ_ONLY_BINARIES.has(baseBin) || SHELL_NEUTRAL_BUILTINS.has(baseBin)) {
     return hasFileRedirect ? "other" : "read_only";
   }
+  if (BARE_SCRIPT_RUNNERS.has(baseBin)) {
+    const args = tokens.slice(idx + 1).filter((tok) => !tok.startsWith("-"));
+    if (args.length === 1 && (args[0] === "run" || args[0] === "run-script")) {
+      return "read_only";
+    }
+  }
   if (VERIFICATION_BINARIES.has(baseBin) || rawBin.startsWith("./") || rawBin.startsWith("../")) {
     return "verification";
   }
@@ -426,7 +456,7 @@ export function classifyCommand(commandLine) {
     }
   }
   if (sawVerification) {
-    return "verification";
+    return hasMaskedOrPair(commandLine) ? "other" : "verification";
   }
   return sawOther ? "other" : "read_only";
 }
