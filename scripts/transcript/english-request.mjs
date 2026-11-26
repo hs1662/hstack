@@ -43,15 +43,15 @@ const LANG_CANONICAL_MAP = new Map([
 const KO_COMPLAINT_PREFIX_GUARD = "(?<!(?:왜|자꾸만?|계속(?:해서)?)(?:\\s+[가-힣]{1,8}){0,2}\\s*)";
 const KO_COMPLAINT_POSTFIX_RE = /(?:왜(?!냐(?:하면|면))|자꾸만?|계속(?:해서)?)/;
 const KO_STANDALONE_COMPLAINT_POSTFIX_RE = /^(?:[\s,;~]*(?:왜|자꾸만?|계속(?:해서)?)요?)+[\s,~]*\??$/;
-const KO_REQUEST_NOUN_ACTION = "(?:번역|영작|작성|답변|대답|답장|응답|설명|요약|정리|출력|변환|표현|교정)";
+const KO_REQUEST_NOUN_ACTION = "(?:번역|영작|작성|답변|대답|답장|응답|설명|요약|정리|출력|변환|표현|교정|대화|진행)";
 const KO_REQUEST_NOUN_ENDING =
-  "(?:해\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|주십시오|주시기|주길|라|달라|보여\\s*줘요|보여\\s*줘|보여주세요)|해서\\s*(?:(?:보여|알려)\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|주십시오|달라|라)|보여주세요|보여줘요|보여줘|알려주세요|알려줘요|알려줘)|해주세요|해줘요|해줘|해라|하라|하시오|하십시오|하세요(?!\\?)|하고(?=,|\\s)|하길\\s*(?:바라요|바라|바래요|바래|바랍니다)|하기\\s*(?:바라요|바라|바래요|바래|바랍니다)|하기를\\s*(?:바라요|바라|바래요|바래|바랍니다)|하길\\s*(?:원해요|원해|원합니다)|하기\\s*(?:원해요|원해|원합니다)|하기를\\s*(?:원해요|원해|원합니다)|(?:[을를]\\s*|(?<=\\s))(?:원해요|원해|원합니다|바라요|바라|바래요|바래|바랍니다)|(?:[을를]\\s*)?부탁(?:해요|해|합니다|드립니다|드려요)?|해(?=$|[.!,;\\n])|해요(?=$|[.!,;\\s])|:(?=$|\\s))";
+  "(?:해\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|주십시오|주시기|주길|라|달라|보여\\s*줘요|보여\\s*줘|보여주세요)|해서\\s*(?:(?:보여|알려)\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|주십시오|달라|라)|보여주세요|보여줘요|보여줘|알려주세요|알려줘요|알려줘)|해주세요|해줘요|해줘|해라|하라|하시오|하십시오|하세요(?!\\?)|하고(?=,|\\s)|하길\\s*(?:바라요|바라|바래요|바래|바랍니다)|하기\\s*(?:바라요|바라|바래요|바래|바랍니다)|하기를\\s*(?:바라요|바라|바래요|바래|바랍니다)|하길\\s*(?:원해요|원해|원합니다)|하기\\s*(?:원해요|원해|원합니다)|하기를\\s*(?:원해요|원해|원합니다)|(?:[을를]\\s*|(?<=\\s))(?:원해요|원해|원합니다|바라요|바라|바래요|바래|바랍니다)|(?:[을를]\\s*)?부탁(?:해요|해|합니다|드립니다|드려요)?|해(?=$|[.!,;\\n])|해요(?=$|[.!,;\\s])|하자(?=$|[.!,;~\\s])|합시다|하죠|:(?=$|\\s))";
 const KO_REQUEST_VERB_CONJ =
   "(?:(?:답해|바꿔|바꾸어|옮겨|옮기어|써|적어|말해|고쳐|다시\\s*써|만들어|알려|보여)(?:\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|주십시오|주길|달라|라)|(?=$|[.!,;\\n])|요(?=$|[.!,;\\s]))|(?:답하|바꾸|옮기|쓰|적|말하|고치|만들|알리|보이)(?:라|세요(?!\\?)|시오|십시오|길\\s*(?:바라요|바라|바래요|바래|바랍니다)|기\\s*(?:바라요|바라|바래요|바래|바랍니다)|기를\\s*(?:바라요|바라|바래요|바래|바랍니다)|길\\s*(?:원해요|원해|원합니다)|기\\s*(?:원해요|원해|원합니다)|기를\\s*(?:원해요|원해|원합니다))|(?:해\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|주십시오|달라|라)|해주세요|해줘요|해줘|해라|부탁(?:해요|해|합니다|드립니다|드려요)?))";
 const KO_SHORT_VERB_ENDING = "(?:만들어|써|적어|보여|해)\\s*(?:줘요|줘|주세요|주실래요|주시겠어요|주시겠습니까|주실\\s*수|줄래요|줄래|줄\\s*수|라|달라)|해주세요|해줘요|해줘|해라|부탁(?:해요|해|합니다|드립니다|드려요)?";
 
 const KO_NEGATED_TRANSLATION_RE = new RegExp(
-  `${FOREIGN_LANG_KO}(?:${KO_RO_PARTICLE}|만|도|은|는)?\\s*(?:(?<=\\s)[가-힣A-Za-z0-9·/_-]{1,32}\\s+){0,2}(?:번역|영작|작성|답변|대답|답|답장|응답|설명|요약|정리|출력|변환|교정|쓰|적|말|표현|바꾸|옮기|알려\\s*주|알리|보여\\s*주|하)(?:하|해|해서\\s*(?:보여\\s*주|알려\\s*주)|은|는|을|를)?(?:\\s*좀)?\\s*(?:지\\s*(?:말|마|않)|하지\\s*(?:말|마|않)|하면\\s*안\\s*(?:돼|되|됨|됩니다|돼요)|면\\s*안\\s*(?:돼|되|됨|됩니다|돼요)|말고|금지|대신)` +
+  `${FOREIGN_LANG_KO}(?:${KO_RO_PARTICLE}|만|도|은|는)?\\s*(?:(?<=\\s)[가-힣A-Za-z0-9·/_-]{1,32}\\s+){0,2}(?:번역|영작|작성|답변|대답|답|답장|응답|설명|요약|정리|출력|변환|교정|대화|진행|쓰|적|말|표현|바꾸|옮기|알려\\s*주|알리|보여\\s*주|하)(?:하|해|해서\\s*(?:보여\\s*주|알려\\s*주)|은|는|을|를)?(?:\\s*좀)?\\s*(?:지\\s*(?:말|마|않)|하지\\s*(?:말|마|않)|하면\\s*안\\s*(?:돼|되|됨|됩니다|돼요)|면\\s*안\\s*(?:돼|되|됨|됩니다|돼요)|말고|금지|대신)` +
     `|영작(?:하|해|은|는|을|를)?(?:\\s*좀)?\\s*(?:지\\s*(?:말|마|않)|하지\\s*(?:말|마|않)|하면\\s*안\\s*(?:돼|되|됨|됩니다|돼요)|면\\s*안\\s*(?:돼|되|됨|됩니다|돼요)|말고|금지|대신)` +
     `|${FOREIGN_LANG_KO}(?:${KO_RO_PARTICLE}|만|도|은|는)?\\s*(?:말고|대신|아닌|아니라)`,
   "g",
@@ -104,7 +104,7 @@ const KO_NOUN_MODIFIER_REQUEST_RE = new RegExp(
 const EN_OUTPUT_NOUNS = "(?:translation|version|draft|response|reply|summary|email|mail|message)";
 
 const EN_NEGATED_OUTPUT_RE = new RegExp(
-  `\\b(?:do\\s+not|don['’]t|never|avoid|stop|quit)\\s+(?:[a-z]+\\s+){0,2}(?:translat(?:e|ing)|writ(?:e|ing)|repl(?:y|ying)|respond(?:ing)?|answer(?:ing)?|explain(?:ing)?|summariz(?:e|ing)|output(?:ting)?|rewrit(?:e|ing)|draft(?:ing)?|speak(?:ing)?|talk(?:ing)?|us(?:e|ing))\\b[^.!?\\n,;]{0,40}\\b(?:(?:in|into|to)\\s+)?${FOREIGN_LANG_EN}\\b` +
+  `\\b(?:do\\s+not|don['’]t|never|avoid|stop|quit)\\s+(?:[a-z]+\\s+){0,2}(?:translat(?:e|ing)|writ(?:e|ing)|repl(?:y|ying)|respond(?:ing)?|answer(?:ing)?|explain(?:ing)?|summariz(?:e|ing)|output(?:ting)?|rewrit(?:e|ing)|draft(?:ing)?|speak(?:ing)?|talk(?:ing)?|us(?:e|ing)|switch(?:ing)?)\\b[^.!?\\n,;]{0,40}\\b(?:(?:in|into|to)\\s+)?${FOREIGN_LANG_EN}\\b` +
     `|\\b(?:do\\s+not|don['’]t|never)\\s+(?:want|need)\\s+(?:(?:an?|the|some)\\s+)?(?:[a-z]+\\s+){0,2}${FOREIGN_LANG_EN}\\s+${EN_OUTPUT_NOUNS}\\b` +
     `|\\binstead\\s+of\\b[^.!?\\n,;]{0,30}\\b${FOREIGN_LANG_EN}\\b` +
     `|\\bnot\\s+(?:in|into|to)\\s+${FOREIGN_LANG_EN}\\b` +
@@ -128,6 +128,17 @@ const EN_IMPERATIVE_REQUEST_RE = new RegExp(
 const EN_POLITE_REQUEST_RE = new RegExp(
   `\\b(?:can\\s+you|could\\s+you|would\\s+you|will\\s+you|please|i\\s+(?:want|need|would\\s+like)(?:\\s+you)?\\s+to|i['’]d\\s+like(?:\\s+you)?\\s+to)\\s+(?:(?:please|kindly|just)\\s+){0,3}${EN_ACTION_BODY}` +
     `|\\b(?:i\\s+(?:want|need|would\\s+like)|i['’]d\\s+like)\\s+(?:(?:an?|the|some)\\s+)?(?:[a-z]+\\s+){0,2}${FOREIGN_LANG_EN}\\s+${EN_OUTPUT_NOUNS}\\b`,
+  "gi",
+);
+
+// "Switch to English", "Let's speak English", "From now on, English": a change of conversation language.
+const EN_LANG_CLAUSE_END = "(?=\\s*(?:$|[.,!?;:)]|(?:please|only|from|instead|now|again|with)\\b))";
+const EN_SWITCH_REQUEST_RE = new RegExp(
+  `(?:^|[,;]\\s*|\\b(?:and|then|so|let['’]?s|let\\s+us|(?:can|could|would|will)\\s+(?:you|we))\\s+)` +
+    `(?:(?:please|kindly|just|now|only|always)\\s+)*` +
+    `(?:(?:switch|change|go)\\s+(?:back\\s+|over\\s+)?(?:to|into)\\s+${FOREIGN_LANG_EN}\\b` +
+    `|(?:use|speak|talk|chat|converse|communicate)\\s+(?:only\\s+)?(?:in\\s+)?${FOREIGN_LANG_EN}${EN_LANG_CLAUSE_END})` +
+    `|^\\s*from\\s+now\\s+on\\b[,\\s]+(?:(?:please|just|only)\\s+)*(?:(?:reply|respond|answer|write|speak|talk|use)\\s+)?(?:in\\s+)?${FOREIGN_LANG_EN}\\b`,
   "gi",
 );
 
@@ -299,7 +310,7 @@ function collectEnglishRequestClauseLangs(clause) {
   if (EN_NARRATIVE_COMPLAINT_RE.test(clause)) {
     return langs;
   }
-  for (const re of [EN_IMPERATIVE_REQUEST_RE, EN_POLITE_REQUEST_RE, EN_DIRECT_TRANSLATION_NOUN_RE]) {
+  for (const re of [EN_IMPERATIVE_REQUEST_RE, EN_POLITE_REQUEST_RE, EN_SWITCH_REQUEST_RE, EN_DIRECT_TRANSLATION_NOUN_RE]) {
     for (const match of clause.matchAll(re)) {
       for (const code of extractLanguageCodes(match[0])) {
         langs.add(code);
