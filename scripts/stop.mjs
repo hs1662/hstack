@@ -52,14 +52,20 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
   }
   const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
   const writeStep = (writers.length > 0 ? writers : shellExecs).at(-1).stepIndex;
-  for (const [relPath, signature] of Object.entries(current.files)) {
-    if ((relPath in baseline.files && sameFileSignature(baseline.files[relPath], signature)) || isExemptDocOrAssetPath(relPath)) {
+  // A change the verify_completion snapshot did not see happened after it, whatever the command looked like.
+  const lastGateStep = ledger.turnGateAttempts.at(-1)?.stepIndex ?? -1;
+  const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
+  const unchangedIn = (files, relPath) =>
+    (relPath in files) === (relPath in current.files) && (!(relPath in files) || sameFileSignature(files[relPath], current.files[relPath]));
+  for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files)])) {
+    if (unchangedIn(baseline.files, relPath) || isExemptDocOrAssetPath(relPath)) {
       continue;
     }
+    const step = postGateShell.length > 0 && !unchangedIn(baseline.gate.files, relPath) ? postGateShell.at(-1).stepIndex : writeStep;
     ledger.turnWrittenFiles.add(relPath);
     ledger.turnCodeWrittenFiles.add(relPath);
-    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
-    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, writeStep);
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
+    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
   }
 }
 

@@ -403,6 +403,30 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
   }
 }
 
+// The tree as verify_completion saw it, attached to the current turn snapshot so a new turn discards it.
+export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePluginDataDir() } = {}) {
+  const filePath = resolveSessionStatePath(conversationId, dataDir);
+  if (!filePath || !snapshot) {
+    return false;
+  }
+  try {
+    return withSessionLock(filePath, () => {
+      const prev = readSessionState(conversationId, dataDir);
+      if (!prev?.turnSnapshot || typeof prev.turnSnapshot !== "object" || prev.turnSnapshot.gitRoot !== snapshot.gitRoot) {
+        return false;
+      }
+      atomicWriteJson(filePath, {
+        ...prev,
+        updatedAt: new Date().toISOString(),
+        turnSnapshot: { ...prev.turnSnapshot, gate: { files: snapshot.files } },
+      });
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
 export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir = resolvePluginDataDir() } = {}) {
   const snap = readSessionState(conversationId, dataDir)?.turnSnapshot;
   if (
@@ -416,7 +440,9 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   ) {
     return null;
   }
-  return { gitRoot: snap.gitRoot, files: snap.files };
+  const gateFiles = snap.gate?.files;
+  const gate = gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles) ? { files: gateFiles } : null;
+  return { gitRoot: snap.gitRoot, files: snap.files, gate };
 }
 
 export function markPreflightChallengeLogged({

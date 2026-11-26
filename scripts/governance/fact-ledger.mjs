@@ -68,6 +68,14 @@ const WRAPPER_FLAGS_WITH_ARG = {
   sudo: new Set(["-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-D", "--chdir"]),
 };
 const SHELL_NEUTRAL_BUILTINS = new Set(["cd", "export", "set", "unset", "true", "false", "sleep", "umask"]);
+// Flags that make an otherwise read-only binary run commands or write files.
+const READ_ONLY_BINARY_WRITER_FLAG_RE = {
+  find: /^-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/,
+  rg: /^--pre(?:=|$)/,
+  tree: /^-[oR]$|^--?output(?:=|$)/,
+  file: /^-C$|^--compile$/,
+  git: /^--output(?:=|$)/,
+};
 const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
@@ -424,6 +432,10 @@ function classifySingleSegment(segment) {
 
   const rawBin = tokens[idx];
   const baseBin = posix.basename(toPosix(rawBin));
+  const writerFlagRe = READ_ONLY_BINARY_WRITER_FLAG_RE[baseBin];
+  if (writerFlagRe && tokens.slice(idx + 1).some((tok) => writerFlagRe.test(tok))) {
+    return "other";
+  }
 
   if (baseBin === "git") {
     let subIdx = idx + 1;
