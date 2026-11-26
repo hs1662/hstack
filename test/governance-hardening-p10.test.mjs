@@ -1,7 +1,7 @@
 // v0.1.2 gate audit run 5 (Round H): untracked overflow vs tracked edits, strict npx/npm/go whitelist, sequential pipefail.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
@@ -9,7 +9,7 @@ import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
 import { classifyCommand, listCommittedPaths, readFactLedger, readNumstatSinceHead, readSessionRole, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
-import { mergeShellWrittenFiles, resolveSessionStatePath, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
+import { mergeShellWrittenFiles, resolveSessionStatePath, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
 import { classifyRisk } from "../scripts/governance/risk-classifier.mjs";
 import { readTranscriptSteps } from "../scripts/hook-io.mjs";
 import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
@@ -2329,5 +2329,289 @@ describe("H9 OMH gpt-6.2-astra round-5 regressions (P1 F1-F8, P2 F9-F12)", () =>
       ],
     );
     assert.equal(liveFail.ok, false, "L16 parseTranscriptJsonl path must fail when post-edit test failed");
+  });
+});
+
+describe("H10 OMH gpt-6.2-astra round-6 regressions (P1 F1-F6, P2 F7-F8)", () => {
+  it("R6-F1: treats missing or blank transcriptPath as unknown role and denies PreToolUse calls", () => {
+    const dir = createTempDir("hstack-p10-r6-f1-");
+    assert.equal(readSessionRole(""), "unknown");
+    assert.equal(readSessionRole("   "), "unknown");
+    assert.equal(readSessionRole(undefined), "unknown");
+
+    for (const rawPath of [undefined, "", "   "]) {
+      const base = { hookEventName: "PreToolUse", conversationId: "r6-f1", cwd: dir };
+      if (rawPath !== undefined) {
+        base.transcriptPath = rawPath;
+      }
+      const cmdRes = handlePreToolGate(
+        JSON.stringify({ ...base, toolCall: { name: "run_command", args: { CommandLine: "node --test" } } }),
+        { dataDir: DATA_DIR, skipAuditLog: true, governanceConfig: { autonomyMode: "off" } },
+      );
+      assert.equal(cmdRes.decision, "deny", `run_command must deny when transcriptPath=${JSON.stringify(rawPath)}`);
+
+      const writeRes = handlePreToolGate(
+        JSON.stringify({ ...base, toolCall: { name: "write_file", args: { Path: join(dir, "a.mjs") } } }),
+        { dataDir: DATA_DIR, skipAuditLog: true, governanceConfig: { autonomyMode: "off" } },
+      );
+      assert.equal(writeRes.decision, "deny", `write_file must deny when transcriptPath=${JSON.stringify(rawPath)}`);
+    }
+  });
+
+  it("R6-F2: does not let optional -O swallow a following -n/--dry-run token in make", () => {
+    for (const cmd of ["make -O -n test", "make -O --dry-run test", "make -O -q check"]) {
+      assert.equal(classifyCommand(cmd), "other", `must reject dry-run after -O: ${cmd}`);
+    }
+    for (const cmd of ["make -O test", "make -Otarget test", "make -Oline -j4 test"]) {
+      assert.equal(classifyCommand(cmd), "verification", `must keep valid -O make verification: ${cmd}`);
+    }
+  });
+
+  it("R6-F3: parses multi-line pytest.ini testpaths and fails closed on unparseable/empty testpaths", () => {
+    const dir = createTempDir("hstack-p10-r6-f3-");
+    const runWithIni = (iniText, failTarget) => {
+      const subDir = createTempDir("hstack-p10-r6-f3-sub-");
+      mkdirSync(join(subDir, "unit"), { recursive: true });
+      mkdirSync(join(subDir, "integration"), { recursive: true });
+      writeFileSync(join(subDir, "pytest.ini"), iniText);
+      const p = join(dir, `${Math.random().toString(36).slice(2)}.jsonl`);
+      writeFileSync(
+        p,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(subDir, "app.py") } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: `pytest ${failTarget}`, Cwd: subDir } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: FAIL_OUTPUT },
+          { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: subDir } }] },
+          { step_index: 6, type: "GENERIC", status: "DONE", content: "2 passed in 0.01s" },
+        ]),
+      );
+      return decideGate(
+        {
+          modified_files: ["app.py"],
+          inspected_files: [],
+          verification_runs: [{ command: "pytest", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: subDir,
+          ledger: readFactLedger(p, subDir, subDir),
+          gitLedger: { gitAvailable: false, gitRoot: subDir, gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    const multilineIni = "[pytest]\ntestpaths =\n    unit\n    pkg/unit\n";
+    const outside = runWithIni(multilineIni, "integration/test_it.py");
+    assert.equal(outside.verdict, "REJECT");
+    assert.ok(outside.blockedRules.includes("R3_CONCEALED_FAILURE"));
+
+    const inside = runWithIni(multilineIni, "unit/test_u.py");
+    assert.equal(inside.verdict, "PASS", inside.blockedRules.join(","));
+
+    const emptyTestpathsIni = "[pytest]\ntestpaths =\n";
+    const unparseable = runWithIni(emptyTestpathsIni, "unit/test_u.py");
+    assert.equal(unparseable.verdict, "REJECT");
+    assert.ok(unparseable.blockedRules.includes("R3_CONCEALED_FAILURE"));
+  });
+
+  it("R6-F4: includes wrapper -C/--chdir effective dir in npm prep chain signature", () => {
+    const dir = createTempDir("hstack-p10-r6-f4-");
+    let seq = 0;
+    const check = (cmds) => {
+      const p = join(dir, `f4-${seq++}.jsonl`);
+      writeFileSync(
+        p,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmds[0][0] } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: cmds[0][1] },
+          { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmds[1][0] } }] },
+          { step_index: 6, type: "GENERIC", status: "DONE", content: cmds[1][1] },
+        ]),
+      );
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmds[1][0], outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    const diffDir = check([
+      ["env -C pkg-a npm ci && npm test", FAIL_OUTPUT],
+      ["env -C pkg-b npm ci && npm test", PASS_OUTPUT],
+    ]);
+    assert.equal(diffDir.verdict, "REJECT");
+    assert.ok(diffDir.blockedRules.includes("R3_CONCEALED_FAILURE"));
+
+    const sameDir = check([
+      ["env --chdir=pkg-a npm ci && npm test", FAIL_OUTPUT],
+      ["env --chdir=pkg-a npm ci && npm test", PASS_OUTPUT],
+    ]);
+    assert.equal(sameDir.verdict, "PASS", sameDir.blockedRules.join(","));
+  });
+
+  it("R6-F5: detects regular file <-> symlink replacement when stat target metadata matches", () => {
+    const repo = makeRepo();
+    const targetContent = "export const target = 2;\n";
+    writeFileSync(join(repo, "target.mjs"), targetContent);
+    writeFileSync(join(repo, "linkable.mjs"), "export const target = 1;\n");
+    git(repo, ["add", "target.mjs", "linkable.mjs"]);
+    git(repo, ["commit", "-qm", "add target and linkable"]);
+    const frozenTime = new Date("2025-01-01T00:00:00Z");
+
+    writeFileSync(join(repo, "linkable.mjs"), targetContent);
+    utimesSync(join(repo, "linkable.mjs"), frozenTime, frozenTime);
+    const regularSnap = snapshotWorkingTree(repo);
+    assert.ok(Array.isArray(regularSnap.files["linkable.mjs"]));
+
+    unlinkSync(join(repo, "linkable.mjs"));
+    symlinkSync("target.mjs", join(repo, "linkable.mjs"));
+    utimesSync(join(repo, "target.mjs"), frozenTime, frozenTime);
+    const symlinkSnap = snapshotWorkingTree(repo);
+    assert.ok(Array.isArray(symlinkSnap.files["linkable.mjs"]));
+    assert.notDeepEqual(
+      symlinkSnap.files["linkable.mjs"],
+      regularSnap.files["linkable.mjs"],
+      "snapshot signature must distinguish symlink from regular file even when target stat matches",
+    );
+
+    const { verdicts, out } = runTurnOnRepo(repo, "p10-r6-f5-symlink", [
+      { cmd: "git checkout -- linkable.mjs", effect: (r) => git(r, ["checkout", "--", "linkable.mjs"]) },
+      { write: "linkable.mjs", content: `${targetContent}// changed\n` },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["linkable.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "수정 및 검증을 완료했습니다.",
+        },
+      },
+      {
+        cmd: "ln -sf target.mjs linkable.mjs",
+        effect: (r) => {
+          unlinkSync(join(r, "linkable.mjs"));
+          symlinkSync("target.mjs", join(r, "linkable.mjs"));
+        },
+      },
+    ]);
+    assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts.join(" | "));
+    assertGateBlocked(out);
+  });
+
+  it("R6-F6: sets commitNumstatUnavailable when HEAD changed and committed-path lookup fails before early return", () => {
+    const repo = makeRepo();
+    const convKey = "p10-r6-f6-early-fail";
+    const fakeBaselineHead = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+    const snap = snapshotWorkingTree(repo);
+    saveTurnSnapshot({
+      conversationId: convKey,
+      turnStartStepIndex: 0,
+      snapshot: { ...snap, head: fakeBaselineHead },
+      dataDir: DATA_DIR,
+    });
+
+    const tr = join(repo, ".t.jsonl");
+    writeFileSync(
+      tr,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs") } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+      ]),
+    );
+    const ledger = readFactLedger(tr, repo, repo);
+    mergeShellWrittenFiles(ledger, { conversationKey: convKey, cwd: repo, dirtyFiles: new Set(), diffNumstat: new Map(), dataDir: DATA_DIR });
+    assert.equal(ledger.commitNumstatUnavailable, true);
+
+    const decision = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "확인했습니다.",
+      },
+      {
+        cwd: repo,
+        ledger,
+        gitLedger: { gitAvailable: true, gitRoot: repo, gitDirtyFiles: new Set(), diffNumstat: new Map() },
+        testInfra: { hasTestSuite: true },
+        auditEscalation: "auto",
+      },
+    );
+    assert.equal(decision.verdict, "ESCALATE_AUDIT_REQUIRED");
+    assert.ok(decision.risk.reasons.includes("numstat_unavailable"));
+  });
+
+  it("R6-F7/F8: L16 rejects non-node-test passing verifications and calls missing their GENERIC result", () => {
+    const l16 = CASES.find((entry) => entry.name === "L16-shell-edit-stop-gate");
+    const dir = createTempDir("hstack-p10-r6-f7-");
+    const evalJsonl = (records, auditRecords) => {
+      const p = join(dir, `${Math.random().toString(36).slice(2)}.jsonl`);
+      const raw = toJsonl(records);
+      writeFileSync(p, raw);
+      const parsedSteps = parseTranscriptJsonl(raw);
+      const ledger = readFactLedger(p, "/repo", "/repo");
+      return evaluateGovernanceCase(l16, {
+        steps: parsedSteps,
+        auditRecords,
+        gitDirtyFiles: ["src/calc.mjs"],
+        ledgerExecutions: ledger.turnExecutions,
+        ledgerLastWriteStepIndex: ledger.lastWriteStepIndex,
+      });
+    };
+    const audits = [
+      { event: "stop_decision", decision: "continue_gate", executionNum: 0 },
+      { event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 },
+    ];
+
+    const lintOnly = evalJsonl(
+      [
+        { step_index: 0, type: "USER_INPUT", content: l16.prompt },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "sed -i 's/+//' src/calc.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { step_index: 4, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "npx eslint src/calc.mjs" } }] },
+        { step_index: 5, type: "GENERIC", status: "DONE", content: "" },
+        { step_index: 6, type: "PLANNER_RESPONSE", tool_calls: [{ name: GATE_TOOL_NAME, args: {} }] },
+      ],
+      audits,
+    );
+    assert.equal(lintOnly.ok, false, "L16 must fail when only eslint passed instead of node --test");
+
+    const missingResult = evalJsonl(
+      [
+        { step_index: 0, type: "USER_INPUT", content: l16.prompt },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "sed -i 's/+//' src/calc.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { step_index: 4, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: GATE_TOOL_NAME, args: {} }] },
+      ],
+      audits,
+    );
+    assert.equal(missingResult.ok, false, "L16 must fail when node --test call has no matching GENERIC result");
   });
 });
