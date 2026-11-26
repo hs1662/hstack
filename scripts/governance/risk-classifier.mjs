@@ -217,7 +217,7 @@ function sumChangedLines(codeFiles, diffNumstat) {
   return total;
 }
 
-export function classifyRisk({ turnCodeWrittenFiles, gitLedger, config = null } = {}) {
+export function classifyRisk({ turnCodeWrittenFiles, gitLedger, config = null, numstatUnavailable = false } = {}) {
   const codeFiles =
     turnCodeWrittenFiles instanceof Set
       ? Array.from(turnCodeWrittenFiles)
@@ -258,6 +258,9 @@ export function classifyRisk({ turnCodeWrittenFiles, gitLedger, config = null } 
   }
   if (changedLines >= minChangedLines) {
     reasons.push("large_diff_lines");
+  }
+  if (numstatUnavailable || gitLedger?.numstatUnavailable) {
+    reasons.push("numstat_unavailable");
   }
 
   return {

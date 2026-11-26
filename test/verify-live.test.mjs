@@ -701,7 +701,8 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
   it("evaluates L16-shell-edit-stop-gate: shell-only edit must hit the Stop evidence gate", () => {
     const l16 = CASES.find((c) => c.name === "L16-shell-edit-stop-gate");
     const sedCall = { name: "run_command", args: { CommandLine: "sed -i 's|(1 + percent / 100)|(1 - percent / 100)|' src/calc.mjs" } };
-    const stopBlock = makeStep(3, "SYSTEM_MESSAGE", {
+    const testCall = { name: "run_command", args: { CommandLine: "node --test" } };
+    const stopBlock = makeStep(4, "SYSTEM_MESSAGE", {
       content: wrapAntigravityHookMessage(`${GATE_STOP_MARKER} 완료 검증이 필요합니다.`, "Stop"),
     });
     const passRecords = [
@@ -712,9 +713,10 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       steps: [
         makeStep(0, "USER_INPUT", { content: l16.prompt }),
         makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [sedCall] }),
-        makeStep(2, "PLANNER_RESPONSE", { thinking: koreanThinking, content: koreanContent }),
+        makeStep(2, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [testCall] }),
+        makeStep(3, "GENERIC", { content: "ℹ tests 1\nℹ pass 1\nℹ fail 0\n" }),
         stopBlock,
-        makeStep(4, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
+        makeStep(5, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
       ],
       auditRecords: passRecords,
       gitDirtyFiles: ["src/calc.mjs"],
@@ -725,7 +727,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       steps: [
         makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: "replace_file_content", args: {} }] }),
         stopBlock,
-        makeStep(4, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
+        makeStep(5, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
       ],
       auditRecords: passRecords,
       gitDirtyFiles: ["src/calc.mjs"],

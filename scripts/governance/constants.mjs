@@ -132,6 +132,7 @@ export const RISK_REASON_LABELS = {
   sensitive_path: "민감 경로 변경",
   large_file_count: "다수 코드 파일 변경",
   large_diff_lines: "대규모 코드 변경량",
+  numstat_unavailable: "커밋 변경량 조회 실패",
 };
 
 export const POLLUTION_WARNING_LINE =

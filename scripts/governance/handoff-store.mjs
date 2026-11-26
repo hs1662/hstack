@@ -21,7 +21,14 @@ import {
   PASSING_VERDICTS,
   isExemptDocOrAssetPath,
 } from "./constants.mjs";
-import { listCommittedPaths, normalizeWorkspacePath, readNumstatSinceHead, resolveGitRootFast, snapshotWorkingTree } from "./fact-ledger.mjs";
+import {
+  listCommittedPaths,
+  normalizeWorkspacePath,
+  readNumstatSinceHead,
+  resolveGitRootFast,
+  snapshotWorkingTree,
+  statSnapshotFile,
+} from "./fact-ledger.mjs";
 
 const MAX_SNAPSHOTS_PER_WORKSPACE = 20;
 const MAX_LIST_SNAPSHOTS = 10;
@@ -499,14 +506,7 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   };
 }
 
-function statSignature(gitRoot, relPath) {
-  try {
-    const st = statSync(join(gitRoot, relPath));
-    return [st.mtimeMs, st.size, (st.mode & 0o170000) | (st.mode & 0o111 ? 0o111 : 0)];
-  } catch {
-    return null;
-  }
-}
+const statSignature = statSnapshotFile;
 
 function sameFileSignature(a, b) {
   return Array.isArray(a) && Array.isArray(b)
@@ -573,17 +573,21 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   }
   if (sinceTurn.size > 0 && diffNumstat instanceof Map && baseline.head !== null) {
     const turnNumstat = readNumstatSinceHead(current.gitRoot, baseline.head);
-    for (const [relPath, stat] of turnNumstat) {
-      if (isExemptDocOrAssetPath(relPath)) {
-        continue;
-      }
-      if (!sinceTurn.has(relPath) && !ledger.turnCodeWrittenFiles.has(relPath)) {
-        continue;
-      }
-      const prev = diffNumstat.get(relPath);
-      const prevSum = prev ? prev.added + prev.deleted : -1;
-      if (stat.added + stat.deleted > prevSum) {
-        diffNumstat.set(relPath, stat);
+    if (turnNumstat === null) {
+      ledger.commitNumstatUnavailable = true;
+    } else {
+      for (const [relPath, stat] of turnNumstat) {
+        if (isExemptDocOrAssetPath(relPath)) {
+          continue;
+        }
+        if (!sinceTurn.has(relPath) && !ledger.turnCodeWrittenFiles.has(relPath)) {
+          continue;
+        }
+        const prev = diffNumstat.get(relPath);
+        const prevSum = prev ? prev.added + prev.deleted : -1;
+        if (stat.added + stat.deleted > prevSum) {
+          diffNumstat.set(relPath, stat);
+        }
       }
     }
   }

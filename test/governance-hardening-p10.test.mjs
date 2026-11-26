@@ -1896,9 +1896,11 @@ describe("H8 OMH gpt-6.2-astra round-4 regressions (P1 F1-F6, P2 F7-F9)", () => 
       steps: [
         { stepIndex: 0, type: "USER_INPUT", content: l16.prompt },
         { stepIndex: 1, type: "PLANNER_RESPONSE", toolCalls: [{ name: "run_command", args: { CommandLine: "sed -i 's|(1 + percent / 100)|(1 - percent / 100)|' src/calc.mjs" } }] },
-        { stepIndex: 2, type: "PLANNER_RESPONSE", content: "수정했습니다." },
-        { stepIndex: 3, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
-        { stepIndex: 4, type: "PLANNER_RESPONSE", toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] },
+        { stepIndex: 2, type: "PLANNER_RESPONSE", toolCalls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+        { stepIndex: 3, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+        { stepIndex: 4, type: "PLANNER_RESPONSE", content: "수정했습니다." },
+        { stepIndex: 5, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { stepIndex: 6, type: "PLANNER_RESPONSE", toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] },
       ],
       auditRecords: [
         { event: "stop_decision", decision: "continue_gate", executionNum: 0 },

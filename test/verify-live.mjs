@@ -26,13 +26,14 @@ import {
   CHALLENGER_ROLE_LABEL,
   GATE_TOOL_NAME,
   HANDOFF_TOOL_NAME,
+  PASSING_VERDICTS,
   SUBAGENT_TOOL_NAME,
   USER_VOTE_TOOL_NAMES,
   WORKER_AGENT_NAME,
   WORKER_ROLE_LABEL,
   WRITE_TOOL_NAMES,
 } from "../scripts/governance/constants.mjs";
-import { extractSubagentTypeNames, readFactLedger, readGitLedger } from "../scripts/governance/fact-ledger.mjs";
+import { classifyCommand, extractMcpCheckCommands, extractSubagentTypeNames, inferExecutionFailure, readFactLedger, readGitLedger } from "../scripts/governance/fact-ledger.mjs";
 import {
   GATE_STOP_MARKER,
   PRE_TOOL_USE_UI_TOOLS,
@@ -854,6 +855,7 @@ export const CASES = [
       expectStopGateBlocks: 1,
       expectStopContinueGate: true,
       expectStopBeforeFinalPass: true,
+      expectPostEditTestPass: true,
       expectMaxStopExecutionNumBelow: 2,
       expectFinalVerdict: "PASS",
     },
@@ -1675,6 +1677,9 @@ export function summarizeGovernance({
   let firstStopGateStepOrder = -1;
   let lastGateToolStepOrder = -1;
   let maxStepCacheReadTokens = null;
+  let lastEditOrShellStepOrder = -1;
+  let lastPassingTestStepOrder = -1;
+  let pendingExecs = [];
 
   const collectRoleCandidates = (call, targetAgentName) => {
     const candidates = [];
@@ -1706,14 +1711,36 @@ export function summarizeGovernance({
         firstStopGateStepOrder = sIdx;
       }
     }
+    if (step.type === "GENERIC" && pendingExecs.length > 0) {
+      const exec = pendingExecs.shift();
+      if (exec.isTest && !inferExecutionFailure(step)) {
+        lastPassingTestStepOrder = exec.order;
+      }
+      continue;
+    }
     if (step.type === "PLANNER_RESPONSE") {
+      pendingExecs = [];
       for (const call of getToolCalls(step)) {
         const name = callNameOf(call);
         if (WRITE_TOOL_NAMES.has(name)) {
           writeToolCalls += 1;
+          lastEditOrShellStepOrder = sIdx;
         }
         if (name === "run_command" || name === "mcp_agy-fast_fast_run_checks") {
           shellExecCalls += 1;
+          const cmd =
+            name === "run_command"
+              ? String(call?.args?.CommandLine ?? call?.args?.command_line ?? "")
+              : extractMcpCheckCommands(call).map((c) => c.command).join(" && ");
+          const kind = classifyCommand(cmd);
+          if (kind === "verification") {
+            pendingExecs.push({ order: sIdx, isTest: true });
+          } else {
+            if (kind === "other") {
+              lastEditOrShellStepOrder = sIdx;
+            }
+            pendingExecs.push({ order: sIdx, isTest: false });
+          }
         }
         if (name === GATE_TOOL_NAME) {
           transcriptGateCalls += 1;
@@ -1832,6 +1859,24 @@ export function summarizeGovernance({
     ? ledgerUserVotes.filter((v) => v && v.answered === true && v.errored !== true).length
     : 0;
 
+  let firstStopAuditIndex = -1;
+  let lastPassAuditIndex = -1;
+  for (let i = 0; i < safeRecords.length; i += 1) {
+    const rec = safeRecords[i];
+    if (rec?.event === "stop_decision" && (rec.decision === "continue_gate" || rec.decision === "continue_dual")) {
+      if (firstStopAuditIndex === -1) {
+        firstStopAuditIndex = i;
+      }
+    } else if (rec?.event === "gate_verify" && PASSING_VERDICTS.has(rec.verdict)) {
+      lastPassAuditIndex = i;
+    }
+  }
+  const hasPassAuditAfterStop = firstStopAuditIndex !== -1 && lastPassAuditIndex > firstStopAuditIndex;
+  const stopBeforeFinalPass =
+    firstStopGateStepOrder !== -1 &&
+    lastGateToolStepOrder > firstStopGateStepOrder &&
+    (firstStopAuditIndex === -1 || hasPassAuditAfterStop);
+
   return {
     gateCallCount,
     gateVerdicts,
@@ -1856,7 +1901,8 @@ export function summarizeGovernance({
     stopGateBlocks,
     writeToolCalls,
     shellExecCalls,
-    stopBeforeFinalPass: firstStopGateStepOrder !== -1 && lastGateToolStepOrder > firstStopGateStepOrder,
+    stopBeforeFinalPass,
+    hasPostEditTestPass: lastEditOrShellStepOrder !== -1 && lastPassingTestStepOrder > lastEditOrShellStepOrder,
     stopContinueGateCount,
     stopMaxExecutionNum,
     cacheReadTokens,
@@ -1979,6 +2025,10 @@ export function evaluateGovernanceCase(
 
   if (exp.expectStopBeforeFinalPass === true && !governance.stopBeforeFinalPass) {
     failures.push("Expected Stop gate block to occur before final verify_completion pass call");
+  }
+
+  if (exp.expectPostEditTestPass === true && !governance.hasPostEditTestPass) {
+    failures.push("Expected passing post-edit verification command execution after shell/file modification");
   }
 
   if (exp.expectStopContinueGate === true && governance.stopContinueGateCount < 1) {

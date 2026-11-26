@@ -1,4 +1,5 @@
-import { posix } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, join, posix } from "node:path";
 import {
   ALLOWED_AUDIT_ESCALATION_MODES,
   ALLOWED_SCHEMA_REGISTERS,
@@ -7,7 +8,7 @@ import {
   REGISTER_COPY,
   RISK_REASON_LABELS,
 } from "./constants.mjs";
-import { classifyCommand, normalizeWorkspacePath, splitShellSegments } from "./fact-ledger.mjs";
+import { classifyCommand, extractChainPrepSignature, normalizeWorkspacePath, splitShellSegments } from "./fact-ledger.mjs";
 import { detectHedges } from "./hedge-detector.mjs";
 import { classifyRisk } from "./risk-classifier.mjs";
 
@@ -66,15 +67,6 @@ function advanceDir(currentDir, op, arg, opaqueSeq) {
   return { dir: nextDir, stack };
 }
 
-function isChainPrepText(norm) {
-  const tok = norm.split(" ");
-  if (tok[0] !== "npm") {
-    return false;
-  }
-  const positional = tok.slice(1).filter((t) => !t.startsWith("-"));
-  return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
-}
-
 function extractVerificationEntries(cmd, baseDir = ".") {
   if (typeof cmd !== "string" || cmd.trim().length === 0) {
     return [];
@@ -94,8 +86,9 @@ function extractVerificationEntries(cmd, baseDir = ".") {
       state = advanceDir(state, dirMatch[1], dirMatch[2]?.trim(), seq);
       continue;
     }
-    if (isChainPrepText(norm)) {
-      prepPrefixes.push(norm);
+    const prepSig = extractChainPrepSignature(seg);
+    if (prepSig) {
+      prepPrefixes.push(`${state.dir}::${prepSig}`);
       continue;
     }
     if (classifyCommand(norm) === "verification") {
@@ -141,8 +134,47 @@ const ALL_TESTS_WITHOUT_TARGETS = [
 const SHELL_OPERATOR_TOKEN_RE = /[|&;()<>`$]/;
 const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
-function isPathTarget(token) {
-  return !token.startsWith("-") && !token.includes("=") && (/[/\\*]/.test(token) || /\.[A-Za-z0-9]+$/.test(token));
+function isPathTarget(token, runnerPrefix = []) {
+  const raw = Array.isArray(runnerPrefix) && runnerPrefix.includes("pytest") ? token.split("::")[0] : token;
+  return Boolean(raw) && !raw.startsWith("-") && !raw.includes("=") && (/[/\\*]/.test(raw) || /\.[A-Za-z0-9]+$/.test(raw));
+}
+
+const EXCLUDED_TEST_DIRS_RE = /(?:^|\/)(?:node_modules|\.git|\.venv|venv|__pycache__|build|dist|\.tox|\.nox|\.eggs)(?:\/|$)/;
+
+function readPytestTestpaths(execDir) {
+  if (!execDir || !existsSync(execDir)) {
+    return null;
+  }
+  const iniPath = join(execDir, "pytest.ini");
+  if (existsSync(iniPath)) {
+    try {
+      const m = /^[ \t]*testpaths[ \t]*=[ \t]*(.+)$/m.exec(readFileSync(iniPath, "utf8"));
+      if (m) {
+        return m[1].trim().split(/[\s,]+/).filter(Boolean).map((p) => p.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""));
+      }
+    } catch {
+      return null;
+    }
+  }
+  const pyprojPath = join(execDir, "pyproject.toml");
+  if (existsSync(pyprojPath)) {
+    try {
+      const text = readFileSync(pyprojPath, "utf8");
+      const sect = /\[tool\.pytest\.ini_options\]([\s\S]*?)(?:\n\[|$)/.exec(text);
+      if (sect) {
+        const arrMatch = /testpaths\s*=\s*\[([^\]]*)\]/.exec(sect[1]);
+        if (arrMatch) {
+          return arrMatch[1]
+            .split(",")
+            .map((s) => s.trim().replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""))
+            .filter(Boolean);
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
 }
 
 const RUNNER_VALUE_FLAGS = new Set([
@@ -188,11 +220,25 @@ const RUNNER_VALUE_FLAGS = new Set([
   "--tsconfig",
 ]);
 
-function isDefaultDiscoverableTestTarget(target, runnerPrefix) {
-  const norm = target.replace(/\\/g, "/").replace(/^\.\//, "");
+function isDefaultDiscoverableTestTarget(target, runnerPrefix, execDir = "") {
+  const rawFile = runnerPrefix.includes("pytest") ? target.split("::")[0] : target;
+  const normRaw = rawFile.replace(/\\/g, "/");
+  if (normRaw.startsWith("/") || /^[A-Za-z]:\//.test(normRaw)) {
+    return false;
+  }
+  const norm = normRaw.replace(/^\.\//, "");
+  if (norm.split("/").includes("..") || EXCLUDED_TEST_DIRS_RE.test(norm)) {
+    return false;
+  }
   if (runnerPrefix.includes("pytest")) {
-    const filePart = norm.split("::")[0];
-    return /(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(filePart);
+    if (!/(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm)) {
+      return false;
+    }
+    const testpaths = readPytestTestpaths(execDir);
+    if (testpaths && testpaths.length > 0) {
+      return testpaths.some((tp) => tp === "." || norm === tp || norm.startsWith(`${tp}/`));
+    }
+    return true;
   }
   if (runnerPrefix[0] === "node" && runnerPrefix[1] === "--test") {
     return /(?:^|\/)test(?:\/|$)|(?:^|\/)test-[^/]*\.[cm]?js$|(?:^|\/)test\.[cm]?js$|[._-]test\.[cm]?js$/.test(norm);
@@ -229,7 +275,7 @@ function droppedTokenIndexes(failed, passed) {
 // A passing command clears a failing one when it is the same command, or the same runner and flags
 // with every file target removed on a runner whose target-less form runs every test. Dropping only
 // some targets narrows the run. Go widens only to `./...`, over relative package targets inside it.
-function segmentResolvedBy(failedSeg, passedSeg) {
+function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   if (failedSeg.length === 0 || passedSeg.length === 0) {
     return false;
   }
@@ -246,7 +292,7 @@ function segmentResolvedBy(failedSeg, passedSeg) {
     return false;
   }
   if (runner.kind === "go") {
-    const isGoTarget = (token) => token === "." || isPathTarget(token);
+    const isGoTarget = (token) => token === "." || isPathTarget(token, runner.prefix);
     const targets = (tokens) => tokens.slice(runner.end).filter(isGoTarget);
     const flags = (tokens) => tokens.slice(runner.end).filter((token) => !isGoTarget(token));
     return (
@@ -260,23 +306,33 @@ function segmentResolvedBy(failedSeg, passedSeg) {
     return false;
   }
   const isTarget = (tokens, index) =>
-    isPathTarget(tokens[index]) && !(index - 1 >= runner.end && RUNNER_VALUE_FLAGS.has(tokens[index - 1]));
+    isPathTarget(tokens[index], runner.prefix) && !(index - 1 >= runner.end && RUNNER_VALUE_FLAGS.has(tokens[index - 1]));
   const droppedOnlyTargets = dropped.every((index) =>
     failed[index] === "--"
       ? failed.slice(index + 1).every((_, k) => dropped.includes(index + 1 + k))
-      : isTarget(failed, index) && isDefaultDiscoverableTestTarget(failed[index], runner.prefix),
+      : isTarget(failed, index) && isDefaultDiscoverableTestTarget(failed[index], runner.prefix, execDir),
   );
   return droppedOnlyTargets && !passed.some((_, index) => index >= runner.end && isTarget(passed, index));
 }
 
-function entriesMatchForResolution(failedEntry, passedEntry) {
+function resolveEntryExecDir(entryDir, baseCwd) {
+  if (!entryDir || entryDir === ".") {
+    return baseCwd;
+  }
+  if (isAbsolute(entryDir)) {
+    return entryDir;
+  }
+  return baseCwd ? join(baseCwd, entryDir) : entryDir;
+}
+
+function entriesMatchForResolution(failedEntry, passedEntry, baseCwd = "") {
   if (failedEntry.dir !== passedEntry.dir) {
     return false;
   }
   if (failedEntry.prepKey && passedEntry.prepKey !== failedEntry.prepKey) {
     return false;
   }
-  return segmentResolvedBy(failedEntry.seg, passedEntry.seg);
+  return segmentResolvedBy(failedEntry.seg, passedEntry.seg, resolveEntryExecDir(failedEntry.dir, baseCwd));
 }
 
 function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBaseDir = ".") {
@@ -288,9 +344,9 @@ function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBa
   const failedEntries = extractVerificationEntries(failedCmd, failedBaseDir);
   const passedEntries = extractVerificationEntries(passedCmd, passedBaseDir);
   if (failedEntries.length > 0 && passedEntries.length > 0) {
-    return failedEntries.every((failedEntry) => passedEntries.some((passedEntry) => entriesMatchForResolution(failedEntry, passedEntry)));
+    return failedEntries.every((failedEntry) => passedEntries.some((passedEntry) => entriesMatchForResolution(failedEntry, passedEntry, failedBaseDir)));
   }
-  return normalizeExecDir(failedBaseDir) === normalizeExecDir(passedBaseDir) && segmentResolvedBy(failedNorm, passedNorm);
+  return normalizeExecDir(failedBaseDir) === normalizeExecDir(passedBaseDir) && segmentResolvedBy(failedNorm, passedNorm, failedBaseDir);
 }
 
 function extractExecutionVerificationEntries(exec, defaultCwd = ".") {
@@ -510,10 +566,11 @@ function claimMatchesExecution(normClaim, exec) {
   if (normClaim.length === 0 || !exec) {
     return false;
   }
-  if (commandMatchesExecution(normClaim, exec.command)) {
+  const hasSubCommands = Array.isArray(exec.subCommands) && exec.subCommands.length > 0;
+  if (!hasSubCommands && commandMatchesExecution(normClaim, exec.command)) {
     return true;
   }
-  if (Array.isArray(exec.subCommands)) {
+  if (hasSubCommands) {
     for (const subCmd of exec.subCommands) {
       if (commandMatchesExecution(normClaim, subCmd)) {
         return true;
@@ -815,6 +872,7 @@ export function decideGate(input = {}, context = {}) {
       turnCodeWrittenFiles: ledger.turnCodeWrittenFiles,
       gitLedger,
       config: context.governanceConfig ?? null,
+      numstatUnavailable: Boolean(ledger?.commitNumstatUnavailable || gitLedger?.numstatUnavailable),
     });
   const allTurnAudits = Array.isArray(ledger.turnSubagentAudits) ? ledger.turnSubagentAudits : [];
   const totalAuditRejects = allTurnAudits.filter((audit) => audit.verdict === "REJECT").length;

@@ -103,7 +103,9 @@ const CARGO_VALUE_FLAGS = new Set(["--manifest-path", "--target", "--target-dir"
 const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench", "compile"]);
 const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
 const JS_TEST_LIST_FLAGS = new Set(["--listTests", "--list-tests", "--list", "--showConfig", "--show-config"]);
-const MAKE_DRY_RUN_LONG_FLAGS = new Set(["--just-print", "--dry-run", "--recon", "--question", "--touch", "--print-data-base"]);
+const MAKE_DRY_RUN_LONG_FLAGS = new Set(["--just-print", "--dry-run", "--recon", "--question", "--touch", "--print-data-base", "--help", "--version"]);
+const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "o", "W", "l", "j", "O", "E"]);
+const MAKE_NOOP_SHORT_FLAGS = new Set(["n", "q", "t", "p", "h", "v"]);
 const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
 const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
   /^(?:--if-present|--script-shell|--userconfig|--globalconfig|--prefix|--dir|--cwd|-C|--preload|-r|--require|--import|--loader)(?:=|$)/;
@@ -166,7 +168,7 @@ const NPM_BLOCKED_CONFIG_ENV_RE =
 
 // Assignments that change which binary or code runs: PATH with a non-system dir, preload and startup hooks, GIT_*, and unsafe package-manager env configs.
 function isExecHijackAssign(tok) {
-  if (/^(?:GIT_[A-Za-z0-9_]*|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/.test(tok)) {
+  if (/^(?:GIT_[A-Za-z0-9_]*|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|MAKEFLAGS|GNUMAKEFLAGS)=/.test(tok)) {
     return true;
   }
   if (NPM_BLOCKED_CONFIG_ENV_RE.test(tok)) {
@@ -1042,8 +1044,15 @@ function isJsTestToolArgsSafe(tool, toolArgs) {
   if (head.some((a) => JS_TEST_LIST_FLAGS.has(a))) {
     return false;
   }
-  if (tool === "vitest" && head.find((a) => !a.startsWith("-")) === "list") {
+  const firstPos = head.find((a) => !a.startsWith("-")) ?? "";
+  if (tool === "vitest" && firstPos === "list") {
     return false;
+  }
+  if (tool === "playwright") {
+    return firstPos === "test";
+  }
+  if (tool === "cypress") {
+    return firstPos === "run";
   }
   return true;
 }
@@ -1051,12 +1060,56 @@ function isJsTestToolArgsSafe(tool, toolArgs) {
 function isMakeVerification(args) {
   const sepIdx = args.indexOf("--");
   const head = sepIdx === -1 ? args : args.slice(0, sepIdx);
-  for (const arg of head) {
-    if (MAKE_DRY_RUN_LONG_FLAGS.has(arg)) {
+  for (let i = 0; i < head.length; i += 1) {
+    const arg = head[i];
+    if (/^(?:MAKEFLAGS|GNUMAKEFLAGS)=/.test(arg)) {
       return false;
     }
-    if (/^-[A-Za-z]+$/.test(arg) && /[nqtp]/.test(arg.slice(1))) {
-      return false;
+    if (arg.startsWith("--")) {
+      const flagName = arg.split("=", 1)[0];
+      if (MAKE_DRY_RUN_LONG_FLAGS.has(flagName)) {
+        return false;
+      }
+      continue;
+    }
+    if (arg.startsWith("-") && arg.length > 1) {
+      const chars = arg.slice(1);
+      for (let j = 0; j < chars.length; j += 1) {
+        const ch = chars[j];
+        if (MAKE_NOOP_SHORT_FLAGS.has(ch)) {
+          return false;
+        }
+        if (MAKE_VALUE_FLAGS.has(ch)) {
+          const rest = chars.slice(j + 1);
+          if (ch === "j" || ch === "l") {
+            if (rest.length > 0) {
+              const numMatch = /^(?:\d+(?:\.\d*)?|\.\d+)(.*)$/.exec(rest);
+              const trailing = numMatch ? numMatch[1] : rest;
+              if (numMatch) {
+                for (const t of trailing) {
+                  if (MAKE_NOOP_SHORT_FLAGS.has(t) || !/[A-Za-z]/.test(t)) {
+                    return false;
+                  }
+                }
+                j += (numMatch[0].length - trailing.length);
+                continue;
+              }
+              return false;
+            }
+            if (head[i + 1] && /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(head[i + 1])) {
+              i += 1;
+            }
+            break;
+          }
+          if (rest.length === 0 && i + 1 < head.length) {
+            i += 1;
+          }
+          break;
+        }
+        if (!/[A-Za-z]/.test(ch)) {
+          return false;
+        }
+      }
     }
   }
   return true;
@@ -1162,6 +1215,25 @@ function isChainPrepCommand({ words, redirects }) {
   }
   const positional = args.filter((tok) => !tok.startsWith("-"));
   return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
+}
+
+export function extractChainPrepSignature(segment) {
+  if (typeof segment !== "string" || segment.trim().length === 0) {
+    return null;
+  }
+  const cmds = lexVerificationChain(segment);
+  if (!cmds || cmds.length !== 1) {
+    return null;
+  }
+  const parsed = cmds[0];
+  if (!isChainPrepCommand(parsed)) {
+    return null;
+  }
+  const idx = skipCommandPrefix(parsed.words);
+  if (idx === -1 || idx >= parsed.words.length) {
+    return null;
+  }
+  return ["npm", ...parsed.words.slice(idx + 1)].join(" ");
 }
 
 // A known test runner, optionally behind safe assignments and wrappers. A shell `-c` body must itself match the
@@ -2042,6 +2114,7 @@ function createEmptyLedger(transcriptAvailable = false) {
     turnWorkerConversationIds: [],
     latestTokens: { inputTokens: null, cacheReadTokens: null, outputTokens: null },
     gateBlockedThisTurn: false,
+    commitNumstatUnavailable: false,
   };
 }
 
@@ -2132,6 +2205,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     ledger.turnWorkerCompleted = false;
     ledger.turnWorkerConversationIds = [];
     ledger.gateBlockedThisTurn = false;
+    ledger.commitNumstatUnavailable = false;
     pendingCalls = [];
     seenGenericInCurrentPlanner = false;
     asyncAuditsByConversationId.clear();
@@ -2674,7 +2748,7 @@ export function readSessionRole(transcriptPath) {
       continue;
     }
   }
-  return "main";
+  return "unknown";
 }
 
 // Stop and PostInvocation: the turn ledger and the drift steps both read from the tail.
@@ -2874,10 +2948,10 @@ const SNAPSHOT_MAX_FILES = 2000;
 
 const SNAPSHOT_MAX_BUFFER = 16 * 1024 * 1024;
 
-function statSnapshotFile(gitRoot, relPath) {
+export function statSnapshotFile(gitRoot, relPath) {
   try {
     const st = statSync(join(gitRoot, relPath));
-    return [st.mtimeMs, st.size, (st.mode & 0o170000) | (st.mode & 0o111 ? 0o111 : 0)];
+    return [st.mtimeMs, st.size, (st.mode & 0o170000) | (st.mode & 0o111)];
   } catch {
     return null;
   }
@@ -3005,9 +3079,10 @@ export function readNumstatSinceHead(gitRoot, fromHead) {
       { cwd: gitRoot, timeout: SNAPSHOT_GIT_TIMEOUT_MS, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     );
     parseNumstatOutput(out, gitRoot, numstat, true);
+    return numstat;
   } catch {
+    return null;
   }
-  return numstat;
 }
 
 export function readGitLedger(cwd) {

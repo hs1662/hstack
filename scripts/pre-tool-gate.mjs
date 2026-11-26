@@ -307,7 +307,7 @@ function analyzeChallengerState(ledger) {
 // The role alone needs only the transcript header, so a run_command or an off-mode write stays O(header).
 function resolveSessionRole(transcriptPath, options) {
   if (options?.ledger) {
-    return options.ledger.transcriptAvailable ? options.ledger.sessionRole : "main";
+    return options.ledger.transcriptAvailable ? options.ledger.sessionRole : (transcriptPath ? "unknown" : "main");
   }
   return transcriptPath ? readSessionRole(transcriptPath) : "main";
 }
@@ -315,7 +315,7 @@ function resolveSessionRole(transcriptPath, options) {
 function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options }) {
   const dataDir = options?.dataDir ?? resolvePluginDataDir();
   const sessionRole = resolveSessionRole(transcriptPath, options);
-  if (sessionRole === "auditor" || sessionRole === "challenger") {
+  if (sessionRole === "auditor" || sessionRole === "challenger" || sessionRole === "unknown") {
     return { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON };
   }
   if (sessionRole !== "main") {
@@ -453,7 +453,7 @@ export function handlePreToolGate(stdinText, options = {}) {
   // Test runners and npx run arbitrary code, so no command string proves a shell call read-only.
   if (EXEC_TOOL_NAMES.has(toolName) || MCP_VERIFICATION_TOOL_NAMES.has(toolName)) {
     const sessionRole = resolveSessionRole(transcriptPath, options);
-    return sessionRole === "auditor" || sessionRole === "challenger"
+    return sessionRole === "auditor" || sessionRole === "challenger" || sessionRole === "unknown"
       ? { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON }
       : { decision: "allow" };
   }

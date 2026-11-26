@@ -132,7 +132,8 @@ const EN_POLITE_REQUEST_RE = new RegExp(
 );
 
 // "Switch to English", "Let's speak English", "From now on, English": a change of conversation language.
-const EN_LANG_CLAUSE_END = "(?=\\s*(?:$|[.,!?;:)]|(?:please|only|from|instead|now|again|with)\\b))";
+const EN_LANG_CLAUSE_END =
+  "(?=\\s*(?:$|[.,!?;:)]|(?:please|only|from|instead|now|again|with|until|during)\\b|for\\s+(?:the\\s+)?(?:rest|remainder|next|remaining|future|following|this|our|all|now)\\b|for\\s+now\\b))";
 const EN_SWITCH_REQUEST_RE = new RegExp(
   `(?:^|[,;]\\s*|\\b(?:and|then|so|let['’]?s|let\\s+us|(?:can|could|would|will)\\s+(?:you|we))\\s+)` +
     `(?:(?:please|kindly|just|now|only|always)\\s+)*` +
