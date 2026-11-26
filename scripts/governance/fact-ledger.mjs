@@ -556,6 +556,9 @@ function classifySingleSegment(segment) {
   if (READ_ONLY_BINARIES.has(baseBin) || SHELL_NEUTRAL_BUILTINS.has(baseBin)) {
     return hasFileRedirect ? "other" : "read_only";
   }
+  if (baseBin === "node" && tokens.length === idx + 2 && /^(?:-v|--version)$/.test(tokens[idx + 1])) {
+    return hasFileRedirect ? "other" : "read_only";
+  }
   if (BARE_SCRIPT_RUNNERS.has(baseBin)) {
     const args = tokens.slice(idx + 1).filter((tok) => !tok.startsWith("-"));
     if (args.length === 1 && (args[0] === "run" || args[0] === "run-script")) {
@@ -634,6 +637,8 @@ function lexVerificationChain(line) {
   return close("", line.length) ? cmds : null;
 }
 
+const NODE_TEST_FILE_RE = /(?:^|\/)test\/|\.(?:test|spec)\.[cm]?[jt]sx?$/;
+
 function isSafeAssign(tok) {
   return ENV_ASSIGN_RE.test(tok) && !isExecHijackAssign(tok);
 }
@@ -672,6 +677,10 @@ function isRunnerCommand({ words, redirects }) {
     return false;
   }
   const scriptArgs = args.filter((tok) => !tok.startsWith("-"));
+  // `node <script>` runs any program, so node counts only for its test runner or a test file.
+  if (baseBin === "node" && !args.some((tok) => tok === "--test") && !scriptArgs.some((tok) => NODE_TEST_FILE_RE.test(tok))) {
+    return false;
+  }
   if (BARE_SCRIPT_RUNNERS.has(baseBin) && scriptArgs.length === 1 && (scriptArgs[0] === "run" || scriptArgs[0] === "run-script")) {
     return false;
   }
