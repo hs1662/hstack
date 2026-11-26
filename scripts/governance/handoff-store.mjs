@@ -533,6 +533,10 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
   const postGateWriter = postGateShell.some((exec) => exec.kind === "other");
   const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
+  // A file the gate saw as it is now was verified, even if a later commit touched it, so only the shell calls
+  // before the gate can have made it.
+  const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
+  const preGateKeepsToolDate = (relPath) => !preGateShell.some((exec) => exec.kind === "other") && ledger.turnWrittenFiles.has(relPath);
   for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
     if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
       continue;
@@ -541,8 +545,8 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       if (postGateWriter || !toolWroteAfterGate(relPath)) {
         record(relPath, datingStep(postGateShell));
       }
-    } else if (!keepsToolDate(relPath)) {
-      record(relPath, writeStep);
+    } else if (!preGateKeepsToolDate(relPath)) {
+      record(relPath, preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex);
     }
   }
   return false;
