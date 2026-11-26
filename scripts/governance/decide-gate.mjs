@@ -14,6 +14,8 @@ const BARE_RUNTIME_LAUNCHERS = new Set([
   "node",
   "npm",
   "npx",
+  "pnpx",
+  "bunx",
   "pnpm",
   "yarn",
   "python",

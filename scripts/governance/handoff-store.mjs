@@ -408,7 +408,13 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
         ...prev,
         conversationId,
         updatedAt: new Date().toISOString(),
-        turnSnapshot: { turnStartStepIndex, gitRoot: snapshot.gitRoot, head: snapshot.head, files: snapshot.files },
+        turnSnapshot: {
+          turnStartStepIndex,
+          gitRoot: snapshot.gitRoot,
+          head: snapshot.head,
+          files: snapshot.files,
+          untrackedTruncated: Boolean(snapshot.untrackedTruncated),
+        },
       });
       return true;
     });
@@ -432,7 +438,14 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
       atomicWriteJson(filePath, {
         ...prev,
         updatedAt: new Date().toISOString(),
-        turnSnapshot: { ...prev.turnSnapshot, gate: { head: snapshot.head, files: snapshot.files } },
+        turnSnapshot: {
+          ...prev.turnSnapshot,
+          gate: {
+            head: snapshot.head,
+            files: snapshot.files,
+            untrackedTruncated: Boolean(snapshot.untrackedTruncated),
+          },
+        },
       });
       return true;
     });
@@ -458,8 +471,10 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   const headOf = (raw) => (typeof raw?.head === "string" ? raw.head : null);
   const gateFiles = snap.gate?.files;
   const gate =
-    gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles) ? { head: headOf(snap.gate), files: gateFiles } : null;
-  return { gitRoot: snap.gitRoot, head: headOf(snap), files: snap.files, gate };
+    gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles)
+      ? { head: headOf(snap.gate), files: gateFiles, untrackedTruncated: Boolean(snap.gate?.untrackedTruncated) }
+      : null;
+  return { gitRoot: snap.gitRoot, head: headOf(snap), files: snap.files, untrackedTruncated: Boolean(snap.untrackedTruncated), gate };
 }
 
 // The [mtimeMs, size] signature snapshotWorkingTree records, or null for a missing file.
@@ -486,11 +501,10 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
     return false;
   }
-  const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
+  const unclassifiedShellExecs = shellExecs.filter((exec) => exec.kind === "other");
   // Date a change at the last command that could have made it: a writer, else a read-only-looking command, else a check.
   const datingStep = (execs) =>
     (execs.findLast((exec) => exec.kind === "other") ?? execs.findLast((exec) => exec.kind === "read_only") ?? execs.at(-1)).stepIndex;
-  const writeStep = datingStep(shellExecs);
   const otherStep = shellExecs.findLast((exec) => exec.kind === "other")?.stepIndex ?? -1;
   const record = (relPath, step) => {
     ledger.turnWrittenFiles.add(relPath);
@@ -508,14 +522,14 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
   const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
   if (!sinceTurn || !sinceGate) {
-    if (writers.length === 0 || !resolveGitRootFast(cwd)) {
+    if (unclassifiedShellExecs.length === 0 || !resolveGitRootFast(cwd)) {
       return false;
     }
-    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, otherStep);
     // Without a diff any dirty code file may be the shell's, so each one needs reporting and a check after it.
     for (const relPath of dirtyFiles) {
       if (!isExemptDocOrAssetPath(relPath) && !keepsToolDate(relPath)) {
-        record(relPath, writeStep);
+        record(relPath, otherStep);
       }
     }
     return true;
@@ -547,6 +561,19 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       }
     } else if (!preGateKeepsToolDate(relPath)) {
       record(relPath, preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex);
+    }
+  }
+  const untrackedIncomplete = Boolean(
+    current.untrackedTruncated || baseline.untrackedTruncated || (postGateShell.length > 0 && baseline.gate?.untrackedTruncated),
+  );
+  if (untrackedIncomplete && unclassifiedShellExecs.length > 0) {
+    if (postGateWriter) {
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+      return true;
+    }
+    if (lastGateStep === -1 || otherStep > lastGateStep) {
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, otherStep);
+      return true;
     }
   }
   return false;

@@ -211,6 +211,8 @@ export const VERIFICATION_BINARIES = new Set([
   "pnpm",
   "yarn",
   "npx",
+  "pnpx",
+  "bunx",
   "bun",
   "deno",
   "pytest",

@@ -57,6 +57,46 @@ const CHALLENGER_MARKER_LINE_RE = /^\[hstack:사전검토\]$/;
 const WORKER_MARKER_LINE_RE = /^\[hstack:격리작업\]$/;
 const INJECTED_CONTEXT_LINE_RE =
   /^(?:작업 경로:|세션 기록 경로:|현재 턴 시작 스텝:|-\s*작업 디렉터리:|위 작업 경로의 실제 파일과 호출 관계를 직접 읽고)/;
+const PACKAGE_EXEC_RUNNERS = new Set(["npx", "pnpx", "bunx"]);
+const PACKAGE_EXEC_SAFE_FLAGS = new Set([
+  "-y",
+  "--yes",
+  "--no",
+  "--no-install",
+  "-q",
+  "--quiet",
+  "--silent",
+  "--prefer-offline",
+  "--offline",
+  "--bun",
+]);
+const PACKAGE_EXEC_VERIFICATION_TOOLS = new Set([
+  "vitest",
+  "jest",
+  "mocha",
+  "ava",
+  "tap",
+  "playwright",
+  "cypress",
+  "tsc",
+  "vue-tsc",
+  "eslint",
+  "oxlint",
+  "biome",
+  "stylelint",
+]);
+const NPM_TEST_SUBCOMMANDS = new Set(["test", "t", "tst"]);
+const PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS = new Set([
+  "test",
+  "t",
+  "tst",
+  "lint",
+  "typecheck",
+  "check",
+  "build",
+  "verify",
+]);
+const GO_VERIFICATION_SUBCOMMANDS = new Set(["test", "vet", "build"]);
 // `npm run` with no script name only lists scripts.
 const BARE_SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
 const ALLOWED_SUBAGENT_SYSTEM_SOURCES = new Set(["SYSTEM"]);
@@ -400,6 +440,7 @@ const PYTHON_FLAGS_WITH_ARG = new Set(["-W", "-X"]);
 const INLINE_CODE_FLAG_RE = {
   node: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
   bun: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
+  tsx: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
 };
 
 // The inline body of an interpreter given code on its command line, or null for a script or a plain run.
@@ -410,8 +451,10 @@ function inlineInterpreterBody(bin, args) {
     let pipefail = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg)) {
-        pipefail ||= arg === "-o" && args[i + 1] === "pipefail";
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][A-Za-z]*o$/.test(arg)) {
+        if (args[i + 1] === "pipefail") {
+          pipefail = arg[0] === "-";
+        }
         i += 1;
       } else if (/^[-+][A-Za-z]+$/.test(arg)) {
         inline ||= arg[0] === "-" && arg.includes("c");
@@ -691,6 +734,25 @@ function isSafeAssign(tok) {
   return ENV_ASSIGN_RE.test(tok) && !isExecHijackAssign(tok);
 }
 
+function isValidSetCommandArgs(args) {
+  if (args.length === 0) {
+    return false;
+  }
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (!SET_FLAG_RE.test(arg)) {
+      return false;
+    }
+    if (arg.endsWith("o")) {
+      if (!SET_OPTIONS.has(args[i + 1] ?? "")) {
+        return false;
+      }
+      i += 1;
+    }
+  }
+  return true;
+}
+
 // cd/pushd/popd, `set` with errexit/nounset/xtrace/pipefail only, safe assignments or exports, or a read-only command.
 function isPrefixCommand({ words, raw }) {
   const [bin, ...args] = words;
@@ -702,13 +764,112 @@ function isPrefixCommand({ words, raw }) {
   }
   if (bin === "set") {
     // `set -n` (noexec) would skip the runner and exit 0, so only these flags pass.
-    return args.length > 0 && args.every((arg, i) => SET_FLAG_RE.test(arg) || (SET_OPTIONS.has(arg) && /o$/.test(args[i - 1] ?? "")));
+    return isValidSetCommandArgs(args);
   }
   return bin !== "export" && classifySingleSegment(raw) === "read_only";
 }
 
-function setsPipefail({ words }) {
-  return words[0] === "set" && words.some((tok, i) => tok === "pipefail" && /o$/.test(words[i - 1] ?? ""));
+function applyPipefailState({ words }, current) {
+  if (words[0] !== "set") {
+    return current;
+  }
+  let state = current;
+  for (let i = 1; i < words.length; i += 1) {
+    const tok = words[i];
+    if (SET_FLAG_RE.test(tok) && tok.endsWith("o")) {
+      if (words[i + 1] === "pipefail") {
+        state = tok[0] === "-";
+      }
+      i += 1;
+    }
+  }
+  return state;
+}
+
+function isTsxVerification(args) {
+  if (inlineInterpreterBody("tsx", args) !== null) {
+    return false;
+  }
+  const sepIdx = args.indexOf("--");
+  const headArgs = sepIdx === -1 ? args : args.slice(0, sepIdx);
+  if (headArgs.some((tok) => tok === "--test")) {
+    return true;
+  }
+  return headArgs.filter((tok) => !tok.startsWith("-")).some((tok) => NODE_TEST_FILE_RE.test(tok));
+}
+
+function isPackageExecVerification(args) {
+  let toolIdx = 0;
+  while (toolIdx < args.length) {
+    const arg = args[toolIdx];
+    if (arg === "--") {
+      toolIdx += 1;
+      break;
+    }
+    if (!arg.startsWith("-")) {
+      break;
+    }
+    if (!PACKAGE_EXEC_SAFE_FLAGS.has(arg)) {
+      return false;
+    }
+    toolIdx += 1;
+  }
+  const tool = args[toolIdx];
+  if (!tool || /[/\\@:]/.test(tool)) {
+    return false;
+  }
+  const toolArgs = args.slice(toolIdx + 1);
+  if (tool === "prettier") {
+    const hasCheck = toolArgs.some((a) => a === "--check" || a === "-c" || a === "--list-different" || a === "-l");
+    const hasWrite = toolArgs.some((a) => a === "--write" || a === "-w");
+    return hasCheck && !hasWrite;
+  }
+  if (tool === "tsx") {
+    return isTsxVerification(toolArgs);
+  }
+  if (tool === "biome") {
+    return !toolArgs.some((a) => a === "--write" || a === "--apply" || a === "--apply-unsafe" || a === "--unsafe");
+  }
+  return PACKAGE_EXEC_VERIFICATION_TOOLS.has(tool);
+}
+
+function isScriptRunnerVerification(baseBin, args) {
+  const sepIdx = args.indexOf("--");
+  const headArgs = sepIdx === -1 ? args : args.slice(0, sepIdx);
+  const positional = headArgs.filter((tok) => !tok.startsWith("-"));
+  const sub = positional[0] ?? "";
+  if (baseBin === "bun") {
+    return (
+      sub === "test" ||
+      ((sub === "run" || sub === "run-script") &&
+        Boolean(positional[1]) &&
+        !/[/\\.]/.test(positional[1]) &&
+        CHECK_SCRIPT_RE.test(positional[1]))
+    );
+  }
+  if (baseBin === "npm") {
+    return NPM_TEST_SUBCOMMANDS.has(sub) || ((sub === "run" || sub === "run-script") && Boolean(positional[1]));
+  }
+  return (
+    PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS.has(sub) ||
+    ((sub === "run" || sub === "run-script") && Boolean(positional[1]))
+  );
+}
+
+function isChainPrepCommand({ words, redirects }) {
+  if (redirects > 0) {
+    return false;
+  }
+  const idx = skipCommandPrefix(words);
+  if (idx === -1 || idx >= words.length) {
+    return false;
+  }
+  const baseBin = posix.basename(toPosix(words[idx]));
+  if (baseBin !== "npm") {
+    return false;
+  }
+  const positional = words.slice(idx + 1).filter((tok) => !tok.startsWith("-"));
+  return positional[0] === "ci" || positional[0] === "install";
 }
 
 // A known test runner, optionally behind safe assignments and wrappers. A shell `-c` body must itself match the
@@ -732,18 +893,23 @@ function isRunnerCommand({ words, redirects }) {
   if (baseBin === "node" && !args.some((tok) => tok === "--test") && !scriptArgs.some((tok) => NODE_TEST_FILE_RE.test(tok))) {
     return false;
   }
+  if (baseBin === "tsx" && !isTsxVerification(args)) {
+    return false;
+  }
   if ((baseBin === "python" || baseBin === "python3") && !pythonRunsTests(args)) {
     return false;
   }
-  // `bun <file>` and `bun run <file>` run any program; `bun test` and `bun run test` run the tests.
-  if (baseBin === "bun" && !(scriptArgs[0] === "test" || (scriptArgs[0] === "run" && scriptArgs[1] === "test"))) {
+  if (PACKAGE_EXEC_RUNNERS.has(baseBin) && !isPackageExecVerification(args)) {
+    return false;
+  }
+  if (BARE_SCRIPT_RUNNERS.has(baseBin) && !isScriptRunnerVerification(baseBin, args)) {
+    return false;
+  }
+  if (baseBin === "go" && !GO_VERIFICATION_SUBCOMMANDS.has(args[0] ?? "")) {
     return false;
   }
   // A local script or one a shell reads from a file runs anything, so only a test or check script counts.
   if (!VERIFICATION_BINARIES.has(baseBin) && !CHECK_SCRIPT_RE.test(rawBin)) {
-    return false;
-  }
-  if (BARE_SCRIPT_RUNNERS.has(baseBin) && scriptArgs.length === 1 && (scriptArgs[0] === "run" || scriptArgs[0] === "run-script")) {
     return false;
   }
   const body = inlineInterpreterBody(baseBin, args);
@@ -769,8 +935,8 @@ function matchesVerificationGrammar(commandLine) {
     if (cmd.op === "") {
       return isRunnerCommand(cmd);
     }
-    pipefail ||= setsPipefail(cmd);
-    if (!isPrefixCommand(cmd) && !isRunnerCommand(cmd)) {
+    pipefail = applyPipefailState(cmd, pipefail);
+    if (!isPrefixCommand(cmd) && !isRunnerCommand(cmd) && !isChainPrepCommand(cmd)) {
       return false;
     }
   }
@@ -2348,18 +2514,30 @@ export function resolveGitRootFast(startDir) {
 const SNAPSHOT_GIT_TIMEOUT_MS = 750;
 const SNAPSHOT_MAX_FILES = 2000;
 
-// Cheap working-tree fingerprint: dirty/untracked paths from git status plus [mtimeMs, size] (null when missing).
-// Returns null for non-git dirs, git errors or timeouts, and trees too dirty to fingerprint cheaply.
+const SNAPSHOT_MAX_BUFFER = 16 * 1024 * 1024;
+
+function statSnapshotFile(gitRoot, relPath) {
+  try {
+    const st = statSync(join(gitRoot, relPath));
+    return [st.mtimeMs, st.size];
+  } catch {
+    return null;
+  }
+}
+
+// Cheap working-tree fingerprint: separates tracked changes (`-uno`) from untracked code files (`ls-files`)
+// so 2,000+ untracked code files degrade only untracked diffing while keeping tracked file edits exact.
 export function snapshotWorkingTree(cwd) {
   const gitRoot = resolveGitRootFast(cwd);
   if (!gitRoot) {
     return null;
   }
-  let out;
+  let trackedOut;
   try {
-    out = execFileSync("git", ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-uall", "-z"], {
+    trackedOut = execFileSync("git", ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-uno", "-z"], {
       cwd: gitRoot,
       timeout: SNAPSHOT_GIT_TIMEOUT_MS,
+      maxBuffer: SNAPSHOT_MAX_BUFFER,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
@@ -2381,29 +2559,57 @@ export function snapshotWorkingTree(cwd) {
     }
   }
   const files = {};
-  let count = 0;
-  const tokens = out.split("\0");
-  for (let i = 0; i < tokens.length; i += 1) {
-    const entry = tokens[i];
+  let trackedCodeCount = 0;
+  const trackedTokens = trackedOut.split("\0");
+  for (let i = 0; i < trackedTokens.length; i += 1) {
+    const entry = trackedTokens[i];
     if (entry.length < 4) {
       continue;
     }
     if ("RC".includes(entry[0]) || "RC".includes(entry[1])) {
       i += 1;
     }
-    count += 1;
-    if (count > SNAPSHOT_MAX_FILES) {
+    const relPath = entry.slice(3);
+    if (isExemptDocOrAssetPath(relPath)) {
+      continue;
+    }
+    trackedCodeCount += 1;
+    if (trackedCodeCount > SNAPSHOT_MAX_FILES) {
       return null;
     }
-    const relPath = entry.slice(3);
-    try {
-      const st = statSync(join(gitRoot, relPath));
-      files[relPath] = [st.mtimeMs, st.size];
-    } catch {
-      files[relPath] = null;
-    }
+    files[relPath] = statSnapshotFile(gitRoot, relPath);
   }
-  return { gitRoot, head, files };
+
+  let untrackedTruncated = false;
+  try {
+    const untrackedOut = execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "-z"], {
+      cwd: gitRoot,
+      timeout: SNAPSHOT_GIT_TIMEOUT_MS,
+      maxBuffer: SNAPSHOT_MAX_BUFFER,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const untrackedFiles = {};
+    let untrackedCodeCount = 0;
+    for (const relPath of untrackedOut.split("\0")) {
+      if (!relPath || isExemptDocOrAssetPath(relPath)) {
+        continue;
+      }
+      untrackedCodeCount += 1;
+      if (untrackedCodeCount > SNAPSHOT_MAX_FILES) {
+        untrackedTruncated = true;
+        break;
+      }
+      untrackedFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+    }
+    if (!untrackedTruncated) {
+      Object.assign(files, untrackedFiles);
+    }
+  } catch {
+    untrackedTruncated = true;
+  }
+
+  return { gitRoot, head, files, untrackedTruncated };
 }
 
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
