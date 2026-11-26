@@ -221,8 +221,11 @@ describe("H2 masked verification never passes or clears a failure", () => {
       const r = gate([[cmd, FAIL], [cmd, "ok"]], cmd);
       assert.equal(r.verdict, "PASS", `${cmd} ${r.blockedRules}`);
     }
-    const r = gate([["npm test", FAIL], ["cd x && npm test", "ok"]], "npm test");
-    assert.equal(r.verdict, "PASS", r.blockedRules.join(","));
+    const sameDir = gate([["npm test", FAIL], ["cd /repo && npm test", "ok"]], "npm test");
+    assert.equal(sameDir.verdict, "PASS", sameDir.blockedRules.join(","));
+    const crossDir = gate([["npm test", FAIL], ["cd x && npm test", "ok"]], "npm test");
+    assert.equal(crossDir.verdict, "REJECT", crossDir.blockedRules.join(","));
+    assert.ok(crossDir.blockedRules.includes("R3_CONCEALED_FAILURE"));
   });
 });
 

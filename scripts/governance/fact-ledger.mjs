@@ -98,6 +98,11 @@ const PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS = new Set([
 ]);
 const GO_VERIFICATION_SUBCOMMANDS = new Set(["test", "vet", "build"]);
 const GO_EXEC_FLAG_RE = /^--?(?:exec|toolexec|vettool)(?:=|$)/;
+const CARGO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "clippy", "build", "bench", "doc"]);
+const CARGO_VALUE_FLAGS = new Set(["--manifest-path", "--target", "--target-dir", "--package", "-p", "--features", "-F", "--jobs", "-j", "--color", "--config", "-Z"]);
+const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench", "compile"]);
+const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
+const JS_TEST_LIST_FLAGS = new Set(["--listTests", "--list-tests", "--list", "--showConfig", "--show-config"]);
 const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
 const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
   /^(?:--if-present|--script-shell|--userconfig|--globalconfig|--prefix|--dir|--cwd|-C|--preload|-r|--require|--import|--loader)(?:=|$)/;
@@ -812,17 +817,33 @@ function isVersionProbe(bin, arg) {
   return arg === "--version" || arg === "-V" || arg === "--help" || arg === "-h" || (arg === "-v" && bin !== "pytest");
 }
 
-// python runs any program, so it counts only for `-m pytest|unittest` or a test file.
+// python runs any program, so it counts only for `-m pytest|unittest` (with actual test execution) or a test file.
 function pythonRunsTests(args) {
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
+    if (arg === "--version" || arg === "-V" || arg === "--help" || arg === "-h") {
+      return false;
+    }
     if (!arg.startsWith("-")) {
       return PYTHON_TEST_FILE_RE.test(arg);
     }
     const flag = /^-[A-Za-z]*?([cmWX]|$)/.exec(arg)?.[1];
     if (flag === "m") {
-      const module = arg.slice(arg.indexOf("m") + 1) || (args[i + 1] ?? "");
-      return module === "pytest" || module === "unittest";
+      const attached = arg.slice(arg.indexOf("m") + 1);
+      const module = attached || (args[i + 1] ?? "");
+      if (module !== "pytest" && module !== "unittest") {
+        return false;
+      }
+      const modArgs = args.slice(attached ? i + 1 : i + 2);
+      const sepIdx = modArgs.indexOf("--");
+      const modHead = sepIdx === -1 ? modArgs : modArgs.slice(0, sepIdx);
+      if (modHead.some((a) => a === "--version" || a === "-V" || a === "--help" || a === "-h")) {
+        return false;
+      }
+      if (module === "pytest" && modHead.some((a) => PYTEST_DRY_RUN_FLAGS.has(a))) {
+        return false;
+      }
+      return true;
     }
     if (PYTHON_FLAGS_WITH_ARG.has(arg)) {
       i += 1;
@@ -938,8 +959,7 @@ function hasLeadingVersionProbe(bin, args) {
   if (!VERIFICATION_BINARIES.has(bin) && !PACKAGE_EXEC_VERIFICATION_TOOLS.has(bin)) {
     return false;
   }
-  const verboseDashVAllowed =
-    bin === "pytest" || bin === "go" || bin === "cargo" || bin === "make" || bin === "ctest" || bin === "rspec";
+  const verboseDashVAllowed = bin === "pytest" || bin === "go" || bin === "cargo" || bin === "ctest" || bin === "rspec";
   const sepIdx = args.indexOf("--");
   const head = sepIdx === -1 ? args : args.slice(0, sepIdx);
   for (let i = 0; i < head.length; i += 1) {
@@ -958,16 +978,18 @@ function isNodeOrTsxVerification(bin, args) {
   if (inlineInterpreterBody(bin, args) !== null) {
     return false;
   }
+  let sawTestFlag = false;
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === "--") {
-      return NODE_TEST_FILE_RE.test(args[i + 1] ?? "");
+      return sawTestFlag || NODE_TEST_FILE_RE.test(args[i + 1] ?? "");
     }
     if (isVersionProbe(bin, arg)) {
       return false;
     }
     if (arg === "--test") {
-      return true;
+      sawTestFlag = true;
+      continue;
     }
     if (arg.startsWith("-")) {
       if (NODE_TSX_VALUE_FLAGS.has(arg)) {
@@ -975,9 +997,9 @@ function isNodeOrTsxVerification(bin, args) {
       }
       continue;
     }
-    return NODE_TEST_FILE_RE.test(arg);
+    return sawTestFlag || NODE_TEST_FILE_RE.test(arg);
   }
-  return false;
+  return sawTestFlag;
 }
 
 function isTsxVerification(args) {
@@ -986,6 +1008,43 @@ function isTsxVerification(args) {
 
 function isEslintSafeArgs(toolArgs) {
   return !toolArgs.some((a) => a === "--fix" || a === "--fix-dry-run" || a.startsWith("--fix-type"));
+}
+
+function isCargoVerification(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--list") {
+      return false;
+    }
+    if (arg.startsWith("+")) {
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      if (CARGO_VALUE_FLAGS.has(arg)) {
+        i += 1;
+      }
+      continue;
+    }
+    return CARGO_VERIFICATION_SUBCOMMANDS.has(arg);
+  }
+  return false;
+}
+
+function isDenoVerification(args) {
+  const sub = args.find((arg) => !arg.startsWith("-")) ?? "";
+  return DENO_VERIFICATION_SUBCOMMANDS.has(sub);
+}
+
+function isJsTestToolArgsSafe(tool, toolArgs) {
+  const sepIdx = toolArgs.indexOf("--");
+  const head = sepIdx === -1 ? toolArgs : toolArgs.slice(0, sepIdx);
+  if (head.some((a) => JS_TEST_LIST_FLAGS.has(a))) {
+    return false;
+  }
+  if (tool === "vitest" && head.find((a) => !a.startsWith("-")) === "list") {
+    return false;
+  }
+  return true;
 }
 
 function isVerificationScriptName(name) {
@@ -1031,6 +1090,9 @@ function isPackageExecVerification(args) {
   }
   if (tool === "biome") {
     return !toolArgs.some((a) => a === "--write" || a === "--apply" || a === "--apply-unsafe" || a === "--unsafe");
+  }
+  if ((tool === "vitest" || tool === "jest" || tool === "playwright" || tool === "cypress" || tool === "mocha" || tool === "ava" || tool === "tap") && !isJsTestToolArgsSafe(tool, toolArgs)) {
+    return false;
   }
   return PACKAGE_EXEC_VERIFICATION_TOOLS.has(tool);
 }
@@ -1103,7 +1165,7 @@ function isRunnerCommand({ words, redirects }) {
   if (args.length === 1 && isVersionProbe(baseBin, args[0])) {
     return false;
   }
-  if (baseBin !== "node" && baseBin !== "tsx" && !SHELL_INTERPRETERS.has(baseBin) && hasLeadingVersionProbe(baseBin, args)) {
+  if (baseBin !== "node" && baseBin !== "tsx" && baseBin !== "python" && baseBin !== "python3" && !SHELL_INTERPRETERS.has(baseBin) && hasLeadingVersionProbe(baseBin, args)) {
     return false;
   }
   // `node <script>` runs any program, so node counts only for its test runner or a test file.
@@ -1117,6 +1179,18 @@ function isRunnerCommand({ words, redirects }) {
     return false;
   }
   if ((baseBin === "python" || baseBin === "python3") && !pythonRunsTests(args)) {
+    return false;
+  }
+  if (baseBin === "pytest" && args.some((a) => PYTEST_DRY_RUN_FLAGS.has(a))) {
+    return false;
+  }
+  if (baseBin === "cargo" && !isCargoVerification(args)) {
+    return false;
+  }
+  if (baseBin === "deno" && !isDenoVerification(args)) {
+    return false;
+  }
+  if ((baseBin === "vitest" || baseBin === "jest" || baseBin === "playwright" || baseBin === "cypress") && !isJsTestToolArgsSafe(baseBin, args)) {
     return false;
   }
   if (PACKAGE_EXEC_RUNNERS.has(baseBin) && !isPackageExecVerification(args)) {
@@ -1369,6 +1443,14 @@ function extractCommandLine(call) {
     return "";
   }
   return pickString(args, ["CommandLine", "commandLine", "command"]);
+}
+
+function extractCommandCwd(call, fallbackCwd = "") {
+  const args = asObject(call?.args);
+  if (!args) {
+    return fallbackCwd;
+  }
+  return pickString(args, ["Cwd", "cwd"]) || fallbackCwd;
 }
 
 export function extractMcpCheckCommands(call) {
@@ -2167,9 +2249,11 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
 
           if (EXEC_TOOL_NAMES.has(name)) {
             const command = extractCommandLine(call);
+            const execCwd = extractCommandCwd(call, cwd);
             const entry = {
               stepIndex,
               command,
+              execCwd,
               kind: classifyCommand(command),
               hasPrepSideEffect: commandHasPrepSideEffect(command),
               passed: true,
@@ -2181,10 +2265,12 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
             pendingCalls.push({ kind: "exec", entry });
           } else if (MCP_VERIFICATION_TOOL_NAMES.has(name)) {
             const { commands, labels } = extractMcpCheckCommands(call);
+            const execCwd = extractCommandCwd(call, cwd);
             const entry = {
               stepIndex,
               toolName: name,
               command: commands.join(" && ") || name,
+              execCwd,
               subCommands: commands,
               checkLabels: labels,
               kind: classifyMcpCheckCommands(commands),
@@ -2871,17 +2957,35 @@ export function snapshotWorkingTree(cwd) {
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 // Paths that commits between two snapshot HEADs touched ("" is an unborn HEAD), or null when git cannot say.
+// --no-renames preserves both old and new paths when a code file is moved/renamed into an exempt directory.
 export function listCommittedPaths(gitRoot, fromHead, toHead) {
   try {
     const out = execFileSync(
       "git",
-      ["-c", "core.quotepath=false", "diff", "--name-only", "-z", fromHead || EMPTY_TREE_SHA, toHead || EMPTY_TREE_SHA, "--"],
+      ["-c", "core.quotepath=false", "diff", "--no-renames", "--name-only", "-z", fromHead || EMPTY_TREE_SHA, toHead || EMPTY_TREE_SHA, "--"],
       { cwd: gitRoot, timeout: SNAPSHOT_GIT_TIMEOUT_MS, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     );
     return new Set(out.split("\0").filter(Boolean));
   } catch {
     return null;
   }
+}
+
+export function readNumstatSinceHead(gitRoot, fromHead) {
+  const numstat = new Map();
+  if (!gitRoot || fromHead === null) {
+    return numstat;
+  }
+  try {
+    const out = execFileSync(
+      "git",
+      ["-c", "core.quotepath=false", "diff", "--no-renames", "--numstat", "-z", fromHead || EMPTY_TREE_SHA],
+      { cwd: gitRoot, timeout: SNAPSHOT_GIT_TIMEOUT_MS, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    parseNumstatOutput(out, gitRoot, numstat, true);
+  } catch {
+  }
+  return numstat;
 }
 
 export function readGitLedger(cwd) {

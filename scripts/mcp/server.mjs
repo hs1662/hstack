@@ -339,7 +339,7 @@ export function createMcpServerHandler(options = {}) {
       return skipNoSession({ ledgerScanMs, gitScanMs });
     }
     const conversationKey = resolveEffectiveConversationKey(conversationId, cwd);
-    mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles: gitLedger.gitDirtyFiles, dataDir });
+    mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles: gitLedger.gitDirtyFiles, diffNumstat: gitLedger.diffNumstat, dataDir });
     const testInfra = detectTestInfrastructure(cwd, gitLedger.gitRoot || null);
     const governanceConfig = readGovernanceConfig(dataDir);
     const auditEscalation = resolveAuditEscalationMode(dataDir, governanceConfig);

@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import {
   ALLOWED_AUDIT_ESCALATION_MODES,
   ALLOWED_SCHEMA_REGISTERS,
@@ -37,18 +38,61 @@ function isBareRuntimeLauncher(normCmd) {
   return !normCmd.includes(" ") && BARE_RUNTIME_LAUNCHERS.has(normCmd);
 }
 
-function extractVerificationSegments(cmd) {
+function normalizeExecDir(dir) {
+  if (typeof dir !== "string" || dir.trim().length === 0) {
+    return ".";
+  }
+  const norm = posix.normalize(dir.trim().replace(/\\/g, "/"));
+  return norm.length > 1 ? norm.replace(/\/+$/, "") : norm;
+}
+
+function advanceDir(currentDir, op, arg, opaqueSeq) {
+  if (op === "popd") {
+    return currentDir.stack.length > 0 ? { dir: currentDir.stack.pop(), stack: currentDir.stack } : currentDir;
+  }
+  if (!arg || arg === "-" || arg.startsWith("~") || /[$`]/.test(arg)) {
+    const stack = op === "pushd" ? [...currentDir.stack, currentDir.dir] : currentDir.stack;
+    return { dir: `opaque:${opaqueSeq}:${arg ?? ""}`, stack };
+  }
+  const cleanArg = arg.replace(/^['"]|['"]$/g, "");
+  const nextDir = cleanArg.startsWith("/")
+    ? normalizeExecDir(cleanArg)
+    : currentDir.dir.startsWith("opaque:")
+      ? `${currentDir.dir}/${cleanArg}`
+      : currentDir.dir === "."
+        ? normalizeExecDir(cleanArg)
+        : normalizeExecDir(`${currentDir.dir}/${cleanArg}`);
+  const stack = op === "pushd" ? [...currentDir.stack, currentDir.dir] : currentDir.stack;
+  return { dir: nextDir, stack };
+}
+
+function extractVerificationEntries(cmd, baseDir = ".") {
   if (typeof cmd !== "string" || cmd.trim().length === 0) {
     return [];
   }
-  const segments = [];
+  const entries = [];
+  let state = { dir: normalizeExecDir(baseDir), stack: [] };
+  let seq = 0;
   for (const seg of splitShellSegments(cmd)) {
     const norm = normalizeCommandText(seg);
-    if (norm.length > 0 && classifyCommand(norm) === "verification") {
-      segments.push(norm);
+    if (norm.length === 0) {
+      continue;
+    }
+    const dirMatch = /^(cd|pushd|popd)(?:\s+(.*))?$/.exec(norm);
+    if (dirMatch) {
+      seq += 1;
+      state = advanceDir(state, dirMatch[1], dirMatch[2]?.trim(), seq);
+      continue;
+    }
+    if (classifyCommand(norm) === "verification") {
+      entries.push({ seg: norm, dir: state.dir });
     }
   }
-  return segments;
+  return entries;
+}
+
+function extractVerificationSegments(cmd) {
+  return extractVerificationEntries(cmd).map((entry) => entry.seg);
 }
 
 // Runner prefixes whose form without file targets runs the whole suite. `go test` is absent on purpose:
@@ -135,6 +179,9 @@ function isDefaultDiscoverableTestTarget(target, runnerPrefix) {
   if (runnerPrefix.includes("pytest")) {
     return /(?:^|\/)tests?(?:\/|$)|(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm);
   }
+  if (runnerPrefix[0] === "node" && runnerPrefix[1] === "--test") {
+    return /(?:^|\/)test(?:\/|$)|(?:^|\/)test\.[cm]?js$|[._-]test\.[cm]?js$/.test(norm);
+  }
   return /(?:^|\/)(?:__tests__|tests?)(?:\/|$)|[._-](?:test|spec)\.[cm]?[jt]sx?$/i.test(norm);
 }
 
@@ -184,8 +231,9 @@ function segmentResolvedBy(failedSeg, passedSeg) {
     return false;
   }
   if (runner.kind === "go") {
-    const targets = (tokens) => tokens.slice(runner.end).filter(isPathTarget);
-    const flags = (tokens) => tokens.slice(runner.end).filter((token) => !isPathTarget(token));
+    const isGoTarget = (token) => token === "." || isPathTarget(token);
+    const targets = (tokens) => tokens.slice(runner.end).filter(isGoTarget);
+    const flags = (tokens) => tokens.slice(runner.end).filter((token) => !isGoTarget(token));
     return (
       targets(passed).join(" ") === "./..." &&
       flags(failed).join(" ") === flags(passed).join(" ") &&
@@ -206,43 +254,47 @@ function segmentResolvedBy(failedSeg, passedSeg) {
   return droppedOnlyTargets && !passed.some((_, index) => index >= runner.end && isTarget(passed, index));
 }
 
-function isCommandResolvedBy(failedCmd, passedCmd) {
+function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBaseDir = ".") {
   const failedNorm = normalizeCommandText(failedCmd);
   const passedNorm = normalizeCommandText(passedCmd);
   if (failedNorm.length === 0 || passedNorm.length === 0) {
     return false;
   }
-  if (segmentResolvedBy(failedNorm, passedNorm)) {
-    return true;
+  const failedEntries = extractVerificationEntries(failedCmd, failedBaseDir);
+  const passedEntries = extractVerificationEntries(passedCmd, passedBaseDir);
+  if (failedEntries.length > 0 && passedEntries.length > 0) {
+    return failedEntries.every((failedEntry) =>
+      passedEntries.some((passedEntry) => failedEntry.dir === passedEntry.dir && segmentResolvedBy(failedEntry.seg, passedEntry.seg)),
+    );
   }
-  const failedSegments = extractVerificationSegments(failedCmd);
-  const passedSegments = extractVerificationSegments(passedCmd);
-  if (failedSegments.length === 0 || passedSegments.length === 0) {
-    return false;
-  }
-  return failedSegments.every((failedSeg) => passedSegments.some((passedSeg) => segmentResolvedBy(failedSeg, passedSeg)));
+  return normalizeExecDir(failedBaseDir) === normalizeExecDir(passedBaseDir) && segmentResolvedBy(failedNorm, passedNorm);
 }
 
-function extractExecutionVerificationSegments(exec) {
+function extractExecutionVerificationEntries(exec, defaultCwd = ".") {
+  const baseDir = normalizeExecDir(exec?.execCwd || defaultCwd || ".");
   const candidates =
     Array.isArray(exec?.subCommands) && exec.subCommands.length > 0 ? exec.subCommands : [exec?.command ?? ""];
-  const segments = [];
+  const entries = [];
   for (const cmd of candidates) {
-    for (const seg of extractVerificationSegments(cmd)) {
-      segments.push(seg);
+    for (const entry of extractVerificationEntries(cmd, baseDir)) {
+      entries.push(entry);
     }
   }
-  return segments;
+  return entries;
 }
 
-function isExecutionResolvedBy(failedExec, passedExec) {
-  if (isCommandResolvedBy(failedExec?.command, passedExec?.command)) {
+function isExecutionResolvedBy(failedExec, passedExec, defaultCwd = ".") {
+  const failedBase = normalizeExecDir(failedExec?.execCwd || defaultCwd || ".");
+  const passedBase = normalizeExecDir(passedExec?.execCwd || defaultCwd || ".");
+  if (isCommandResolvedBy(failedExec?.command, passedExec?.command, failedBase, passedBase)) {
     return true;
   }
-  const failedSegments = extractExecutionVerificationSegments(failedExec);
-  const passedSegments = extractExecutionVerificationSegments(passedExec);
-  if (failedSegments.length > 0 && passedSegments.length > 0) {
-    return failedSegments.every((failedSeg) => passedSegments.some((passedSeg) => segmentResolvedBy(failedSeg, passedSeg)));
+  const failedEntries = extractExecutionVerificationEntries(failedExec, defaultCwd);
+  const passedEntries = extractExecutionVerificationEntries(passedExec, defaultCwd);
+  if (failedEntries.length > 0 && passedEntries.length > 0) {
+    return failedEntries.every((failedEntry) =>
+      passedEntries.some((passedEntry) => failedEntry.dir === passedEntry.dir && segmentResolvedBy(failedEntry.seg, passedEntry.seg)),
+    );
   }
   const hasSubCommands = Array.isArray(failedExec?.subCommands) && failedExec.subCommands.length > 0;
   return Boolean(
@@ -250,7 +302,7 @@ function isExecutionResolvedBy(failedExec, passedExec) {
       failedExec?.toolName &&
       passedExec?.toolName &&
       failedExec.toolName === passedExec.toolName &&
-      failedSegments.length === 0,
+      failedEntries.length === 0,
   );
 }
 
@@ -596,7 +648,7 @@ export function decideGate(input = {}, context = {}) {
         if (!later.passed) {
           continue;
         }
-        if (isExecutionResolvedBy(exec, later)) {
+        if (isExecutionResolvedBy(exec, later, cwd)) {
           resolvedByLaterPass = true;
           break;
         }

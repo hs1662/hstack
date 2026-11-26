@@ -21,7 +21,7 @@ import {
   PASSING_VERDICTS,
   isExemptDocOrAssetPath,
 } from "./constants.mjs";
-import { listCommittedPaths, normalizeWorkspacePath, resolveGitRootFast, snapshotWorkingTree } from "./fact-ledger.mjs";
+import { listCommittedPaths, normalizeWorkspacePath, readNumstatSinceHead, resolveGitRootFast, snapshotWorkingTree } from "./fact-ledger.mjs";
 
 const MAX_SNAPSHOTS_PER_WORKSPACE = 20;
 const MAX_LIST_SNAPSHOTS = 10;
@@ -518,7 +518,7 @@ function isRiskyShellExec(exec) {
 
 // Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
 // Returns true when an arbitrary shell command ran in a git tree that could not be diffed (fail closed).
-export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), dataDir = resolvePluginDataDir() }) {
+export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), diffNumstat = null, dataDir = resolvePluginDataDir() }) {
   // run_command and mcp_agy-fast_fast_run_checks both run arbitrary shell commands.
   const shellExecs = ledger.turnExecutions;
   if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
@@ -557,6 +557,22 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       }
     }
     return true;
+  }
+  if (sinceTurn.size > 0 && diffNumstat instanceof Map && baseline.head !== null) {
+    const turnNumstat = readNumstatSinceHead(current.gitRoot, baseline.head);
+    for (const [relPath, stat] of turnNumstat) {
+      if (isExemptDocOrAssetPath(relPath)) {
+        continue;
+      }
+      if (!sinceTurn.has(relPath) && !ledger.turnCodeWrittenFiles.has(relPath)) {
+        continue;
+      }
+      const prev = diffNumstat.get(relPath);
+      const prevSum = prev ? prev.added + prev.deleted : -1;
+      if (stat.added + stat.deleted > prevSum) {
+        diffNumstat.set(relPath, stat);
+      }
+    }
   }
   const statFreshnessMs = (gitRoot, relPath) => {
     try {
@@ -639,7 +655,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   );
   if (untrackedIncomplete && riskyShellExecs.length > 0) {
     const baseMs = postGateWriter && baseline.gate?.capturedAtMs ? baseline.gate.capturedAtMs : baseline.capturedAtMs;
-    const cutoffMs = Number.isFinite(baseMs) ? baseMs : 0;
+    const cutoffMs = Number.isFinite(baseMs) ? baseMs - 10 : 0;
     const targetStep = postGateWriter ? datingStep(postGateShell) : riskyStep;
     const markRecentUntracked = (step) => {
       for (const relPath of dirtyFiles) {
