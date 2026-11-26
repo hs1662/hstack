@@ -114,6 +114,15 @@ function replayTrackers(steps, ctx) {
       continue;
     }
 
+    if (steps[i + 1]?.type === "ERROR_MESSAGE") {
+      for (const field of FIELDS) {
+        const tracker = trackers[field];
+        tracker.hasPendingMarker = false;
+        tracker.markerFailed = false;
+      }
+      continue;
+    }
+
     const evaluation = i === cachedIdx ? cachedEval : evaluateStep(steps, i, analyzerOptions);
     const effectiveDrifted = [];
     for (const field of FIELDS) {

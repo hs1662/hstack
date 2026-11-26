@@ -334,6 +334,7 @@ const ALLOWED_AUTONOMY_FLAG_NAMES = new Set([
   "circuitBreakerTurns",
   "promptRouteTurns",
   "autoHandoffTurns",
+  "koreanAnchorTurns",
 ]);
 const MAX_AUTONOMY_TURN_KEYS = 30;
 

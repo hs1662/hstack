@@ -53,6 +53,9 @@ export const PENDING_CHALLENGER_DENY_REASON =
 export const PROMPT_ROUTE_SYSTEM_MESSAGE =
   "[자율 사전검토 안내] 고위험 설계·단순화 제안이 감지되었다. 코드 수정이나 결론 제시 전 관련 파일을 직접 읽어 중립 브리프를 정리하고 `invoke_subagent`로 `hstack-challenger`(`적대적 설계 검토관`, `[hstack:자동사전검토]`)의 독립 반론을 먼저 받아라. `진행 가능`·`조건부 진행`은 보완 반영 후 자율 진행(읽기 전용 요청이면 검토 결과만 보고)하고, `재설계 권고`일 때만 `파일:줄` 근거와 대안을 제시해 사용자 확인을 받아라.";
 
+export const KOREAN_THINKING_ANCHOR_MESSAGE =
+  '[한국어사고:장기세션재고정] 대화가 길어졌더라도 모든 내부 추론과 생각 요약 문단의 첫 문장은 반드시 "이 추론과 생각 요약은 반드시 한국어로만 작성한다."로 시작하고, 전체 추론을 2에서 3문단 이내(문단당 2문장)의 순수 한국어 평서문으로 압축하라. 백그라운드 명령의 영어 출력이나 대형 로그를 추론 안에서 길게 요약하거나 미완료 작업 결과를 추측하지 말고 다음 행동만 짧게 정하라.';
+
 export function buildCircuitBreakerDenyReason({ targetPath, reasons, removedPrimitives, deletedLines }) {
   const detailParts = [];
   if (Array.isArray(removedPrimitives) && removedPrimitives.length > 0) {

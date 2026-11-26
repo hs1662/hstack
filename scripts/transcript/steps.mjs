@@ -1,4 +1,4 @@
-export const KEPT_STEP_TYPES = new Set(["PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT"]);
+export const KEPT_STEP_TYPES = new Set(["PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT", "ERROR_MESSAGE"]);
 export const PRE_TOOL_DENIAL_NEEDLE = "tool call denied by pre-tool hook";
 
 export function parseStepIndex(raw, fallback) {

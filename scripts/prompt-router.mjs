@@ -2,9 +2,18 @@
 
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode } from "./governance/config.mjs";
-import { PROMPT_ROUTE_SYSTEM_MESSAGE } from "./governance/constants.mjs";
+import {
+  DEFAULT_POLLUTION_THRESHOLDS,
+  KOREAN_THINKING_ANCHOR_MESSAGE,
+  PROMPT_ROUTE_SYSTEM_MESSAGE,
+} from "./governance/constants.mjs";
 import { detectSessionRoleFromUserInput, readTurnLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
-import { claimAutonomyTurnFlag, resolveEffectiveConversationKey, saveTurnSnapshot } from "./governance/handoff-store.mjs";
+import {
+  claimAutonomyTurnFlag,
+  readSessionState,
+  resolveEffectiveConversationKey,
+  saveTurnSnapshot,
+} from "./governance/handoff-store.mjs";
 import {
   isDirectExecution,
   parseHookPayload,
@@ -79,26 +88,54 @@ export function handlePreInvocation(stdinText, options = {}) {
   }
 
   const governanceConfig = options?.governanceConfig ?? readGovernanceConfig(dataDir);
-  if (resolveAutonomyMode(dataDir, governanceConfig) !== "smart") {
-    return {};
+  const rawPrompt = payload.lastUserInput ?? payload.last_user_input;
+  const sessionRole = ledger?.transcriptAvailable
+    ? ledger.sessionRole
+    : typeof rawPrompt === "string"
+      ? detectSessionRoleFromUserInput(rawPrompt)
+      : "main";
+  const turnKey = `${effectiveCid}:${turnStartStepIndex}`;
+  const injectSteps = [];
+
+  if (sessionRole === "main") {
+    const sessionState = conversationId ? readSessionState(conversationId, dataDir) : null;
+    const rawThresholds = governanceConfig?.pollutionThresholds;
+    const threshold =
+      rawThresholds && typeof rawThresholds === "object" && Number.isFinite(rawThresholds.inputTokensWarning)
+        ? rawThresholds.inputTokensWarning
+        : DEFAULT_POLLUTION_THRESHOLDS.inputTokensWarning;
+    const totalContextTokens = (ledger?.latestTokens?.inputTokens ?? 0) + (ledger?.latestTokens?.cacheReadTokens ?? 0);
+    const isHighContext = Boolean(sessionState?.pollutionAlert) || totalContextTokens >= threshold;
+    if (isHighContext) {
+      const claimedAnchor = claimAutonomyTurnFlag({
+        conversationId: effectiveCid,
+        flagName: "koreanAnchorTurns",
+        turnKey,
+        dataDir,
+      });
+      if (claimedAnchor === true) {
+        injectSteps.push({
+          systemMessage: {
+            systemMessage: KOREAN_THINKING_ANCHOR_MESSAGE,
+          },
+        });
+      }
+    }
   }
 
-  const rawPrompt = payload.lastUserInput ?? payload.last_user_input;
+  if (resolveAutonomyMode(dataDir, governanceConfig) !== "smart") {
+    return injectSteps.length > 0 ? { injectSteps } : {};
+  }
+
   const evaluation = shouldAutoChallengePrompt(rawPrompt);
   if (!evaluation.matched) {
-    return {};
+    return injectSteps.length > 0 ? { injectSteps } : {};
   }
 
-  if (typeof rawPrompt === "string" && detectSessionRoleFromUserInput(rawPrompt) !== "main") {
-    return {};
-  }
-
-  const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
   if (sessionRole !== "main") {
-    return {};
+    return injectSteps.length > 0 ? { injectSteps } : {};
   }
 
-  const turnKey = `${effectiveCid}:${turnStartStepIndex}`;
   const claimed = claimAutonomyTurnFlag({
     conversationId: effectiveCid,
     flagName: "promptRouteTurns",
@@ -106,7 +143,7 @@ export function handlePreInvocation(stdinText, options = {}) {
     dataDir,
   });
   if (claimed !== true) {
-    return {};
+    return injectSteps.length > 0 ? { injectSteps } : {};
   }
 
   if (options?.skipAuditLog !== true) {
@@ -124,15 +161,13 @@ export function handlePreInvocation(stdinText, options = {}) {
     );
   }
 
-  return {
-    injectSteps: [
-      {
-        systemMessage: {
-          systemMessage: PROMPT_ROUTE_SYSTEM_MESSAGE,
-        },
-      },
-    ],
-  };
+  injectSteps.push({
+    systemMessage: {
+      systemMessage: PROMPT_ROUTE_SYSTEM_MESSAGE,
+    },
+  });
+
+  return { injectSteps };
 }
 
 if (isDirectExecution(import.meta.url)) {
