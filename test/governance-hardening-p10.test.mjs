@@ -1,7 +1,7 @@
 // v0.1.2 gate audit run 5 (Round H): untracked overflow vs tracked edits, strict npx/npm/go whitelist, sequential pipefail.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
@@ -549,5 +549,281 @@ describe("H4 long-session Korean thinking anchor and error-step cooldown recover
     assert.equal(decision.action, "inject", JSON.stringify(decision));
     assert.deepEqual(decision.driftedFields, ["thinking"]);
     assert.equal(decision.stepIndex, 6);
+  });
+});
+
+describe("H5 OMH gpt-6.2-astra audit regressions F1-F10", () => {
+  it("F1: does not misreport preexisting untracked files as changed when ls-files fails asymmetrically", () => {
+    withCpuLock(() => {
+      const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+      for (const failOn of ["first", "second"]) {
+        const binDir = createTempDir("hstack-p10-asym-git-");
+        const countFile = join(binDir, "ls-files-count");
+        writeFileSync(countFile, "0");
+        const fakeGit = join(binDir, "git");
+        const targetCount = failOn === "first" ? 1 : 2;
+        writeFileSync(
+          fakeGit,
+          [
+            "#!/bin/sh",
+            'if printf "%s\\n" "$*" | grep -q -- "ls-files"; then',
+            `  c=$(cat "${countFile}")`,
+            "  c=$((c + 1))",
+            `  printf "%s" "$c" > "${countFile}"`,
+            `  if [ "$c" -eq ${targetCount} ]; then exit 128; fi`,
+            "fi",
+            `exec "${realGit}" "$@"`,
+            "",
+          ].join("\n"),
+        );
+        chmodSync(fakeGit, 0o755);
+
+        const prevPath = process.env.PATH ?? "";
+        process.env.PATH = `${binDir}:${prevPath}`;
+        try {
+          const repo = makeRepo();
+          writeFileSync(join(repo, "preexisting.mjs"), "export const preexisting = true;\n");
+          const { out } = runTurnOnRepo(repo, `p10-f1-${failOn}`, [{ cmd: "node --test", output: PASS_OUTPUT }]);
+          assert.deepEqual(out, {}, `asymmetric ls-files (${failOn}) should allow test-only Stop`);
+        } finally {
+          process.env.PATH = prevPath;
+        }
+      }
+    });
+  });
+
+  it("F2: catches shell-created untracked code files via mtime under 2,100+ untracked files without flagging old files", () => {
+    withCpuLock(() => {
+      const repo = makeRepo();
+      mkdirSync(join(repo, "untracked"));
+      const staleTime = new Date(Date.now() - 10_000);
+      for (let i = 0; i < 2100; i += 1) {
+        const fp = join(repo, "untracked", `u${i}.mjs`);
+        writeFileSync(fp, `export const n = ${i};\n`);
+        utimesSync(fp, staleTime, staleTime);
+      }
+
+      const rejectRes = runTurnOnRepo(repo, "p10-f2-unreported", [
+        {
+          cmd: `sh -c 'echo "export const n = 1;" > new_untracked.mjs'`,
+          effect: (r) => writeFileSync(join(r, "new_untracked.mjs"), "export const n = 1;\n"),
+        },
+        { cmd: "node --test", output: PASS_OUTPUT },
+        {
+          gate: {
+            modified_files: [],
+            inspected_files: [],
+            verification_runs: [{ command: "node --test", outcome: "pass" }],
+            unverified_scope: [],
+            self_assessment: "확인했습니다.",
+          },
+        },
+      ]);
+      assert.equal(rejectRes.verdicts[0], VERDICT_HEADERS.REJECT_NEUTRAL, rejectRes.verdicts.join(" | "));
+      assertGateBlocked(rejectRes.out);
+
+      const repoPass = makeRepo();
+      mkdirSync(join(repoPass, "untracked"));
+      const staleTime2 = new Date(Date.now() - 10_000);
+      for (let i = 0; i < 2100; i += 1) {
+        const fp = join(repoPass, "untracked", `u${i}.mjs`);
+        writeFileSync(fp, `export const n = ${i};\n`);
+        utimesSync(fp, staleTime2, staleTime2);
+      }
+      const passRes = runTurnOnRepo(repoPass, "p10-f2-reported", [
+        {
+          cmd: `sh -c 'echo "export const n = 1;" > new_untracked.mjs'`,
+          effect: (r) => writeFileSync(join(r, "new_untracked.mjs"), "export const n = 1;\n"),
+        },
+        { cmd: "node --test", output: PASS_OUTPUT },
+        {
+          gate: {
+            modified_files: ["new_untracked.mjs"],
+            inspected_files: [],
+            verification_runs: [{ command: "node --test", outcome: "pass" }],
+            unverified_scope: [],
+            self_assessment: "확인했습니다.",
+          },
+        },
+      ]);
+      assert.equal(passRes.verdicts[0], VERDICT_HEADERS.PASS, passRes.verdicts.join(" | "));
+      assert.deepEqual(passRes.out, {});
+    });
+  });
+
+  it("F3: tracks command-wrapped set +o pipefail and blocks command set -n", () => {
+    for (const cmd of [
+      "set -o pipefail && command set +o pipefail && npm test | head -3",
+      "set -o pipefail && command -- set +o pipefail && npm test | head -3",
+      "command set -n && npm test",
+      "env set -o pipefail && npm test | head -3",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+    assert.equal(
+      classifyCommand("set -o pipefail && command set -o errexit && npm test | head -3"),
+      "verification",
+    );
+  });
+
+  it("F4: rejects version/help probes inside package execution wrappers", () => {
+    for (const cmd of [
+      "pnpx tsc --version",
+      "npx vitest --version",
+      "npx eslint --help",
+      "bunx jest -v",
+      "npx prettier --version",
+      "npx mocha -V",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+  });
+
+  it("F5: rejects --if-present conditional script execution", () => {
+    for (const cmd of [
+      "npm run lint --if-present",
+      "npm --if-present run test",
+      "pnpm run --if-present lint",
+      "yarn run --if-present test",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+  });
+
+  it("F6: inspects only options before first positional script and the script itself for tsx/node", () => {
+    for (const cmd of [
+      "tsx inspect.ts test/sample.test.ts",
+      "npx tsx inspect.ts --test",
+      "node inspect.mjs test/sample.test.mjs",
+      "node inspect.mjs --test",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+    for (const cmd of [
+      "tsx --test",
+      "tsx --tsconfig tsconfig.json test/a.test.ts",
+      "npx tsx --test src/a.test.ts",
+      "node --test",
+      "node --test-reporter=spec --test",
+      "node --import ./setup.mjs test/a.test.mjs",
+      "node test/a.test.mjs",
+    ]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+  });
+
+  it("F7: rejects package-installing npm chains and protects npm install/ci prep chains when snapshot is missing", () => {
+    assert.equal(classifyCommand("npm install left-pad && npm test"), "other");
+    assert.equal(classifyCommand("npm install --save-dev evil && npm test"), "other");
+    assert.equal(classifyCommand("npm ci && npm test"), "verification");
+    assert.equal(classifyCommand("npm install && npm test"), "verification");
+
+    const blocked = runTurnOnRepo(
+      makeRepo(),
+      "p10-f7-prep-nosnap",
+      [{ cmd: "npm install && npm test", output: PASS_OUTPUT }],
+      { dropSnapshot: true },
+    );
+    assertGateBlocked(blocked.out);
+
+    const testOnly = runTurnOnRepo(
+      makeRepo(),
+      "p10-f7-test-nosnap",
+      [{ cmd: "node --test", output: PASS_OUTPUT }],
+      { dropSnapshot: true },
+    );
+    assert.deepEqual(testOnly.out, {});
+  });
+
+  it("F8: rejects bash/sh -n and -o noexec syntax-check invocations", () => {
+    for (const cmd of [
+      "bash -n -c 'npm test'",
+      "bash -nc 'npm test'",
+      "bash -n -euo pipefail -c 'npm test | head -3'",
+      "bash -o noexec -c 'npm test'",
+      "sh -n -c 'node --test'",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+    assert.equal(classifyCommand("bash -euo pipefail -c 'npm test | head -3'"), "verification");
+  });
+
+  it("F9: accepts workspace/filter value flags and blocks unsafe script-runner flags", () => {
+    for (const cmd of [
+      "npm --workspace web test",
+      "npm -w web test",
+      "npm --workspace=web test",
+      "pnpm --filter web test",
+      "pnpm --filter web run lint",
+      "pnpm -F web test",
+    ]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+    for (const cmd of [
+      "npm --script-shell=/bin/sh test",
+      "npm --prefix /tmp/x test",
+      "npm --userconfig /tmp/x test",
+      "pnpm --dir /tmp/x test",
+      "yarn --cwd /tmp/x test",
+      "bun --preload /tmp/x.js test",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+  });
+
+  it("F10: resolves targeted pnpx/bunx vitest failure with full pnpx/bunx vitest rerun", () => {
+    const dir = createTempDir("hstack-p10-f10-");
+    let seq = 0;
+    const runRerunGate = (cmds, claimCmd) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const [cmd, out] of cmds) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd } }] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: out });
+      }
+      const p = join(dir, `f10-${seq++}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: claimCmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    for (const runner of ["pnpx", "bunx"]) {
+      const widened = runRerunGate(
+        [
+          [`${runner} vitest run test/a.test.ts`, FAIL_OUTPUT],
+          [`${runner} vitest run`, "Tests  2 passed (2)"],
+        ],
+        `${runner} vitest run`,
+      );
+      assert.equal(widened.verdict, "PASS", `${runner}: ${widened.blockedRules.join(",")}`);
+
+      const narrowed = runRerunGate(
+        [
+          [`${runner} vitest run`, FAIL_OUTPUT],
+          [`${runner} vitest run test/a.test.ts`, "Tests  1 passed (1)"],
+        ],
+        `${runner} vitest run test/a.test.ts`,
+      );
+      assert.equal(narrowed.verdict, "REJECT", `${runner} narrowed should reject`);
+      assert.ok(narrowed.blockedRules.includes("R3_CONCEALED_FAILURE"), `${runner}: ${narrowed.blockedRules}`);
+    }
   });
 });
