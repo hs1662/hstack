@@ -1,15 +1,27 @@
 #!/usr/bin/env node
 
-import { appendAuditRecord, readGovernanceConfig } from "./governance/audit-log.mjs";
-import { DEFAULT_POLLUTION_THRESHOLDS } from "./governance/constants.mjs";
+import { appendAuditRecord } from "./governance/audit-log.mjs";
+import { readGovernanceConfig, resolveAutonomyMode, resolveAutonomyThresholds } from "./governance/config.mjs";
+import { DEFAULT_POLLUTION_THRESHOLDS, buildAutoHandoffSystemMessage } from "./governance/constants.mjs";
 import { detectSessionRoleFromHeaderSteps, readFactLedger } from "./governance/fact-ledger.mjs";
-import { markPreflightChallengeLogged, updateSessionPollutionState } from "./governance/handoff-store.mjs";
-import { isDirectExecution, loadHookContext, readTranscriptSteps, runHookCli } from "./hook-io.mjs";
+import {
+  claimAutonomyTurnFlag,
+  markPreflightChallengeLogged,
+  updateSessionPollutionState,
+} from "./governance/handoff-store.mjs";
+import { evaluateThrashing } from "./governance/thrashing-detector.mjs";
+import {
+  isDirectExecution,
+  loadHookContext,
+  readTranscriptSteps,
+  resolvePluginDataDir,
+  runHookCli,
+} from "./hook-io.mjs";
 import { decideHookAction } from "./transcript.mjs";
 
 export { readTranscriptSteps };
 
-function tryLogCompletedPreflightChallenges(conversationId, ledger) {
+function tryLogCompletedPreflightChallenges(conversationId, ledger, dataDir) {
   if (!ledger?.transcriptAvailable || ledger.sessionRole !== "main") {
     return;
   }
@@ -41,38 +53,46 @@ function tryLogCompletedPreflightChallenges(conversationId, ledger) {
       markPreflightChallengeLogged({
         conversationId,
         dedupKey: `${conversationId}:${ledger.turnStartStepIndex}:${launchIdx}:${slotIdx}:${votePhase}`,
+        dataDir,
       });
     if (!shouldLog) {
       continue;
     }
-    appendAuditRecord({
-      ts: new Date().toISOString(),
-      event: "preflight_complete",
-      eventType: "preflight_complete",
-      conversationId,
-      turnStartStepIndex: ledger.turnStartStepIndex,
-      verdict: challenge.verdict,
-      voted,
-      codeWritten,
-      challengeStepIndex: challenge.completedStepIndex,
-    });
+    appendAuditRecord(
+      {
+        ts: new Date().toISOString(),
+        event: "preflight_complete",
+        eventType: "preflight_complete",
+        conversationId,
+        turnStartStepIndex: ledger.turnStartStepIndex,
+        mode: challenge.mode === "auto" ? "auto" : "manual",
+        verdict: challenge.verdict,
+        voted,
+        codeWritten,
+        challengeStepIndex: challenge.completedStepIndex,
+      },
+      dataDir,
+    );
   }
 }
 
-function tryLogPostInvocationTelemetry(context, decision) {
+function evaluateAndLogPostInvocation(context, decision, options = {}) {
+  let autoHandoffMessage = null;
   try {
     const { payload, transcriptPath, steps } = context;
+    const dataDir = options.dataDir ?? resolvePluginDataDir();
     const rawConversationId = payload.conversationId ?? payload.conversation_id;
     const conversationId = typeof rawConversationId === "string" ? rawConversationId.trim() : "";
     const latestStep = steps[steps.length - 1];
     const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
-    const ledger = transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null;
+    const ledger = options.ledger ?? (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
     const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : detectSessionRoleFromHeaderSteps(steps);
     const tokens = ledger?.latestTokens ?? { inputTokens: null, cacheReadTokens: null, outputTokens: null };
+    const cfg = options.governanceConfig ?? readGovernanceConfig(dataDir);
+    const autonomyMode = resolveAutonomyMode(dataDir, cfg);
 
     let pollutionState = null;
     if (sessionRole !== "auditor" && sessionRole !== "challenger" && conversationId) {
-      const cfg = readGovernanceConfig();
       const thresholds = {
         ...DEFAULT_POLLUTION_THRESHOLDS,
         ...(cfg?.pollutionThresholds && typeof cfg.pollutionThresholds === "object" ? cfg.pollutionThresholds : {}),
@@ -84,34 +104,96 @@ function tryLogPostInvocationTelemetry(context, decision) {
         failedExecutionsInTurn: ledger?.turnFailedExecutionCount ?? 0,
         maxSingleFileEdits: ledger?.maxSingleFileEdits ?? 0,
         thresholds,
+        dataDir,
       });
     }
 
     if (sessionRole === "main" && ledger) {
-      tryLogCompletedPreflightChallenges(conversationId, ledger);
+      tryLogCompletedPreflightChallenges(conversationId, ledger, dataDir);
     }
 
-    appendAuditRecord({
-      ts: new Date().toISOString(),
-      event: "post_invocation",
-      conversationId,
-      stepCount: steps.length,
-      latestStepIndex: typeof latestStep?.stepIndex === "number" ? latestStep.stepIndex : null,
-      langAction: decision.action,
-      langReason: decision.reason ?? (decision.action === "inject" ? "drifted" : "ok"),
-      driftedFields: Array.isArray(decision.driftedFields) ? decision.driftedFields : [],
-      pollutionAlert: Boolean(pollutionState?.pollutionAlert),
-      metrics: {
+    if (
+      autonomyMode === "smart" &&
+      sessionRole === "main" &&
+      ledger?.transcriptAvailable &&
+      !ledger.turnAutoHandoffTriggered &&
+      !ledger.turnWorkerCompleted
+    ) {
+      const autonomyThresholds = resolveAutonomyThresholds(dataDir, cfg);
+      const thrashResult = evaluateThrashing({
+        turnVerifyFailures: ledger.turnVerifyFailures ?? 0,
+        turnConsecutiveVerifyFailures: ledger.turnConsecutiveVerifyFailures ?? 0,
+        maxSameFileEdits: ledger.maxSingleFileEdits ?? 0,
+        mostEditedFile: ledger.mostEditedFile ?? "",
         inputTokens: tokens.inputTokens,
-        cacheReadTokens: tokens.cacheReadTokens,
-        outputTokens: tokens.outputTokens,
+        thresholds: autonomyThresholds,
+      });
+      if (thrashResult.thrashing) {
+        const turnKey = `${conversationId || "anon"}:${ledger.turnStartStepIndex}`;
+        const claimed =
+          !conversationId ||
+          claimAutonomyTurnFlag({
+            conversationId,
+            flagName: "autoHandoffTurns",
+            turnKey,
+            dataDir,
+          });
+        if (claimed) {
+          appendAuditRecord(
+            {
+              ts: new Date().toISOString(),
+              event: "autonomy_event",
+              eventType: "autonomy_event",
+              kind: "auto_handoff",
+              conversationId,
+              turnStartStepIndex: ledger.turnStartStepIndex,
+              reasons: thrashResult.reasons,
+              turnVerifyFailures: thrashResult.summary.turnVerifyFailures,
+              maxSameFileEdits: thrashResult.summary.maxSameFileEdits,
+              inputTokens: thrashResult.summary.inputTokens,
+            },
+            dataDir,
+          );
+          autoHandoffMessage = buildAutoHandoffSystemMessage({
+            reasons: thrashResult.reasons,
+            turnVerifyFailures: thrashResult.summary.turnVerifyFailures,
+            maxSameFileEdits: thrashResult.summary.maxSameFileEdits,
+            mostEditedFile: thrashResult.summary.mostEditedFile,
+            inputTokens: thrashResult.summary.inputTokens,
+          });
+        }
+      }
+    }
+
+    appendAuditRecord(
+      {
+        ts: new Date().toISOString(),
+        event: "post_invocation",
+        conversationId,
+        stepCount: steps.length,
+        latestStepIndex: typeof latestStep?.stepIndex === "number" ? latestStep.stepIndex : null,
+        langAction: decision.action,
+        langReason: decision.reason ?? (decision.action === "inject" ? "drifted" : "ok"),
+        driftedFields: Array.isArray(decision.driftedFields) ? decision.driftedFields : [],
+        pollutionAlert: Boolean(pollutionState?.pollutionAlert),
+        metrics: {
+          inputTokens: tokens.inputTokens,
+          cacheReadTokens: tokens.cacheReadTokens,
+          outputTokens: tokens.outputTokens,
+        },
       },
-    });
+      dataDir,
+    );
   } catch {
   }
+  return autoHandoffMessage;
 }
 
-export function handlePostInvocation(stdinText, readTextFile) {
+export function handlePostInvocation(stdinText, readTextFileOrOptions) {
+  const isFn = typeof readTextFileOrOptions === "function";
+  const readTextFile = isFn ? readTextFileOrOptions : readTextFileOrOptions?.readTextFile;
+  const options = isFn ? {} : (readTextFileOrOptions ?? {});
+
   const context = loadHookContext(stdinText, "PostInvocation", readTextFile);
   if (!context || context.steps.length === 0) {
     return {};
@@ -119,26 +201,35 @@ export function handlePostInvocation(stdinText, readTextFile) {
   const { payload, steps } = context;
 
   const rawLastUserInput = payload.lastUserInput ?? payload.last_user_input;
-  const options = typeof rawLastUserInput === "string" ? { lastUserInput: rawLastUserInput } : {};
-  const decision = decideHookAction(steps, options);
+  const langOptions = typeof rawLastUserInput === "string" ? { lastUserInput: rawLastUserInput } : {};
+  const decision = decideHookAction(steps, langOptions);
 
-  if (typeof readTextFile !== "function") {
-    tryLogPostInvocationTelemetry(context, decision);
+  let autoHandoffMessage = null;
+  if (!isFn) {
+    autoHandoffMessage = evaluateAndLogPostInvocation(context, decision, options);
   }
 
-  if (decision.action !== "inject") {
+  const injectSteps = [];
+  if (decision.action === "inject") {
+    injectSteps.push({
+      systemMessage: {
+        systemMessage: decision.message,
+      },
+    });
+  }
+  if (autoHandoffMessage) {
+    injectSteps.push({
+      systemMessage: {
+        systemMessage: autoHandoffMessage,
+      },
+    });
+  }
+
+  if (injectSteps.length === 0) {
     return {};
   }
 
-  return {
-    injectSteps: [
-      {
-        systemMessage: {
-          systemMessage: decision.message,
-        },
-      },
-    ],
-  };
+  return { injectSteps };
 }
 
 if (isDirectExecution(import.meta.url)) {

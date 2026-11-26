@@ -1,5 +1,12 @@
 {
   "hstack-guard": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./scripts/prompt-router.mjs",
+        "timeout": 5
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "^(update_steps|ask_question|todo_write|task_create|task_update|update_plan)$",
@@ -12,7 +19,7 @@
         ]
       },
       {
-        "matcher": "^(mcp_hstack_.*|invoke_subagent)$",
+        "matcher": "^(mcp_hstack_.*|invoke_subagent|edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content|mcp_agy-fast_fast_apply_edits|mcp_agy-fast_apply_edits)$",
         "hooks": [
           {
             "type": "command",

@@ -9,6 +9,8 @@ import {
   AUDITOR_SESSION_MARKER,
   AUDIT_PASS_TAG,
   AUDIT_REJECT_TAG,
+  AUTO_CHALLENGER_MARKER,
+  AUTO_HANDOFF_MARKER,
   CHALLENGER_AGENT_NAME,
   CHALLENGER_SESSION_MARKER,
   CREATE_AS_READ_TOOL_NAMES,
@@ -26,6 +28,7 @@ import {
   USER_VOTE_TOOL_NAMES,
   VERDICT_HEADERS,
   VERIFICATION_BINARIES,
+  WORKER_AGENT_NAME,
   WORKER_SESSION_MARKER,
   WRITE_TOOL_NAMES,
   isExemptDocOrAssetPath,
@@ -534,7 +537,7 @@ export function extractToolPaths(call, cwd = "", gitRoot = "") {
   if (READ_TOOL_NAMES.has(name)) {
     const raw = pickString(args, ["Path", "path", "AbsolutePath", "absolute_path", "file_path"]);
     pushNorm(readPaths, raw);
-  } else if (name === "mcp_agy-fast_fast_apply_edits") {
+  } else if (name === "mcp_agy-fast_fast_apply_edits" || name === "mcp_agy-fast_apply_edits") {
     const baseCwd = pickString(args, ["cwd"]) || cwd;
     for (const rawEdit of asArray(args.edits) ?? []) {
       const edit = asObject(rawEdit);
@@ -674,6 +677,37 @@ function isAuditorTypeName(typeName) {
 
 function isChallengerTypeName(typeName) {
   return typeName === CHALLENGER_AGENT_NAME || typeName === `hstack:${CHALLENGER_AGENT_NAME}`;
+}
+
+function isWorkerTypeName(typeName) {
+  return typeName === WORKER_AGENT_NAME || typeName === `hstack:${WORKER_AGENT_NAME}`;
+}
+
+function extractSubagentPrompts(call) {
+  const args = asObject(call?.args);
+  if (!args) {
+    return [];
+  }
+  const prompts = [];
+  const topPrompt = typeof args.Prompt === "string" ? args.Prompt : typeof args.prompt === "string" ? args.prompt : "";
+  const topType = pickString(args, ["TypeName", "typeName", "type_name", "subagent_type"]);
+  if (topType.length > 0) {
+    prompts.push(topPrompt);
+  }
+  const subagents = asArray(args.Subagents ?? args.subagents);
+  if (subagents) {
+    for (const rawItem of subagents) {
+      const item = asObject(rawItem);
+      if (!item) {
+        continue;
+      }
+      const itemType = pickString(item, ["TypeName", "typeName", "type_name", "subagent_type"]);
+      if (itemType.length > 0) {
+        prompts.push(typeof item.Prompt === "string" ? item.Prompt : typeof item.prompt === "string" ? item.prompt : "");
+      }
+    }
+  }
+  return prompts;
 }
 
 function extractLastMeaningfulLine(fullContent) {
@@ -1062,6 +1096,9 @@ function extractLatestTokens(parsed) {
   return { inputTokens, cacheReadTokens, outputTokens };
 }
 
+const PRE_TOOL_WRITE_PROBE_MAX_BYTES = 8192;
+const MANUAL_PREFLIGHT_CMD_RE = /\/(?:hstack:)?hstack-preflight\b/i;
+
 function createEmptyLedger(transcriptAvailable = false) {
   return {
     transcriptAvailable,
@@ -1074,8 +1111,12 @@ function createEmptyLedger(transcriptAvailable = false) {
     lastCodeWriteStepIndex: -1,
     turnExecutions: [],
     turnFailedExecutionCount: 0,
+    turnVerifyFailures: 0,
+    turnConsecutiveVerifyFailures: 0,
     fileEditCounts: new Map(),
+    turnFileEditCounts: null,
     maxSingleFileEdits: 0,
+    mostEditedFile: "",
     turnGateAttempts: [],
     turnSubagentAudits: [],
     pendingAsyncAuditorCount: 0,
@@ -1084,6 +1125,11 @@ function createEmptyLedger(transcriptAvailable = false) {
     pendingAsyncChallenges: 0,
     pendingAsyncChallengesAfterLastWrite: 0,
     turnUserVotes: [],
+    turnHasManualPreflightCommand: false,
+    turnAutoChallengeTriggered: false,
+    turnAutoHandoffTriggered: false,
+    turnWorkerDispatched: false,
+    turnWorkerCompleted: false,
     latestTokens: { inputTokens: null, cacheReadTokens: null, outputTokens: null },
     gateBlockedThisTurn: false,
   };
@@ -1091,11 +1137,14 @@ function createEmptyLedger(transcriptAvailable = false) {
 
 function scanTranscriptToLedger(filePath, cwd, gitRoot) {
   const ledger = createEmptyLedger(true);
+  ledger.turnFileEditCounts = ledger.fileEditCounts;
   let pendingCalls = [];
   let seenFirstUserInput = false;
   let seenFirstPlannerResponse = false;
+  let lastRecordWasPlannerResponse = false;
   const asyncAuditsByConversationId = new Map();
   const asyncChallengesByConversationId = new Map();
+  const asyncWorkersByConversationId = new Map();
 
   const applyHeaderSessionRole = (record) => {
     if (seenFirstPlannerResponse || ledger.sessionRole === "auditor") {
@@ -1105,7 +1154,40 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     ledger.sessionRole = pickHigherSessionRole(ledger.sessionRole, candidate);
   };
 
-  const resetTurn = (stepIndex) => {
+  const commitWriteToolResult = (pendingWrite) => {
+    for (const p of pendingWrite.readPaths) {
+      ledger.sessionReadFiles.add(p);
+    }
+    for (const p of pendingWrite.writePaths) {
+      ledger.turnWrittenFiles.add(p);
+      const nextCount = (ledger.fileEditCounts.get(p) ?? 0) + 1;
+      ledger.fileEditCounts.set(p, nextCount);
+      if (nextCount > ledger.maxSingleFileEdits) {
+        ledger.maxSingleFileEdits = nextCount;
+        ledger.mostEditedFile = p;
+      }
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, pendingWrite.stepIndex);
+      if (!isExemptDocOrAssetPath(p)) {
+        ledger.turnCodeWrittenFiles.add(p);
+        ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, pendingWrite.stepIndex);
+      }
+    }
+  };
+
+  // Commit unconfirmed writes only when transitioning out of a turn/planner boundary that omitted GENERICs (synthetic fixtures).
+  const flushUnresolvedSyntheticWrites = () => {
+    if (pendingCalls.length === 0) {
+      return;
+    }
+    for (const pending of pendingCalls) {
+      if (pending.kind === "write") {
+        commitWriteToolResult(pending);
+      }
+    }
+    pendingCalls = [];
+  };
+
+  const resetTurn = (stepIndex, userContent = "") => {
     ledger.turnStartStepIndex = stepIndex;
     ledger.turnWrittenFiles = new Set();
     ledger.turnCodeWrittenFiles = new Set();
@@ -1113,8 +1195,12 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     ledger.lastCodeWriteStepIndex = -1;
     ledger.turnExecutions = [];
     ledger.turnFailedExecutionCount = 0;
+    ledger.turnVerifyFailures = 0;
+    ledger.turnConsecutiveVerifyFailures = 0;
     ledger.fileEditCounts = new Map();
+    ledger.turnFileEditCounts = ledger.fileEditCounts;
     ledger.maxSingleFileEdits = 0;
+    ledger.mostEditedFile = "";
     ledger.turnGateAttempts = [];
     ledger.turnSubagentAudits = [];
     ledger.pendingAsyncAuditorCount = 0;
@@ -1123,20 +1209,31 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     ledger.pendingAsyncChallenges = 0;
     ledger.pendingAsyncChallengesAfterLastWrite = 0;
     ledger.turnUserVotes = [];
+    ledger.turnHasManualPreflightCommand = MANUAL_PREFLIGHT_CMD_RE.test(userContent);
+    ledger.turnAutoChallengeTriggered = false;
+    ledger.turnAutoHandoffTriggered = false;
+    ledger.turnWorkerDispatched = false;
+    ledger.turnWorkerCompleted = false;
     ledger.gateBlockedThisTurn = false;
     pendingCalls = [];
     asyncAuditsByConversationId.clear();
     asyncChallengesByConversationId.clear();
+    asyncWorkersByConversationId.clear();
   };
 
   const peekNeedsGeneric = () => {
     const nextPending = pendingCalls[0];
-    return Boolean(
-      nextPending &&
-        (nextPending.kind === "exec" ||
-          nextPending.kind === "gate" ||
-          nextPending.kind === "managed_subagent" ||
-          nextPending.kind === "user_vote"),
+    if (!nextPending) {
+      return false;
+    }
+    if (nextPending.kind === "write") {
+      return PRE_TOOL_WRITE_PROBE_MAX_BYTES;
+    }
+    return (
+      nextPending.kind === "exec" ||
+      nextPending.kind === "gate" ||
+      nextPending.kind === "managed_subagent" ||
+      nextPending.kind === "user_vote"
     );
   };
 
@@ -1162,25 +1259,36 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       const stepIndex = parseStepIndex(rawIndex, recordIndex);
 
       if (parsed.type === "USER_INPUT") {
+        lastRecordWasPlannerResponse = false;
+        const userContent = typeof parsed.content === "string" ? parsed.content : "";
         if (!seenFirstUserInput) {
           seenFirstUserInput = true;
           applyHeaderSessionRole(parsed);
         }
-        resetTurn(stepIndex);
+        resetTurn(stepIndex, userContent);
         return true;
       }
 
       if (parsed.type === "SYSTEM_MESSAGE") {
+        lastRecordWasPlannerResponse = false;
         applyHeaderSessionRole(parsed);
         const msgContent = typeof parsed.content === "string" ? parsed.content : "";
         if (msgContent.includes(GATE_STOP_MARKER)) {
           ledger.gateBlockedThisTurn = true;
         }
+        if (msgContent.includes(AUTO_CHALLENGER_MARKER)) {
+          ledger.turnAutoChallengeTriggered = true;
+        }
+        if (msgContent.includes(AUTO_HANDOFF_MARKER)) {
+          ledger.turnAutoHandoffTriggered = true;
+        }
         const rawSource = typeof parsed.source === "string" ? parsed.source.trim() : "";
         const allowedSubagentSource = rawSource.length === 0 || ALLOWED_SUBAGENT_SYSTEM_SOURCES.has(rawSource);
         if (
           allowedSubagentSource &&
-          (asyncAuditsByConversationId.size > 0 || asyncChallengesByConversationId.size > 0) &&
+          (asyncAuditsByConversationId.size > 0 ||
+            asyncChallengesByConversationId.size > 0 ||
+            asyncWorkersByConversationId.size > 0) &&
           msgContent.length > 0
         ) {
           const senderMatch = msgContent.match(SUBAGENT_SENDER_MSG_RE);
@@ -1196,13 +1304,19 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
               finalVerdicts: FINAL_PREFLIGHT_VERDICTS,
               holdCompletionUntilFinal: true,
             });
+            if (asyncWorkersByConversationId.has(senderId)) {
+              ledger.turnWorkerCompleted = true;
+              asyncWorkersByConversationId.delete(senderId);
+            }
           }
         }
         return true;
       }
 
       if (parsed.type === "PLANNER_RESPONSE") {
+        flushUnresolvedSyntheticWrites();
         seenFirstPlannerResponse = true;
+        lastRecordWasPlannerResponse = true;
         pendingCalls = [];
         const tokens = extractLatestTokens(parsed);
         if (tokens) {
@@ -1212,21 +1326,21 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
         for (const call of getToolCalls(parsed)) {
           const name = typeof call?.name === "string" ? call.name : "";
           const { readPaths, writePaths } = extractToolPaths(call, cwd, gitRoot);
+
+          if (writePaths.length > 0 || WRITE_TOOL_NAMES.has(name)) {
+            if (writePaths.length > 0) {
+              pendingCalls.push({ kind: "write", writePaths, readPaths, stepIndex });
+            } else {
+              for (const p of readPaths) {
+                ledger.sessionReadFiles.add(p);
+              }
+              pendingCalls.push({ kind: "other" });
+            }
+            continue;
+          }
+
           for (const p of readPaths) {
             ledger.sessionReadFiles.add(p);
-          }
-          for (const p of writePaths) {
-            ledger.turnWrittenFiles.add(p);
-            const nextCount = (ledger.fileEditCounts.get(p) ?? 0) + 1;
-            ledger.fileEditCounts.set(p, nextCount);
-            if (nextCount > ledger.maxSingleFileEdits) {
-              ledger.maxSingleFileEdits = nextCount;
-            }
-            ledger.lastWriteStepIndex = stepIndex;
-            if (!isExemptDocOrAssetPath(p)) {
-              ledger.turnCodeWrittenFiles.add(p);
-              ledger.lastCodeWriteStepIndex = stepIndex;
-            }
           }
 
           if (EXEC_TOOL_NAMES.has(name)) {
@@ -1278,9 +1392,12 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
             pendingCalls.push({ kind: "user_vote", entry });
           } else if (name === SUBAGENT_TOOL_NAME) {
             const typeNames = extractSubagentTypeNames(call);
+            const subPrompts = extractSubagentPrompts(call);
             const auditEntries = [];
             const challengeEntries = [];
+            const workerEntries = [];
             for (let idx = 0; idx < typeNames.length; idx += 1) {
+              const promptAtSlot = subPrompts[idx] ?? "";
               if (isAuditorTypeName(typeNames[idx])) {
                 const entry = {
                   stepIndex,
@@ -1296,6 +1413,12 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
                 ledger.turnSubagentAudits.push(entry);
                 auditEntries.push(entry);
               } else if (isChallengerTypeName(typeNames[idx])) {
+                const isExplicitAuto = promptAtSlot.includes(AUTO_CHALLENGER_MARKER);
+                const challengeMode = ledger.turnHasManualPreflightCommand
+                  ? "manual"
+                  : isExplicitAuto || ledger.turnAutoChallengeTriggered
+                    ? "auto"
+                    : "manual";
                 const entry = {
                   stepIndex,
                   launchedStepIndex: stepIndex,
@@ -1303,16 +1426,20 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
                   slotIndex: idx,
                   totalSlots: typeNames.length,
                   typeName: CHALLENGER_AGENT_NAME,
+                  mode: challengeMode,
                   verdict: "MISSING_VERDICT",
                   conversationId: "",
                   tail: "",
                 };
                 ledger.turnPreflightChallenges.push(entry);
                 challengeEntries.push(entry);
+              } else if (isWorkerTypeName(typeNames[idx])) {
+                ledger.turnWorkerDispatched = true;
+                workerEntries.push({ slotIndex: idx, totalSlots: typeNames.length, stepIndex });
               }
             }
-            if (auditEntries.length > 0 || challengeEntries.length > 0) {
-              pendingCalls.push({ kind: "managed_subagent", auditEntries, challengeEntries });
+            if (auditEntries.length > 0 || challengeEntries.length > 0 || workerEntries.length > 0) {
+              pendingCalls.push({ kind: "managed_subagent", auditEntries, challengeEntries, workerEntries });
             } else {
               pendingCalls.push({ kind: "other" });
             }
@@ -1326,12 +1453,20 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       }
 
       if (parsed.type === "GENERIC") {
+        lastRecordWasPlannerResponse = false;
         const pending = pendingCalls.shift();
         if (!pending) {
           return true;
         }
         const status = typeof parsed.status === "string" ? parsed.status : "";
         const error = typeof parsed.error === "string" ? parsed.error : "";
+
+        if (pending.kind === "write") {
+          if (!isPreToolDenialStep(parsed)) {
+            commitWriteToolResult(pending);
+          }
+          return true;
+        }
 
         if (pending.kind === "exec") {
           const tail = extractTail(parsed.content);
@@ -1349,6 +1484,12 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
             !inferExecutionFailure({ status, error, head, tail });
           if (!pending.entry.passed) {
             ledger.turnFailedExecutionCount += 1;
+            if (pending.entry.kind === "verification") {
+              ledger.turnVerifyFailures += 1;
+              ledger.turnConsecutiveVerifyFailures += 1;
+            }
+          } else if (pending.entry.kind === "verification") {
+            ledger.turnConsecutiveVerifyFailures = 0;
           }
         } else if (pending.kind === "gate") {
           const verdict = parseGateVerdictFromText(typeof parsed.content === "string" ? parsed.content : "");
@@ -1394,6 +1535,18 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
             asyncMap: asyncChallengesByConversationId,
             setCompletedOnSync: true,
           });
+          if (pending.workerEntries && pending.workerEntries.length > 0 && !isDenial) {
+            if (isLaunchAck && convIds.length > 0) {
+              for (const w of pending.workerEntries) {
+                const wid = w.totalSlots > 1 ? (convIds[w.slotIndex] ?? "") : (convIds[0] ?? "");
+                if (wid) {
+                  asyncWorkersByConversationId.set(wid, w);
+                }
+              }
+            } else if (!isLaunchAck && status.toUpperCase() !== "ERROR" && error.length === 0) {
+              ledger.turnWorkerCompleted = true;
+            }
+          }
         }
         return true;
       }
@@ -1403,11 +1556,20 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     {
       onSkipped(prefixType, isValid) {
         if (prefixType === "GENERIC" && isValid && pendingCalls.length > 0) {
-          pendingCalls.shift();
+          const skipped = pendingCalls.shift();
+          if (skipped && skipped.kind === "write") {
+            commitWriteToolResult(skipped);
+          }
         }
       },
     },
   );
+
+  // If the file ends right after a synthetic PLANNER_RESPONSE with no trailing GENERICs, preserve legacy fixture compatibility
+  // ONLY when there is no other GENERIC in the stream (if PreToolUse runs before GENERIC is emitted, write wasn't executed yet).
+  if (lastRecordWasPlannerResponse && pendingCalls.length > 0) {
+    // Keep pending writes unconfirmed while tool execution hasn't emitted GENERIC unless later PLANNER_RESPONSE moved past it.
+  }
 
   if (!result.hasContent) {
     return null;

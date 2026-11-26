@@ -366,6 +366,7 @@ export function decideGate(input = {}, context = {}) {
       risk: emptyRisk,
       auditVerdict: null,
       preflight: emptyPreflight,
+      preflightMode: "none",
       receiptText,
       metrics: {
         hedgeHits: 0,
@@ -562,11 +563,20 @@ export function decideGate(input = {}, context = {}) {
     verdict: effectiveChallenge ? effectiveChallenge.verdict : null,
     voted: hasPostChallengeVote,
   };
+  const preflightMode = effectiveChallenge
+    ? effectiveChallenge.mode === "auto"
+      ? "auto"
+      : "manual"
+    : "none";
 
   if (sessionRole === "main" && ledger.turnCodeWrittenFiles.size > 0 && effectiveChallenge && !hasPostChallengeVote) {
     details.preflightVerdict = effectiveChallenge.verdict;
     if (effectiveChallenge.verdict === "RETHINK") {
       blockedRules.push("R9_PREFLIGHT_UNVOTED");
+    } else if (preflightMode === "auto") {
+      if (effectiveChallenge.verdict === "ERROR" || effectiveChallenge.verdict === "MISSING_VERDICT") {
+        warnedRules.push("R9_PREFLIGHT_UNVOTED");
+      }
     } else {
       warnedRules.push("R9_PREFLIGHT_UNVOTED");
     }
@@ -677,6 +687,7 @@ export function decideGate(input = {}, context = {}) {
     risk,
     auditVerdict,
     preflight,
+    preflightMode,
     receiptText,
     metrics: {
       hedgeHits: hedge.hedgeHits,

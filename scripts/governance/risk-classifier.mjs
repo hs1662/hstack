@@ -64,6 +64,14 @@ function compileSensitivePatterns(rawPatterns) {
   return compiled.length > 0 ? compiled : DEFAULT_SENSITIVE_PATTERNS;
 }
 
+export function isSensitiveFilePath(filePath, config = null) {
+  if (typeof filePath !== "string" || filePath.length === 0) {
+    return false;
+  }
+  const patterns = compileSensitivePatterns(config?.sensitivePatterns);
+  return patterns.some((re) => re.test(filePath));
+}
+
 function toPositiveInt(value, fallback) {
   const num = Number(value);
   return Number.isInteger(num) && num >= 1 ? num : fallback;

@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { appendAuditRecord } from "./governance/audit-log.mjs";
+import { readGovernanceConfig, resolveAutonomyMode, resolveAutonomyThresholds } from "./governance/config.mjs";
 import {
   AUDITOR_AGENT_NAME,
   AUDITOR_ROLE_LABEL,
@@ -9,17 +12,29 @@ import {
   CHALLENGER_ROLE_LABEL,
   CHALLENGER_SESSION_MARKER,
   HANDOFF_TOOL_NAME,
+  RETHINK_UNVOTED_DENY_REASON,
   SUBAGENT_TOOL_NAME,
   WORKER_AGENT_NAME,
   WORKER_ROLE_LABEL,
   WORKER_SESSION_MARKER,
+  WRITE_TOOL_NAMES,
+  buildCircuitBreakerDenyReason,
 } from "./governance/constants.mjs";
+import { detectDestructiveEdit, normalizeWriteOperations } from "./governance/destructive-edit.mjs";
 import { readFactLedger } from "./governance/fact-ledger.mjs";
-import { isDirectExecution, parseHookPayload, resolveTranscriptCandidates, runHookCli } from "./hook-io.mjs";
+import { claimAutonomyTurnFlag, hasAutonomyTurnFlag } from "./governance/handoff-store.mjs";
+import {
+  isDirectExecution,
+  parseHookPayload,
+  resolvePluginDataDir,
+  resolveTranscriptCandidates,
+  runHookCli,
+} from "./hook-io.mjs";
 
 const HSTACK_MCP_TOOL_RE = /^mcp_hstack_.*$/;
 const GATE_TOOL_SUMMARY = "증거 기반 완료 검증 실행";
 const HANDOFF_TOOL_SUMMARY = "팩트 증류 컨텍스트 핸드오프 처리";
+const MAX_EXISTING_READ_BYTES = 2 * 1024 * 1024;
 
 function pickPreferredTranscriptPath(rawTranscriptPath) {
   if (typeof rawTranscriptPath !== "string") {
@@ -220,7 +235,158 @@ function handleSubagentPreTool(toolCall, { cwd, transcriptPath }) {
   };
 }
 
-export function handlePreToolGate(stdinText) {
+function readExistingContentsMap(toolName, toolInput, cwd, readTextFile) {
+  const ops = normalizeWriteOperations(toolName, toolInput, cwd);
+  const contents = new Map();
+  for (const op of ops) {
+    const base = op.baseCwd || cwd || process.cwd();
+    const candidateAbs = op.rawPath ? resolve(base, op.rawPath) : resolve(base, op.targetPath);
+    try {
+      if (typeof readTextFile === "function") {
+        const text = readTextFile(candidateAbs);
+        contents.set(op.targetPath, typeof text === "string" ? text : null);
+      } else if (existsSync(candidateAbs)) {
+        const text = readFileSync(candidateAbs, "utf8");
+        contents.set(op.targetPath, text.length <= MAX_EXISTING_READ_BYTES ? text : text.slice(0, MAX_EXISTING_READ_BYTES));
+      } else {
+        contents.set(op.targetPath, null);
+      }
+    } catch {
+      contents.set(op.targetPath, null);
+    }
+  }
+  return contents;
+}
+
+function hasUnvotedRethinkChallenge(ledger) {
+  const allChallenges = Array.isArray(ledger?.turnPreflightChallenges) ? ledger.turnPreflightChallenges : [];
+  const completed = allChallenges.filter(
+    (entry) => typeof entry?.completedStepIndex === "number" && entry.completedStepIndex >= 0,
+  );
+  if (completed.length === 0) {
+    return { completed, unvotedRethink: false };
+  }
+  const votes = Array.isArray(ledger?.turnUserVotes) ? ledger.turnUserVotes : [];
+  const hasVoteAfter = (challenge) =>
+    votes.some(
+      (vote) =>
+        vote &&
+        vote.answered === true &&
+        vote.errored !== true &&
+        typeof vote.completedStepIndex === "number" &&
+        vote.completedStepIndex > challenge.completedStepIndex,
+    );
+  const unvotedRethink = completed.some((ch) => ch.verdict === "RETHINK" && !hasVoteAfter(ch));
+  return { completed, unvotedRethink };
+}
+
+function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options }) {
+  const dataDir = options?.dataDir ?? resolvePluginDataDir();
+  const governanceConfig = options?.governanceConfig ?? readGovernanceConfig(dataDir);
+  const autonomyMode = resolveAutonomyMode(dataDir, governanceConfig);
+  if (autonomyMode !== "smart") {
+    return { decision: "allow" };
+  }
+
+  const ledger =
+    options?.ledger ??
+    (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
+  const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
+  if (sessionRole !== "main") {
+    return { decision: "allow" };
+  }
+
+  const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
+  const { completed, unvotedRethink } = hasUnvotedRethinkChallenge(ledger);
+
+  if (unvotedRethink) {
+    if (options?.skipAuditLog !== true) {
+      appendAuditRecord(
+        {
+          ts: new Date().toISOString(),
+          event: "autonomy_event",
+          eventType: "autonomy_event",
+          kind: "circuit_breaker",
+          subkind: "rethink_unvoted_block",
+          conversationId,
+          turnStartStepIndex,
+          toolName: toolCall.name,
+          reasons: ["rethink_unvoted"],
+        },
+        dataDir,
+      );
+    }
+    return {
+      decision: "deny",
+      reason: RETHINK_UNVOTED_DENY_REASON,
+    };
+  }
+
+  if (completed.length > 0) {
+    return { decision: "allow" };
+  }
+
+  const turnKey = `${conversationId || "anon"}:${turnStartStepIndex}`;
+  if (conversationId && hasAutonomyTurnFlag({ conversationId, flagName: "circuitBreakerTurns", turnKey, dataDir })) {
+    return { decision: "allow" };
+  }
+
+  const thresholds = resolveAutonomyThresholds(dataDir, governanceConfig);
+  const existingContentsByPath =
+    options?.existingContentsByPath ??
+    readExistingContentsMap(toolCall.name, toolCall.args, cwd, options?.readTextFile);
+
+  const inspection = detectDestructiveEdit({
+    toolName: toolCall.name,
+    toolInput: toolCall.args,
+    cwd,
+    existingContentsByPath,
+    config: governanceConfig,
+    thresholds,
+  });
+
+  if (!inspection.destructive) {
+    return { decision: "allow" };
+  }
+
+  if (conversationId) {
+    const claimed = claimAutonomyTurnFlag({
+      conversationId,
+      flagName: "circuitBreakerTurns",
+      turnKey,
+      dataDir,
+    });
+    if (!claimed) {
+      return { decision: "allow" };
+    }
+  }
+
+  if (options?.skipAuditLog !== true) {
+    appendAuditRecord(
+      {
+        ts: new Date().toISOString(),
+        event: "autonomy_event",
+        eventType: "autonomy_event",
+        kind: "circuit_breaker",
+        conversationId,
+        turnStartStepIndex,
+        toolName: toolCall.name,
+        targetPath: inspection.targetPath,
+        reasons: inspection.reasons,
+        deletedLines: inspection.deletedLines,
+        removedPrimitives: inspection.removedPrimitives,
+      },
+      dataDir,
+    );
+  }
+
+  return {
+    decision: "deny",
+    reason: buildCircuitBreakerDenyReason(inspection),
+  };
+}
+
+export function handlePreToolGate(stdinText, options = {}) {
   const payload = parseHookPayload(stdinText, "PreToolUse");
   const toolCall = payload?.toolCall ?? payload?.tool_call;
   if (!payload || !toolCall || typeof toolCall !== "object") {
@@ -236,6 +402,10 @@ export function handlePreToolGate(stdinText) {
 
   if (toolName === SUBAGENT_TOOL_NAME) {
     return handleSubagentPreTool(toolCall, { cwd, transcriptPath });
+  }
+
+  if (WRITE_TOOL_NAMES.has(toolName)) {
+    return handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options });
   }
 
   if (!HSTACK_MCP_TOOL_RE.test(toolName)) {

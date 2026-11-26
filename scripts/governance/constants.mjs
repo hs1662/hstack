@@ -30,6 +30,60 @@ export const PASSING_VERDICTS = new Set([
 
 export const ALLOWED_AUDIT_ESCALATION_MODES = new Set(["auto", "manual", "off"]);
 
+export const AUTO_CHALLENGER_MARKER = "[hstack:자동사전검토]";
+export const AUTO_HANDOFF_MARKER = "[hstack:자가치유위임]";
+export const ALLOWED_AUTONOMY_MODES = new Set(["smart", "manual", "off"]);
+export const DEFAULT_AUTONOMY_MODE = "smart";
+export const DEFAULT_AUTONOMY_THRESHOLDS = {
+  destructiveDeleteLines: 25,
+  thrashingVerifyFailures: 4,
+  thrashingSameFileEdits: 5,
+  thrashingHighTokens: 150_000,
+};
+
+export const RETHINK_UNVOTED_DENY_REASON =
+  "[서킷브레이커 차단] 적대적 사전 검토관이 재설계 권고 판정을 내렸으므로 사용자 표결 없이 코드를 수정할 수 없습니다. 먼저 `ask_question`으로 사용자 승인을 받거나 비대화형 환경이면 대조 표와 선택지만 보고하고 작업을 멈추세요.";
+
+export const PROMPT_ROUTE_SYSTEM_MESSAGE =
+  "[자율 사전검토 안내] 고위험 설계·단순화 제안이 감지되었다. 코드 수정이나 결론 제시 전 관련 파일을 직접 읽어 중립 브리프를 정리하고 `invoke_subagent`로 `hstack-challenger`(`적대적 설계 검토관`, `[hstack:자동사전검토]`)의 독립 반론을 먼저 받아라. `진행 가능`·`조건부 진행`은 보완 반영 후 자율 진행(읽기 전용 요청이면 검토 결과만 보고)하고, `재설계 권고`일 때만 `파일:줄` 근거와 대안을 제시해 사용자 확인을 받아라.";
+
+export function buildCircuitBreakerDenyReason({ targetPath, reasons, removedPrimitives, deletedLines }) {
+  const detailParts = [];
+  if (Array.isArray(removedPrimitives) && removedPrimitives.length > 0) {
+    detailParts.push(`안전장치 제거(${removedPrimitives.join(", ")})`);
+  }
+  if (Array.isArray(reasons) && reasons.includes("sensitive_mass_delete")) {
+    detailParts.push(`민감 경로 대규모 삭제(${deletedLines}줄)`);
+  }
+  const summary = detailParts.length > 0 ? detailParts.join(" 및 ") : "파괴적 코드 변경 위험";
+  const pathLabel = targetPath ? `\`${targetPath}\`` : "대상 파일";
+  return [
+    `[서킷브레이커 자동 제동] ${pathLabel} 편집에서 ${summary} 징후가 감지되어 쓰기를 잠시 보류했습니다.`,
+    `먼저 관련 파일을 직접 읽어 중립 브리프를 작성하고 \`invoke_subagent\`로 \`hstack-challenger\`(\`적대적 설계 검토관\`)를 호출해 \`${AUTO_CHALLENGER_MARKER}\` 표식과 함께 독립 반론을 받으세요.`,
+    "판정이 `진행 가능`이면 지적된 잔여 리스크를 반영해 묻지 않고 진행하고, `조건부 진행`이면 사용자 목표와 충돌하지 않는 보완을 자동 반영해 진행하며, `재설계 권고`일 때만 편집을 멈추고 `ask_question`으로 `파일:줄` 근거와 대안을 제시해 사용자 확인을 받으세요.",
+  ].join(" ");
+}
+
+export function buildAutoHandoffSystemMessage({ reasons, turnVerifyFailures, maxSameFileEdits, mostEditedFile, inputTokens }) {
+  const details = [];
+  if (reasons.includes("verify_failures_accumulated")) {
+    details.push(`검증 실패 누적(${turnVerifyFailures}회)`);
+  }
+  if (reasons.includes("same_file_churn_with_failures")) {
+    const fileNote = mostEditedFile ? `\`${mostEditedFile}\` ` : "";
+    details.push(`${fileNote}반복 수정(${maxSameFileEdits}회)과 검증 실패 동반`);
+  }
+  if (reasons.includes("high_tokens_consecutive_failures")) {
+    details.push(`고토큰(${inputTokens})과 연속 검증 실패`);
+  }
+  const reasonText = details.length > 0 ? details.join(", ") : "반복 실패 징후";
+  return [
+    `${AUTO_HANDOFF_MARKER} ${reasonText}가 감지되어 자가치유 위임을 권고한다.`,
+    "현재 문맥에서 같은 시도를 반복하지 말고, 즉시 `manage_handoff`(저장 동작)로 확인된 사실과 실패한 접근 목록을 증류 저장한 뒤 `invoke_subagent`로 `hstack-worker`(`팩트 기반 격리 작업자`)에게 남은 수정과 테스트 통과를 위임하라.",
+    "만약 격리 작업자도 해결하지 못하면 재위임 루프를 돌지 말고 증류된 실패 원인과 선택지를 사용자에게 보고하고 종료하라.",
+  ].join(" ");
+}
+
 export const DEFAULT_RISK_THRESHOLDS = {
   minCodeFiles: 4,
   minChangedLines: 150,
@@ -110,6 +164,7 @@ export const WRITE_TOOL_NAMES = new Set([
   "replace_file_content",
   "multi_replace_file_content",
   "mcp_agy-fast_fast_apply_edits",
+  "mcp_agy-fast_apply_edits",
 ]);
 
 export const CREATE_AS_READ_TOOL_NAMES = new Set(["write_file", "write_to_file"]);

@@ -224,6 +224,7 @@ export function updateSessionPollutionState({
       : [];
 
     const state = {
+      ...prev,
       conversationId,
       turnStartStepIndex:
         typeof turnStartStepIndex === "number" && Number.isFinite(turnStartStepIndex)
@@ -242,6 +243,71 @@ export function updateSessionPollutionState({
     } catch {
     }
     return state;
+  });
+}
+
+const ALLOWED_AUTONOMY_FLAG_NAMES = new Set([
+  "circuitBreakerTurns",
+  "promptRouteTurns",
+  "autoHandoffTurns",
+]);
+const MAX_AUTONOMY_TURN_KEYS = 30;
+
+export function hasAutonomyTurnFlag({
+  conversationId,
+  flagName,
+  turnKey,
+  dataDir = resolvePluginDataDir(),
+} = {}) {
+  if (
+    !ALLOWED_AUTONOMY_FLAG_NAMES.has(flagName) ||
+    typeof turnKey !== "string" ||
+    turnKey.length === 0
+  ) {
+    return false;
+  }
+  const state = readSessionState(conversationId, dataDir);
+  if (!state) {
+    return false;
+  }
+  const existing = Array.isArray(state[flagName]) ? state[flagName] : [];
+  return existing.includes(turnKey);
+}
+
+export function claimAutonomyTurnFlag({
+  conversationId,
+  flagName,
+  turnKey,
+  dataDir = resolvePluginDataDir(),
+} = {}) {
+  if (!ALLOWED_AUTONOMY_FLAG_NAMES.has(flagName) || typeof turnKey !== "string" || turnKey.length === 0) {
+    return false;
+  }
+  const filePath = resolveSessionStatePath(conversationId, dataDir);
+  if (!filePath) {
+    return true;
+  }
+  return withSessionLock(filePath, () => {
+    const prev = readSessionState(conversationId, dataDir) ?? { conversationId };
+    const existing = Array.isArray(prev[flagName])
+      ? prev[flagName].filter((k) => typeof k === "string" && k.length > 0)
+      : [];
+    if (existing.includes(turnKey)) {
+      return false;
+    }
+    const nextList = [...existing, turnKey].slice(-MAX_AUTONOMY_TURN_KEYS);
+    const nextState = {
+      ...prev,
+      conversationId,
+      updatedAt: new Date().toISOString(),
+      [flagName]: nextList,
+    };
+    try {
+      atomicWriteJson(filePath, nextState);
+      return true;
+    } catch {
+      return false;
+    }
   });
 }
 
