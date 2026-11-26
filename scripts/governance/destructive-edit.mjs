@@ -79,8 +79,12 @@ function stripCommentsOnly(text) {
   return parts.join("");
 }
 
-function stripCommentsAndWhitespace(text) {
-  return stripCommentsOnly(text).replace(/\s+/g, "");
+// Quote-blind strip: a regex literal such as /`/ or /'/ opens a false string in stripCommentsOnly and hides
+// a real comment after it, so removal checks also run on this view.
+const PLAIN_COMMENT_RE = /\/\*[\s\S]*?\*\/|\/\*[\s\S]*|\/\/[^\n]*|^[ \t]*#[^\n]*/gm;
+
+function stripCommentsPlain(text) {
+  return typeof text === "string" ? text.replace(PLAIN_COMMENT_RE, " ") : "";
 }
 
 function countLegacyBranchLines(text) {
@@ -244,8 +248,14 @@ function detectRemovedPrimitives(oldText, newText) {
   if (typeof oldText !== "string" || typeof newText !== "string" || oldText.length === 0) {
     return [];
   }
-  const oldCode = stripCommentsOnly(oldText);
-  const newCode = stripCommentsOnly(newText);
+  const removed = new Set([
+    ...removedPrimitivesInCode(stripCommentsOnly(oldText), stripCommentsOnly(newText)),
+    ...removedPrimitivesInCode(stripCommentsPlain(oldText), stripCommentsPlain(newText)),
+  ]);
+  return [...removed];
+}
+
+function removedPrimitivesInCode(oldCode, newCode) {
   const removed = [];
 
   if (countMatches(oldCode, TIMING_SAFE_EQUAL_RE) > 0 && countMatches(newCode, TIMING_SAFE_EQUAL_RE) === 0) {
@@ -331,7 +341,8 @@ function evaluateSingleOperation(op, existingInfo, { config, deleteLinesThreshol
     netDeletedLines = Math.max(0, countLines(oldSample) - countLines(newSample));
   }
 
-  if (stripCommentsAndWhitespace(oldSample) === stripCommentsAndWhitespace(newSample)) {
+  const sameIgnoringComments = (strip) => strip(oldSample).replace(/\s+/g, "") === strip(newSample).replace(/\s+/g, "");
+  if (sameIgnoringComments(stripCommentsOnly) && sameIgnoringComments(stripCommentsPlain)) {
     return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [], targetPath: effectivePath };
   }
 
