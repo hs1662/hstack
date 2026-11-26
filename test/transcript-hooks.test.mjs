@@ -23,7 +23,7 @@ import {
   parseDriftMarkerStep,
   parseTranscriptJsonl,
 } from "../scripts/transcript.mjs";
-import { createTempDir, makeDenialStep, makeStep, toJsonl, wrapAntigravityHookMessage } from "./helpers.mjs";
+import { createTempDir, makeDenialStep, makeStep, timeUnderCpuLock, toJsonl, wrapAntigravityHookMessage } from "./helpers.mjs";
 
 describe("transcript reducer", () => {
   const englishThinking = "Let me read the hook script and verify the JSON output format carefully.";
@@ -850,9 +850,7 @@ describe("structured drift marker tags", () => {
     const repeatedDrifted = makeStep(0, "SYSTEM_MESSAGE", {
       content: `${DRIFT_MARKER} ${"drifted ".repeat(15_000)}`,
     });
-    const startMs = performance.now();
-    const parsed = parseDriftMarkerStep(repeatedDrifted);
-    const elapsedMs = performance.now() - startMs;
+    const { result: parsed, elapsedMs } = timeUnderCpuLock(() => parseDriftMarkerStep(repeatedDrifted));
 
     assert.ok(elapsedMs < 250, `expected linear-time legacy marker scan (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(parsed?.structured, false);

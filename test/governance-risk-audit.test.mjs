@@ -29,7 +29,7 @@ import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePostInvocation } from "../scripts/post-invocation.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handleStop } from "../scripts/stop.mjs";
-import { createTempDir, toJsonl, withCpuLock } from "./helpers.mjs";
+import { createTempDir, timeUnderCpuLock, toJsonl, withCpuLock } from "./helpers.mjs";
 
 function runGit(cwd, args) {
   return execFileSync("git", args, {
@@ -549,13 +549,14 @@ describe("fact-ledger Phase 2 extensions, git numstat, and 5MB performance", () 
     assert.equal(readFactLedger(spoofPromptPath, "/repo", "/repo").sessionRole, "main");
 
     // M1: ReDoS pattern in config.json sensitivePatterns must be rejected and run fast
-    const t0 = performance.now();
-    const redosRes = classifyRisk({
-      turnCodeWrittenFiles: new Set(["a".repeat(28) + "!"]),
-      gitLedger: { diffNumstat: new Map() },
-      config: { sensitivePatterns: ["(a+)+$"] },
-    });
-    assert.ok(performance.now() - t0 < 200);
+    const { result: redosRes, elapsedMs } = timeUnderCpuLock(() =>
+      classifyRisk({
+        turnCodeWrittenFiles: new Set(["a".repeat(28) + "!"]),
+        gitLedger: { diffNumstat: new Map() },
+        config: { sensitivePatterns: ["(a+)+$"] },
+      }),
+    );
+    assert.ok(elapsedMs < 200);
     assert.equal(redosRes.tier, "TIER_0");
 
     // M2: mixed Subagents array must not bind research agent's conversationId to auditor

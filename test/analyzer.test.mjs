@@ -16,7 +16,7 @@ import {
   extractNaturalText,
 } from "../scripts/analyzer.mjs";
 import { decidePreToolUseAction } from "../scripts/transcript.mjs";
-import { RULES_PATH } from "./helpers.mjs";
+import { RULES_PATH, timeUnderCpuLock } from "./helpers.mjs";
 
 describe("rules", () => {
   it("keeps rules/AGENTS.md 100% pure Korean without ASCII letters and well under budget", () => {
@@ -801,9 +801,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("strips uppercase technical runs in linear time without catastrophic backtracking on trailing lowercase digits", () => {
     const token = `AA${"1".repeat(26)}a`;
     const sample = `해시 토큰 ${token} 과 HTTP2, H264, UTF8MB4, SHA256SUMS 값을 한국어로 확인하고 검증한다.`;
-    const startMs = performance.now();
-    const analysis = analyzeField("content", sample);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeField("content", sample));
 
     assert.ok(elapsedMs < 250, `expected linear-time analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "korean");
@@ -812,9 +810,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("scans long dash-joined tokens without a dot in linear time without quadratic DOTTED_PATH_RE backtracking", () => {
     const dashChain = `a-${"b-".repeat(35_000)}c`;
     const sample = `긴 슬러그 식별자 ${dashChain} 와 a.b.c 경로를 한국어 문장으로 상세하게 확인하고 검증한다.`;
-    const startMs = performance.now();
-    const analysis = analyzeField("content", sample);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeField("content", sample));
 
     assert.ok(elapsedMs < 250, `expected linear-time analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "korean");
@@ -823,9 +819,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("scans escaped-quote lines with no closing quote in linear time without quadratic DOUBLE_QUOTED_RE rescans", () => {
     const escapedQuotes = '\\"'.repeat(30_000);
     const sample = `오류 "Error: Unexpected token" 인용구와 직렬화된 이스케이프 페이로드 ${escapedQuotes} 를 한국어 문장으로 상세하게 확인하고 검증한다.`;
-    const startMs = performance.now();
-    const analysis = analyzeField("content", sample);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeField("content", sample));
 
     assert.ok(elapsedMs < 250, `expected linear-time analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "korean");
@@ -834,9 +828,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("scans long underscore-joined tokens without a slash in linear time without quadratic RELATIVE_PATH_RE backtracking", () => {
     const underscoreChain = `a_${"b_".repeat(35_000)}c`;
     const sample = `긴 밑줄 토큰 ${underscoreChain} 과 scripts/analyzer.mjs 상대 경로를 한국어 문장으로 상세하게 확인하고 검증한다.`;
-    const startMs = performance.now();
-    const analysis = analyzeField("content", sample);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeField("content", sample));
 
     assert.ok(elapsedMs < 250, `expected linear-time analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "korean");
@@ -845,9 +837,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("scans unclosed curly and corner quotes in linear time without quadratic CITED_CURLY_QUOTE_RE backtracking", () => {
     const unclosedCurlyQuotes = "“".repeat(35_000);
     const sample = `한국어 문장 설명과 “Prove It Works” 및 「Boundary Discipline」 원칙과 ${unclosedCurlyQuotes} 기호를 상세하게 확인하고 검증한다.`;
-    const startMs = performance.now();
-    const analysis = analyzeField("content", sample);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeField("content", sample));
 
     assert.ok(elapsedMs < 250, `expected linear-time analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "korean");
@@ -856,9 +846,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("scans long dot-underscore tokens in linear time without quadratic DOTFILE_RE backtracking", () => {
     const dotUnderscoreChain = `.a${"._.a".repeat(30_000)}!`;
     const sample = `숨김 파일 .gitignore 및 .env.local 설정과 ${dotUnderscoreChain} 데이터를 한국어 문장으로 상세하게 확인하고 검증한다.`;
-    const startMs = performance.now();
-    const analysis = analyzeField("content", sample);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeField("content", sample));
 
     assert.ok(elapsedMs < 250, `expected linear-time analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "korean");
@@ -867,9 +855,7 @@ describe("regressions: summarizer boilerplate, spaced Korean UI prefixes, and pr
   it("trims UI token edge punctuation in linear time without quadratic TOKEN_EDGE_PUNCT_RE backtracking", () => {
     const punctRunToken = `${")".repeat(35_000)}A`;
     const sample = `React Router ${punctRunToken}`;
-    const startMs = performance.now();
-    const analysis = analyzeUiTexts([sample]);
-    const elapsedMs = performance.now() - startMs;
+    const { result: analysis, elapsedMs } = timeUnderCpuLock(() => analyzeUiTexts([sample]));
 
     assert.ok(elapsedMs < 250, `expected linear-time UI analysis (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(analysis.status, "drifted");

@@ -24,7 +24,7 @@ import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { GATE_STOP_MARKER, decideHookAction, parseTranscriptJsonl } from "../scripts/transcript.mjs";
 import { deniedToolCallIndexes } from "../scripts/transcript/steps.mjs";
-import { HOOK_SCRIPT, PLUGIN_ROOT, STOP_HOOK_SCRIPT, createTempDir, runHookSubprocess, toJsonl, withCpuLock } from "./helpers.mjs";
+import { HOOK_SCRIPT, PLUGIN_ROOT, STOP_HOOK_SCRIPT, createTempDir, runHookSubprocess, timeUnderCpuLock, toJsonl, withCpuLock } from "./helpers.mjs";
 
 const KOREAN_PROSE = "작업 중입니다 ".repeat(20);
 
@@ -199,9 +199,9 @@ describe("low #2 custom sensitive patterns with nested quantifiers are rejected 
   const hostile = "a".repeat(28) + "!";
   for (const pattern of ["((a+))+", "(a+)+", "(a*)*", "(a|a)+", "([a-z]+){2,}", "(a+)+$", "(a)\\1", "(?<x>a)\\k<x>"]) {
     it(`rejects ${pattern} without running it`, () => {
-      const t0 = performance.now();
-      assert.equal(isSensitiveFilePath(hostile, { sensitivePatterns: [pattern] }), false);
-      assert.ok(performance.now() - t0 < 50, "the pattern was never executed");
+      const { result, elapsedMs } = timeUnderCpuLock(() => isSensitiveFilePath(hostile, { sensitivePatterns: [pattern] }));
+      assert.equal(result, false);
+      assert.ok(elapsedMs < 50, "the pattern was never executed");
       // Rejected custom patterns leave the defaults in force.
       assert.equal(isSensitiveFilePath("lib/auth/login.mjs", { sensitivePatterns: [pattern] }), true);
     });

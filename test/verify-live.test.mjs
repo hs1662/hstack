@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import { analyzeField } from "../scripts/analyzer.mjs";
 import { GATE_TOOL_NAME } from "../scripts/governance/constants.mjs";
 import { DRIFT_MARKER, GATE_STOP_MARKER, buildCorrectionMessage } from "../scripts/transcript.mjs";
-import { createTempDir, makeDenialStep, makeStep, wrapAntigravityHookMessage } from "./helpers.mjs";
+import { createTempDir, makeDenialStep, makeStep, timeUnderCpuLock, wrapAntigravityHookMessage } from "./helpers.mjs";
 import {
   CASES,
   buildIsolatedEnv,
@@ -652,8 +652,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
   });
 
   it("Audit #9: challengerHasFileLineCitation only checks challenger outputs and runs in linear time", () => {
-    const t0 = Date.now();
-    const res = summarizeGovernance({
+    const { result: res, elapsedMs } = timeUnderCpuLock(() => summarizeGovernance({
       steps: [
         makeStep(0, "PLANNER_RESPONSE", {
           thinking: koreanThinking,
@@ -661,8 +660,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
         }),
       ],
       ledgerChallenges: [{ verdict: "RETHINK", tail: "근거 없는 일반 반론입니다." }],
-    });
-    const elapsedMs = Date.now() - t0;
+    }));
     assert.equal(res.challengerHasFileLineCitation, false);
     assert.ok(elapsedMs < 100, `expected linear-time regex (<100ms), got ${elapsedMs}ms`);
   });

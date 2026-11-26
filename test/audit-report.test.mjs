@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+// Joins the suite-wide CPU lock so timed tests never overlap this file.
+import "./helpers.mjs";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

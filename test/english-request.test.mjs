@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { decideHookAction, decideStopAction, isExplicitEnglishOutputRequest } from "../scripts/transcript.mjs";
-import { makeStep } from "./helpers.mjs";
+import { makeStep, timeUnderCpuLock } from "./helpers.mjs";
 
 describe("explicit English output requests", () => {
   const englishThinking = "Let me read the hook script and verify the JSON output format carefully.";
@@ -448,9 +448,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
 
   it("scans repeated polite request prefixes in linear time without quadratic EN_POLITE_REQUEST_RE backtracking", () => {
     const repeatedPlease = `${"please ".repeat(20_000)}확인해 줘`;
-    const startMs = performance.now();
-    const result = isExplicitEnglishOutputRequest(repeatedPlease);
-    const elapsedMs = performance.now() - startMs;
+    const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(repeatedPlease));
 
     assert.ok(elapsedMs < 250, `expected linear-time request check (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(result, false);
@@ -459,9 +457,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
 
   it("strips metadata blocks in linear time without quadratic METADATA_BLOCK_RE scans on unclosed tags", () => {
     const unclosedTags = `${"<ADDITIONAL_METADATA>".repeat(20_000)}구조를 분석해 줘`;
-    const startMs = performance.now();
-    const result = isExplicitEnglishOutputRequest(unclosedTags);
-    const elapsedMs = performance.now() - startMs;
+    const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(unclosedTags));
 
     assert.ok(elapsedMs < 250, `expected linear-time metadata strip (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(result, false);
@@ -475,9 +471,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
 
   it("strips repeated metadata blocks before a distant other metadata tag in linear time without quadratic rescans", () => {
     const repeatedThenOtherTag = `${"<USER_SETTINGS_CHANGE>x</USER_SETTINGS_CHANGE>".repeat(12_000)}<ADDITIONAL_METADATA>Write in English</ADDITIONAL_METADATA>구조를 분석해 줘`;
-    const startMs = performance.now();
-    const result = isExplicitEnglishOutputRequest(repeatedThenOtherTag);
-    const elapsedMs = performance.now() - startMs;
+    const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(repeatedThenOtherTag));
 
     assert.ok(elapsedMs < 250, `expected linear-time multi-tag metadata strip (<250ms), took ${elapsedMs.toFixed(1)}ms`);
     assert.equal(result, false);
@@ -486,9 +480,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
   it("scans padded Korean request nouns in linear time without quadratic KO_REQUEST_NOUN_ENDING backtracking", () => {
     for (const prefix of ["영어로 번역", "영작"]) {
       const padded = `${prefix}${" ".repeat(50_000)}x`;
-      const startMs = performance.now();
-      const result = isExplicitEnglishOutputRequest(padded);
-      const elapsedMs = performance.now() - startMs;
+      const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(padded));
 
       assert.ok(
         elapsedMs < 250,
@@ -507,9 +499,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
   it("scans repeated Korean language-particle tokens in linear time without quadratic backtracking", () => {
     for (const token of ["영어로", "한국어로"]) {
       const repeated = token.repeat(14_000);
-      const startMs = performance.now();
-      const result = isExplicitEnglishOutputRequest(repeated);
-      const elapsedMs = performance.now() - startMs;
+      const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(repeated));
 
       assert.ok(
         elapsedMs < 250,
@@ -525,9 +515,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
 
   it("strips trailing 좀 in isSourceDescription in linear time on whitespace-padded source modifiers", () => {
     const padded = `영어로 된${" ".repeat(60_000)}글 써줘`;
-    const startMs = performance.now();
-    const result = isExplicitEnglishOutputRequest(padded);
-    const elapsedMs = performance.now() - startMs;
+    const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(padded));
 
     assert.ok(
       elapsedMs < 250,
@@ -541,9 +529,7 @@ describe("QA F2/F4: pasted material and short explicit English requests", () => 
   it("normalizes trailing question punctuation in linear time on ?-terminated sentences with long whitespace or punctuation runs", () => {
     for (const filler of [" ", ",", ";", "~"]) {
       const paddedQuestion = `영어로 된${filler.repeat(60_000)}글 써줘?`;
-      const startMs = performance.now();
-      const result = isExplicitEnglishOutputRequest(paddedQuestion);
-      const elapsedMs = performance.now() - startMs;
+      const { result: result, elapsedMs } = timeUnderCpuLock(() => isExplicitEnglishOutputRequest(paddedQuestion));
 
       assert.ok(
         elapsedMs < 250,
