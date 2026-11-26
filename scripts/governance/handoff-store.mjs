@@ -125,7 +125,7 @@ function reclaimStaleSessionLock(lockPath) {
   return true;
 }
 
-function withSessionLock(filePath, fn) {
+export function withSessionLock(filePath, fn) {
   const dir = resolve(filePath, "..");
   mkdirSync(dir, { recursive: true });
   const lockPath = `${filePath}.lock`;
@@ -147,8 +147,10 @@ function withSessionLock(filePath, fn) {
   if (fd === null) {
     throw new Error(`Failed to acquire session lock: ${lockPath}`);
   }
+  // The nonce tells this owner's lock from one a reclaimer handed to the next owner after the age cap.
+  const owner = JSON.stringify({ pid: process.pid, createdAt: Date.now(), nonce: randomBytes(8).toString("hex") });
   try {
-    writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+    writeSync(fd, owner);
     return fn();
   } finally {
     try {
@@ -156,7 +158,10 @@ function withSessionLock(filePath, fn) {
     } catch {
     }
     try {
-      unlinkSync(lockPath);
+      // shortcut: a reclaim landing between this read and the unlink still loses the new lock, which needs a 120s-old holder plus a microsecond race; upgrade to rename-then-verify if it shows up.
+      if (readFileSync(lockPath, "utf8") === owner) {
+        unlinkSync(lockPath);
+      }
     } catch {
     }
   }
