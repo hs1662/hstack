@@ -21,7 +21,7 @@ import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
 import { handleStop } from "../scripts/stop.mjs";
 import { GATE_STOP_MARKER } from "../scripts/transcript.mjs";
-import { HOOKS_JSON_PATH, createTempDir, toJsonl } from "./helpers.mjs";
+import { HOOKS_JSON_PATH, createTempDir, toJsonl, withCpuLock } from "./helpers.mjs";
 
 // Stop and the turn-start snapshot resolve the plugin data dir from the environment.
 const DATA_DIR = createTempDir("hstack-p4-data-");
@@ -229,29 +229,25 @@ describe("H2 masked verification never passes or clears a failure", () => {
 });
 
 describe("H3 an unusable working-tree snapshot fails closed", () => {
+  // More dirty files than the snapshot cap; building the tree is a CPU burst, so keep it off the perf tests.
+  const runHugeDirtyTurn = (conversationId, steps) =>
+    withCpuLock(() => {
+      const repo = makeRepo();
+      for (let i = 0; i < 2001; i += 1) writeFileSync(join(repo, `n${i}.txt`), "");
+      return runTurn(repo, conversationId, steps.map((step) => (step.edit ? { cmd: step.cmd, effect: () => writeFileSync(join(repo, "app.mjs"), step.edit) } : step)));
+    });
+  const SED = { cmd: "sed -i s/1/2/ app.mjs", edit: "export const v = 2;\n" };
+
   it("blocks Stop after a shell edit when the tree has more dirty files than the snapshot cap", () => {
-    const repo = makeRepo();
-    for (let i = 0; i < 2001; i += 1) writeFileSync(join(repo, `n${i}.txt`), "");
-    const out = runTurn(repo, "p4-h3", [
-      { cmd: "sed -i s/1/2/ app.mjs", effect: () => writeFileSync(join(repo, "app.mjs"), "export const v = 2;\n") },
-    ]);
-    assertGateBlocked(out);
+    assertGateBlocked(runHugeDirtyTurn("p4-h3", [SED]));
   });
 
   it("allows Stop once verify_completion passes after that shell edit", () => {
-    const repo = makeRepo();
-    for (let i = 0; i < 2001; i += 1) writeFileSync(join(repo, `n${i}.txt`), "");
-    const out = runTurn(repo, "p4-h3-ok", [
-      { cmd: "sed -i s/1/2/ app.mjs", effect: () => writeFileSync(join(repo, "app.mjs"), "export const v = 2;\n") },
-      { gate: true },
-    ]);
-    assert.deepEqual(out, {});
+    assert.deepEqual(runHugeDirtyTurn("p4-h3-ok", [SED, { gate: true }]), {});
   });
 
   it("keeps read-only turns over a huge dirty tree unblocked", () => {
-    const repo = makeRepo();
-    for (let i = 0; i < 2001; i += 1) writeFileSync(join(repo, `n${i}.txt`), "");
-    assert.deepEqual(runTurn(repo, "p4-h3-ro", [{ cmd: "git status" }]), {});
+    assert.deepEqual(runHugeDirtyTurn("p4-h3-ro", [{ cmd: "git status" }]), {});
   });
 });
 
@@ -372,7 +368,7 @@ describe("M3 polynomial custom patterns are rejected quickly", () => {
     ["a{0,20}a{0,20}b", "a".repeat(60)],
   ];
   for (const [pattern, input] of hostile) {
-    it(`rejects ${pattern} in under 1ms per call`, () => {
+    it(`rejects ${pattern} in under 1ms per call`, () => withCpuLock(() => {
       assert.equal(isSensitiveFilePath(input, { sensitivePatterns: [pattern] }), false);
       // Inputs are sized so an executed pattern costs tens of ms; a rejected one never runs.
       const t0 = performance.now();
@@ -384,7 +380,7 @@ describe("M3 polynomial custom patterns are rejected quickly", () => {
       assert.ok((performance.now() - t0) / calls < 1, "rejection took 1ms or more");
       // A rejected custom list leaves the defaults in force.
       assert.equal(isSensitiveFilePath("lib/auth/login.mjs", { sensitivePatterns: [pattern] }), true);
-    });
+    }));
   }
   for (const [pattern, match] of [["^auth/", "auth/login.mjs"], ["^src/.*/auth/", "src/a/b/auth/x.mjs"], ["npm test", "scripts/npm test.sh"], ["vitest", "vitest.config.ts"], ["^src/.*\\.secret\\.mjs$", "src/x.secret.mjs"]]) {
     it(`accepts ${pattern}`, () => {
