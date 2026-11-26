@@ -537,7 +537,8 @@ describe("#7 head and tail scans read only the header and the current turn of a 
         assert.equal(call("sed -i s/a/b/ app.mjs").decision, "deny");
         samples.push(performance.now() - t0);
       }
-      assert.equal(call("node --test").decision, "allow");
+      // Read-only roles get no shell at all (gate audit run 1); a main session would allow both.
+      assert.equal(call("node --test").decision, "deny");
       assert.ok(Math.min(...samples) < 50, `run_command gate fastest ${Math.min(...samples).toFixed(0)}ms (>= 50ms)`);
     });
   });

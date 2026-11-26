@@ -392,7 +392,8 @@ describe("v0.1.2 inline interpreter bodies are not verification unless the body 
     }
   });
 
-  it("denies an inline-interpreter write from auditor and challenger sessions and still allows their test runs", () => {
+  // Gate audit run 1: read-only roles get no shell at all, so their test runs are denied as well.
+  it("denies an inline-interpreter write from auditor and challenger sessions and their test runs too", () => {
     const repo = makeRepo();
     const mainPath = writeTranscript(repo, "main.jsonl", [{ step_index: 0, type: "USER_INPUT", content: "검토해 줘" }]);
     for (const TypeName of [AUDITOR_AGENT_NAME, CHALLENGER_AGENT_NAME]) {
@@ -402,7 +403,7 @@ describe("v0.1.2 inline interpreter bodies are not verification unless the body 
         const out = preTool(repo, subPath, { name: "run_command", args: { CommandLine } }, OFF);
         assert.equal(out.decision, "deny", `${TypeName} ${CommandLine}`);
       }
-      assert.equal(preTool(repo, subPath, { name: "run_command", args: { CommandLine: 'bash -c "npm test"' } }, OFF).decision, "allow");
+      assert.equal(preTool(repo, subPath, { name: "run_command", args: { CommandLine: 'bash -c "npm test"' } }, OFF).decision, "deny");
     }
   });
 

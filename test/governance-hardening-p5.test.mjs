@@ -93,7 +93,8 @@ describe("HIGH1 a chain is verification only when every other segment is read-on
       "CI=1 npm test",
     ]) {
       assert.equal(classifyCommand(cmd), "verification", cmd);
-      assert.equal(auditorGate(cmd), "allow", cmd);
+      // Read-only roles get no shell at all (gate audit run 1).
+      assert.equal(auditorGate(cmd), "deny", cmd);
     }
   });
 

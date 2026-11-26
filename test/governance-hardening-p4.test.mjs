@@ -286,9 +286,10 @@ describe("Known-B auditor and challenger sessions cannot write through run_comma
         assert.equal(analyzeField("content", out.reason).status, "korean");
       }
     });
-    it(`${role} may still run read-only and verification commands`, () => {
+    // Gate audit run 1: a check can run arbitrary code, so read-only roles get no shell at all.
+    it(`${role} is denied read-only and verification commands too`, () => {
       for (const cmd of ["git diff", "rg -n timingSafeEqual src", "npm test", "cd x && node --test"]) {
-        assert.equal(call(marker, cmd).decision, "allow", cmd);
+        assert.equal(call(marker, cmd).decision, "deny", cmd);
       }
     });
   }

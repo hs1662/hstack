@@ -340,7 +340,11 @@ function tokenizeSegment(segment) {
   return tokens;
 }
 
-function hasUnquotedFileRedirection(segment) {
+const DEV_NULL_TARGET_RE = /^\/dev\/null$/;
+// A check may keep its log; any other redirect target is a write the check only disguises.
+const CHECK_LOG_TARGET_RE = /^(?:\/dev\/null|[\w./-]+\.(?:log|out|txt))$/;
+
+function hasUnquotedFileRedirection(segment, allowedTarget = DEV_NULL_TARGET_RE) {
   let quote = null;
   for (let i = 0; i < segment.length; i += 1) {
     const ch = segment[i];
@@ -378,9 +382,9 @@ function hasUnquotedFileRedirection(segment) {
       while (j < segment.length && /\s/.test(segment[j])) {
         j += 1;
       }
-      const rest = segment.slice(j);
-      if (/^\/dev\/null(?:\s|$)/.test(rest)) {
-        i = j + "/dev/null".length - 1;
+      const target = /^[^\s;&|<>]*/.exec(segment.slice(j))[0];
+      if (allowedTarget.test(target)) {
+        i = j + target.length - 1;
         continue;
       }
       return true;
@@ -392,9 +396,10 @@ function hasUnquotedFileRedirection(segment) {
 const SHELL_INTERPRETERS = new Set(["sh", "bash"]);
 const SHELL_OPTION_FLAGS_WITH_ARG = new Set(["-o", "+o", "-O", "+O"]);
 const PYTHON_FLAGS_WITH_ARG = new Set(["-W", "-X"]);
+// A short-flag cluster counts with its code attached too (`-e"…"` reaches the tokenizer as `-e…`).
 const INLINE_CODE_FLAG_RE = {
-  node: /^(?:-e|-p|-pe|-ep|--eval|--print)(?:=|$)/,
-  bun: /^(?:-e|-p|--eval|--print)(?:=|$)/,
+  node: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
+  bun: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
 };
 
 // The inline body of an interpreter given code on its command line, or null for a script or a plain run.
@@ -410,6 +415,9 @@ function inlineInterpreterBody(bin, args) {
         i += 1;
       } else if (/^[-+][A-Za-z]+$/.test(arg)) {
         inline ||= arg[0] === "-" && arg.includes("c");
+      } else if (/^-[A-Za-z]*c/.test(arg)) {
+        const body = arg.slice(arg.indexOf("c") + 1);
+        return pipefail ? `set -o pipefail && ${body}` : body;
       } else if (!arg.startsWith("--") || arg === "--") {
         const body = arg === "--" ? (args[i + 1] ?? "") : arg;
         return inline ? (pipefail ? `set -o pipefail && ${body}` : body) : null;
@@ -420,13 +428,19 @@ function inlineInterpreterBody(bin, args) {
   if (bin === "python" || bin === "python3") {
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (arg === "-m" || !arg.startsWith("-")) {
+      if (!arg.startsWith("-")) {
+        return null;
+      }
+      // The first of c/m/W/X in a short-flag cluster takes the rest of it (or the next arg) as its value.
+      const flag = /^-[A-Za-z]*?([cmWX]|$)/.exec(arg)?.[1];
+      if (flag === "c") {
+        return "";
+      }
+      if (flag === "m") {
         return null;
       }
       if (PYTHON_FLAGS_WITH_ARG.has(arg)) {
         i += 1;
-      } else if (/^-[A-Za-z]+$/.test(arg) && arg.includes("c")) {
-        return "";
       }
     }
     return null;
@@ -541,7 +555,7 @@ function classifySingleSegment(segment) {
     }
   }
   if (VERIFICATION_BINARIES.has(baseBin) || rawBin.startsWith("./") || rawBin.startsWith("../")) {
-    return "verification";
+    return hasUnquotedFileRedirection(cleaned, CHECK_LOG_TARGET_RE) ? "other" : "verification";
   }
   return "other";
 }

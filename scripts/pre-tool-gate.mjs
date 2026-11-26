@@ -26,10 +26,7 @@ import {
 } from "./governance/constants.mjs";
 import { detectDestructiveEdit, normalizeWriteOperations } from "./governance/destructive-edit.mjs";
 import {
-  asObject,
-  classifyCommand,
   normalizeWorkspacePath,
-  pickString,
   readSessionRole,
   readTurnLedger,
   resolveGitRootFast,
@@ -455,12 +452,12 @@ export function handlePreToolGate(stdinText, options = {}) {
     return handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options });
   }
 
-  // Read-only roles may still read and run checks, but never a shell command that can write.
+  // Test runners and npx run arbitrary code, so no command string proves a shell call read-only.
   if (EXEC_TOOL_NAMES.has(toolName)) {
     const sessionRole = resolveSessionRole(transcriptPath, options);
-    const kind = classifyCommand(pickString(asObject(toolCall.args) ?? {}, ["CommandLine", "commandLine", "command"]));
-    const readOnlyRole = sessionRole === "auditor" || sessionRole === "challenger";
-    return readOnlyRole && kind === "other" ? { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON } : { decision: "allow" };
+    return sessionRole === "auditor" || sessionRole === "challenger"
+      ? { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON }
+      : { decision: "allow" };
   }
 
   if (!HSTACK_MCP_TOOL_RE.test(toolName)) {
