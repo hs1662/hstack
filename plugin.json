@@ -1,0 +1,30 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "hstack",
+  "displayName": "hstack",
+  "version": "0.1.0",
+  "description": "Keep model thinking traces, responses, and UI labels in natural conversational Korean while enforcing an evidence-grounded completion gate with opt-in adversarial preflight challenge, risk-tiered read-only independent auditing, fact-distilled cross-session handoff, eager MCP, PreToolUse interception, unified Stop recovery, and audit logging.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "hs1662",
+    "url": "https://github.com/hs1662"
+  },
+  "homepage": "https://github.com/hs1662/hstack",
+  "repository": "https://github.com/hs1662/hstack",
+  "license": "MIT",
+  "keywords": [
+    "korean",
+    "thinking",
+    "reasoning",
+    "governance",
+    "verification",
+    "mcp",
+    "hooks",
+    "rules"
+  ],
+  "suggestedPrompts": [
+    "이 저장소의 핵심 구조를 분석하고 주요 모듈 간 의존성을 단계별로 설명해 줘",
+    "실패하는 테스트의 원인을 코드 추적부터 수정, 검증 실행, 완료 검증 통과까지 완료해 줘",
+    "이 함수의 경계 오류를 수정하고 단위 테스트를 통과시킨 뒤 증거 기반으로 완료 보고해 줘"
+  ]
+}

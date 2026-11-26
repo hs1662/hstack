@@ -1,0 +1,574 @@
+import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { describe, it } from "node:test";
+import {
+  formatAuditReportTable,
+  parseAuditLines,
+  parseCliArgs,
+  resolveAuditLogPath,
+  summarizeAuditRecords,
+} from "../scripts/audit-report.mjs";
+
+const CLI_PATH = resolve("scripts/audit-report.mjs");
+
+function makeTempDir(prefix = "hstack-audit-report-") {
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
+describe("audit-report parser and aggregator", () => {
+  it("parses mixed Phase 1, Phase 2, and malformed JSONL lines and computes all 6 summary sections", () => {
+    const rawJsonl = [
+      JSON.stringify({
+        ts: "2026-11-20T09:00:00.000Z",
+        event: "gate_verify",
+        attemptInTurn: 1,
+        schemaRegister: "neutral",
+        verdict: "REJECT",
+        blockedRules: ["R2_STALE_VERIFICATION", "R5_FABRICATED_COMMAND"],
+        warnedRules: ["R7_HEDGE_DETECTED"],
+        metrics: {
+          unverifiedScopeCount: 0,
+          fillerUnverifiedCount: 1,
+          inputTokens: 10000,
+          cacheReadTokens: 20000,
+          ledgerScanMs: 10,
+          gitScanMs: 20,
+        },
+      }),
+      "{malformed json line",
+      "[]",
+      JSON.stringify({
+        ts: "2026-11-20T09:05:00.000Z",
+        event: "gate_verify",
+        eventType: "gate_verify",
+        attemptInTurn: 2,
+        sessionRole: "main",
+        schemaRegister: "audit",
+        verdict: "ESCALATE_AUDIT_REQUIRED",
+        riskTier: "TIER_1",
+        riskReasons: ["sensitive_path", "large_diff_lines"],
+        auditVerdict: null,
+        blockedRules: [],
+        warnedRules: [],
+        metrics: {
+          unverifiedScopeCount: 1,
+          fillerUnverifiedCount: 0,
+          pollutionAlert: false,
+          inputTokens: 20000,
+          cacheReadTokens: 40000,
+          ledgerScanMs: 30,
+          gitScanMs: 40,
+        },
+      }),
+      JSON.stringify({
+        ts: "2026-11-25T10:00:00.000Z",
+        event: "gate_verify",
+        eventType: "gate_verify",
+        attemptInTurn: 1,
+        sessionRole: "main",
+        schemaRegister: "neutral",
+        verdict: "PASS",
+        riskTier: "TIER_1",
+        riskReasons: ["sensitive_path"],
+        auditVerdict: "PASS",
+        blockedRules: [],
+        warnedRules: ["R7_HEDGE_DETECTED"],
+        metrics: {
+          unverifiedScopeCount: 2,
+          fillerUnverifiedCount: 2,
+          pollutionAlert: true,
+          inputTokens: 30000,
+          cacheReadTokens: 60000,
+          ledgerScanMs: 50,
+          gitScanMs: 60,
+        },
+      }),
+      JSON.stringify({
+        ts: "2026-11-25T11:00:00.000Z",
+        event: "gate_verify",
+        eventType: "gate_verify",
+        attemptInTurn: 1,
+        sessionRole: "worker",
+        schemaRegister: "neutral",
+        verdict: "PASS_WITH_AUDIT_DEGRADATION",
+        riskTier: "TIER_1",
+        riskReasons: ["large_file_count"],
+        auditVerdict: "REJECT",
+        blockedRules: ["R8_AUDIT_REJECTED"],
+        warnedRules: [],
+        metrics: {
+          unverifiedScopeCount: 1,
+          fillerUnverifiedCount: 0,
+          pollutionAlert: false,
+          inputTokens: 40000,
+          cacheReadTokens: 80000,
+          ledgerScanMs: 70,
+          gitScanMs: 80,
+        },
+      }),
+      JSON.stringify({
+        ts: "2026-11-25T12:00:00.000Z",
+        event: "gate_verify",
+        eventType: "gate_verify",
+        attemptInTurn: 1,
+        sessionRole: "auditor",
+        schemaRegister: "neutral",
+        verdict: "PASS",
+        riskTier: "TIER_0",
+        riskReasons: [],
+        auditVerdict: null,
+        blockedRules: [],
+        warnedRules: [],
+        metrics: {
+          unverifiedScopeCount: 0,
+          fillerUnverifiedCount: 0,
+          pollutionAlert: false,
+          inputTokens: 50000,
+          cacheReadTokens: 100000,
+          ledgerScanMs: 90,
+          gitScanMs: 100,
+        },
+      }),
+      JSON.stringify({
+        ts: "2026-11-25T12:10:00.000Z",
+        eventType: "handoff_save",
+        snapshotId: "snap-1",
+      }),
+      JSON.stringify({
+        ts: "2026-11-25T12:15:00.000Z",
+        eventType: "handoff_load",
+        snapshotId: "snap-1",
+      }),
+      JSON.stringify({
+        ts: "2026-11-25T12:20:00.000Z",
+        event: "post_invocation",
+        pollutionAlert: true,
+        metrics: {
+          inputTokens: 60000,
+          cacheReadTokens: 120000,
+        },
+      }),
+    ].join("\n");
+
+    const parsed = parseAuditLines(rawJsonl);
+    assert.equal(parsed.records.length, 8);
+    assert.equal(parsed.malformedLines, 2);
+
+    const summary = summarizeAuditRecords(parsed, {
+      filePath: "/tmp/audit.jsonl",
+      fileExists: true,
+      groupBy: "day",
+    });
+
+    assert.equal(summary.meta.totalRecords, 8);
+    assert.equal(summary.meta.malformedLines, 2);
+    assert.equal(summary.overview.gateVerifyTotal, 5);
+    assert.equal(summary.overview.rejectCount, 1);
+    assert.equal(summary.overview.rejectRate, 20);
+    assert.equal(summary.overview.firstAttemptTotal, 4);
+    assert.equal(summary.overview.firstAttemptRejects, 1);
+    assert.equal(summary.overview.firstAttemptRejectRate, 25);
+    assert.deepEqual(summary.overview.sessionRoles, { main: 2, auditor: 1, worker: 1, challenger: 0, unknown: 1 });
+    assert.deepEqual(summary.overview.schemaRegisters, { neutral: 4, audit: 1, unknown: 0 });
+    assert.deepEqual(summary.overview.handoff, { save: 1, load: 1 });
+
+    assert.equal(summary.periodTrend.length, 2);
+    assert.deepEqual(summary.periodTrend[0], {
+      period: "2026-11-20",
+      total: 2,
+      rejects: 1,
+      escalations: 1,
+      rejectRate: 50,
+    });
+    assert.deepEqual(summary.periodTrend[1], {
+      period: "2026-11-25",
+      total: 3,
+      rejects: 0,
+      escalations: 0,
+      rejectRate: 0,
+    });
+
+    assert.equal(summary.rules.totalHits, 5);
+    assert.equal(summary.rules.items[0].rule, "R7_HEDGE_DETECTED");
+    assert.equal(summary.rules.items[0].total, 2);
+    assert.equal(summary.rules.items[0].sharePct, 40);
+
+    assert.deepEqual(summary.tier1Audit.tiers, { TIER_0: 1, TIER_1: 3, unknown: 1 });
+    assert.equal(summary.tier1Audit.escalations, 1);
+    assert.deepEqual(summary.tier1Audit.auditVerdicts, {
+      PASS: 1,
+      REJECT: 0,
+      PASS_WITH_AUDIT_DEGRADATION: 1,
+      ERROR: 0,
+      MISSING_VERDICT: 0,
+    });
+    assert.equal(summary.tier1Audit.auditPassRate, 50);
+    assert.deepEqual(summary.tier1Audit.riskReasons, {
+      sensitive_path: 2,
+      large_file_count: 1,
+      large_diff_lines: 1,
+    });
+
+    assert.equal(summary.contextHealth.pollutionCheckedCount, 5);
+    assert.equal(summary.contextHealth.pollutionAlertCount, 2);
+    assert.equal(summary.contextHealth.pollutionAlertRate, 40);
+    assert.equal(summary.contextHealth.avgInputTokens, 35000);
+    assert.equal(summary.contextHealth.avgCacheReadTokens, 70000);
+    assert.equal(summary.contextHealth.avgUnverifiedScopeCount, 0.8);
+    assert.equal(summary.contextHealth.fillerUnverifiedTotal, 3);
+
+    assert.deepEqual(summary.scanLatencyMs.ledgerScanMs, { count: 5, avg: 50, p50: 50, p95: 90, max: 90 });
+    assert.deepEqual(summary.scanLatencyMs.gitScanMs, { count: 5, avg: 60, p50: 60, p95: 100, max: 100 });
+
+    const table = formatAuditReportTable(summary);
+    for (const heading of [
+      "[1] 전체 요약",
+      "[2] 기간별 반려율 추이",
+      "[3] R1~R9 규칙 위반·경고 분포",
+      "[4] Tier 1 독립 감사 현황",
+      "[5] 컨텍스트 오염 경보 및 미검증 보고",
+      "[6] 로컬 스캔 지연 통계",
+      "[7] 적대적 사전 검토(Preflight) 현황",
+    ]) {
+      assert.ok(table.includes(heading), `missing section heading: ${heading}`);
+    }
+    assert.equal(summary.preflight.totalChallenges, 0);
+    assert.equal(summary.preflight.voteCompletionRate, 0);
+  });
+
+  it("supports --days, --since, --group-by week filtering and safe zero-denominator defaults", () => {
+    const parsed = parseAuditLines(
+      [
+        JSON.stringify({ ts: "2026-11-01T00:00:00.000Z", eventType: "gate_verify", verdict: "REJECT", attemptInTurn: 1 }),
+        JSON.stringify({ ts: "2026-11-24T12:00:00.000Z", eventType: "gate_verify", verdict: "PASS", attemptInTurn: 1 }),
+      ].join("\n"),
+    );
+
+    const byDays = summarizeAuditRecords(parsed, {
+      days: 7,
+      nowMs: Date.parse("2026-11-26T00:00:00.000Z"),
+      groupBy: "week",
+    });
+    assert.equal(byDays.meta.totalRecords, 1);
+    assert.equal(byDays.periodTrend[0].period, "2026-W48");
+    assert.equal(byDays.overview.rejectRate, 0);
+
+    const bySince = summarizeAuditRecords(parsed, { since: "2026-11-24" });
+    assert.equal(bySince.meta.totalRecords, 1);
+
+    const emptySummary = summarizeAuditRecords(parseAuditLines(""), { filePath: "/none", fileExists: false });
+    assert.equal(emptySummary.overview.gateVerifyTotal, 0);
+    assert.equal(emptySummary.overview.rejectRate, 0);
+    assert.equal(emptySummary.scanLatencyMs.ledgerScanMs.avg, null);
+    const renderedEmpty = formatAuditReportTable(emptySummary);
+    assert.ok(renderedEmpty.includes("(파일 없음)"));
+    assert.ok(renderedEmpty.includes("0.0%"));
+  });
+
+  it("resolves default audit.jsonl path by precedence and validates CLI options", () => {
+    const resolvedExplicit = resolveAuditLogPath({ file: "./custom-audit.jsonl" });
+    assert.equal(resolvedExplicit, resolve("./custom-audit.jsonl"));
+
+    const resolvedPluginData = resolveAuditLogPath({
+      env: { PLUGIN_DATA: "/isolated/plugin", HSTACK_DATA_DIR: "/other/hstack", ANTIGRAVITY_APP_DATA_DIR: "/data/app" },
+      homedir: "/home/tester",
+      existsSync: (p) => p === "/home/tester/.gemini/antigravity-cli/plugin_data/hstack/audit.jsonl",
+    });
+    assert.equal(resolvedPluginData, "/isolated/plugin/audit.jsonl");
+
+    const resolvedHstackData = resolveAuditLogPath({
+      env: { HSTACK_DATA_DIR: "/isolated/hstack", ANTIGRAVITY_APP_DATA_DIR: "/data/app" },
+      homedir: "/home/tester",
+      existsSync: (p) => p === "/home/tester/.gemini/antigravity-cli/plugin_data/hstack/audit.jsonl",
+    });
+    assert.equal(resolvedHstackData, "/isolated/hstack/audit.jsonl");
+
+    const resolvedAppData = resolveAuditLogPath({
+      env: { ANTIGRAVITY_APP_DATA_DIR: "/data/app" },
+      homedir: "/home/tester",
+      existsSync: () => false,
+    });
+    assert.equal(resolvedAppData, "/data/app/plugin_data/hstack/audit.jsonl");
+
+    const resolvedHomeFallback = resolveAuditLogPath({
+      env: {},
+      homedir: "/home/tester",
+      existsSync: (p) => p === "/home/tester/.gemini/antigravity-cli/plugin_data/hstack/audit.jsonl",
+    });
+    assert.equal(resolvedHomeFallback, "/home/tester/.gemini/antigravity-cli/plugin_data/hstack/audit.jsonl");
+
+    assert.throws(() => parseCliArgs(["--days", "0"]), /1 이상의 정수/);
+    assert.throws(() => parseCliArgs(["--days", "abc"]), /1 이상의 정수/);
+    assert.throws(() => parseCliArgs(["--since", "2026-02-30"]), /YYYY-MM-DD/);
+    assert.throws(() => parseCliArgs(["--group-by", "month"]), /day 또는 week/);
+    assert.throws(() => parseCliArgs(["--unknown-flag"]), /알 수 없는 옵션/);
+  });
+
+  it("counts ERROR/MISSING_VERDICT in auditPassRate and prevents prototype key collisions", () => {
+    const parsed = parseAuditLines(
+      [
+        JSON.stringify({
+          ts: "2026-11-26T01:00:00.000Z",
+          eventType: "gate_verify",
+          verdict: "PASS",
+          riskTier: "TIER_1",
+          auditVerdict: "PASS",
+          riskReasons: ["sensitive_path"],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:01:00.000Z",
+          eventType: "gate_verify",
+          verdict: "REJECT",
+          riskTier: "TIER_1",
+          auditVerdict: "ERROR",
+          blockedRules: ["R8_AUDIT_ERROR"],
+          riskReasons: ["toString", "constructor"],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:02:00.000Z",
+          eventType: "gate_verify",
+          verdict: "toString",
+          riskTier: "TIER_1",
+          auditVerdict: "MISSING_VERDICT",
+          blockedRules: ["R8_AUDIT_ERROR"],
+          riskReasons: ["__proto__"],
+        }),
+      ].join("\n"),
+    );
+
+    const summary = summarizeAuditRecords(parsed, { filePath: "/tmp/audit.jsonl", fileExists: true });
+    assert.equal(summary.tier1Audit.auditVerdicts.PASS, 1);
+    assert.equal(summary.tier1Audit.auditVerdicts.ERROR, 1);
+    assert.equal(summary.tier1Audit.auditVerdicts.MISSING_VERDICT, 1);
+    assert.equal(summary.tier1Audit.auditDecidedTotal, 3);
+    assert.equal(summary.tier1Audit.auditPassRate, 33.3);
+    assert.equal(summary.overview.verdicts.toString, 1);
+    assert.equal(summary.tier1Audit.riskReasons.toString, 1);
+    assert.equal(summary.tier1Audit.riskReasons.constructor, 1);
+    assert.equal(summary.tier1Audit.riskReasons["__proto__"], 1);
+    assert.equal(typeof summary.overview.verdicts.toString, "number");
+    assert.equal(typeof summary.tier1Audit.riskReasons.constructor, "number");
+
+    const table = formatAuditReportTable(summary);
+    assert.ok(table.includes("ERROR=1"));
+    assert.ok(table.includes("MISSING_VERDICT=1"));
+  });
+
+  it("aggregates scan latency across canonical metrics, nested timings, and legacy/alias field layouts", () => {
+    const parsed = parseAuditLines(
+      [
+        JSON.stringify({
+          ts: "2026-11-26T01:00:00.000Z",
+          event: "gate_verify",
+          verdict: "PASS",
+          metrics: { ledgerScanMs: 12.4, gitScanMs: 8.2 },
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:01:00.000Z",
+          event: "gate_verify",
+          verdict: "PASS",
+          timings: { ledgerScanMs: 22.6, gitScanMs: 18.8 },
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:02:00.000Z",
+          event: "gate_verify",
+          verdict: "PASS",
+          metrics: { timings: { ledger_scan_ms: 30, git_scan_ms: 25 } },
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:03:00.000Z",
+          event: "gate_verify",
+          verdict: "PASS",
+          ledger_scan_ms: 40,
+          git_scan_ms: 32,
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:04:00.000Z",
+          event: "gate_verify",
+          verdict: "PASS",
+          scanMs: { ledger: 50, git: 40 },
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T01:05:00.000Z",
+          event: "gate_verify",
+          verdict: "SKIPPED_NO_SESSION",
+          metrics: { ledgerScanMs: null, gitScanMs: null },
+        }),
+      ].join("\n"),
+    );
+
+    const summary = summarizeAuditRecords(parsed, { filePath: "/tmp/audit.jsonl", fileExists: true });
+    assert.equal(summary.scanLatencyMs.ledgerScanMs.count, 5);
+    assert.equal(summary.scanLatencyMs.ledgerScanMs.p50, 30);
+    assert.equal(summary.scanLatencyMs.ledgerScanMs.max, 50);
+    assert.equal(summary.scanLatencyMs.gitScanMs.count, 5);
+    assert.equal(summary.scanLatencyMs.gitScanMs.p50, 25);
+    assert.equal(summary.scanLatencyMs.gitScanMs.max, 40);
+  });
+
+  it("aggregates [7] preflight summary with turn-level deduplication, R9 counts, and Phase 1/2 backward compatibility", () => {
+    const parsed = parseAuditLines(
+      [
+        JSON.stringify({
+          ts: "2026-11-26T02:00:00.000Z",
+          eventType: "preflight_complete",
+          conversationId: "conv-a",
+          turnStartStepIndex: 0,
+          verdict: "RETHINK",
+          voted: false,
+          codeWritten: false,
+          challengeStepIndex: 3,
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T02:01:00.000Z",
+          eventType: "gate_verify",
+          conversationId: "conv-a",
+          turnStartStepIndex: 0,
+          attemptInTurn: 1,
+          sessionRole: "main",
+          verdict: "REJECT",
+          preflight: { used: true, verdict: "RETHINK", voted: false },
+          blockedRules: ["R9_PREFLIGHT_UNVOTED"],
+          warnedRules: [],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T02:02:00.000Z",
+          eventType: "gate_verify",
+          conversationId: "conv-a",
+          turnStartStepIndex: 0,
+          attemptInTurn: 2,
+          sessionRole: "main",
+          verdict: "PASS",
+          preflight: { used: true, verdict: "RETHINK", voted: true },
+          blockedRules: [],
+          warnedRules: [],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T02:05:00.000Z",
+          eventType: "preflight_complete",
+          conversationId: "conv-b",
+          turnStartStepIndex: 4,
+          verdict: "CONDITIONAL",
+          voted: false,
+          codeWritten: true,
+          challengeStepIndex: 6,
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T02:06:00.000Z",
+          eventType: "gate_verify",
+          conversationId: "conv-b",
+          turnStartStepIndex: 4,
+          attemptInTurn: 1,
+          sessionRole: "main",
+          verdict: "PASS_WITH_WARNING",
+          preflight: { used: true, verdict: "CONDITIONAL", voted: false },
+          blockedRules: [],
+          warnedRules: ["R9_PREFLIGHT_UNVOTED"],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T02:10:00.000Z",
+          eventType: "preflight_complete",
+          conversationId: "conv-c",
+          turnStartStepIndex: 0,
+          verdict: "PROCEED",
+          voted: true,
+          codeWritten: false,
+          challengeStepIndex: 2,
+        }),
+      ].join("\n"),
+    );
+
+    const summary = summarizeAuditRecords(parsed, { filePath: "/tmp/audit.jsonl", fileExists: true });
+    assert.equal(summary.preflight.totalChallenges, 3);
+    assert.deepEqual(summary.preflight.verdicts, {
+      PROCEED: 1,
+      CONDITIONAL: 1,
+      RETHINK: 1,
+      ERROR: 0,
+      MISSING_VERDICT: 0,
+    });
+    assert.equal(summary.preflight.votedCount, 2);
+    assert.equal(summary.preflight.voteCompletionRate, 66.7);
+    assert.equal(summary.preflight.r9BlockedCount, 1);
+    assert.equal(summary.preflight.r9WarnedCount, 1);
+
+    const r9Entry = summary.rules.items.find((item) => item.rule === "R9_PREFLIGHT_UNVOTED");
+    assert.ok(r9Entry);
+    assert.equal(r9Entry.blocked, 1);
+    assert.equal(r9Entry.warned, 1);
+    assert.equal(r9Entry.total, 2);
+
+    const table = formatAuditReportTable(summary);
+    assert.ok(table.includes("[3] R1~R9 규칙 위반·경고 분포"));
+    assert.ok(table.includes("[7] 적대적 사전 검토(Preflight) 현황"));
+    assert.ok(table.includes("총 사전 검토: 3건 | 표결 완료율: 66.7% (2/3)"));
+    assert.ok(table.includes("R9_PREFLIGHT_UNVOTED: 차단=1건, 경고=1건"));
+  });
+});
+
+describe("audit-report CLI subprocess execution", () => {
+  it("runs --help, --json, empty file, missing file, and invalid flags cleanly", () => {
+    const helpRes = spawnSync(process.execPath, [CLI_PATH, "--help"], { encoding: "utf8" });
+    assert.equal(helpRes.status, 0);
+    assert.ok(helpRes.stdout.includes("--group-by"));
+
+    const invalidRes = spawnSync(process.execPath, [CLI_PATH, "--days", "0"], { encoding: "utf8" });
+    assert.equal(invalidRes.status, 1);
+    assert.ok(invalidRes.stderr.includes("--days"));
+
+    const tempDir = makeTempDir();
+    try {
+      const missingPath = join(tempDir, "missing.jsonl");
+      const missingRes = spawnSync(process.execPath, [CLI_PATH, "--file", missingPath, "--json"], {
+        encoding: "utf8",
+      });
+      assert.equal(missingRes.status, 0);
+      const missingJson = JSON.parse(missingRes.stdout);
+      assert.equal(missingJson.meta.fileExists, false);
+      assert.equal(missingJson.meta.totalRecords, 0);
+
+      const emptyPath = join(tempDir, "empty.jsonl");
+      writeFileSync(emptyPath, "", "utf8");
+      const emptyRes = spawnSync(process.execPath, [CLI_PATH, "--file", emptyPath], { encoding: "utf8" });
+      assert.equal(emptyRes.status, 0);
+      assert.ok(emptyRes.stdout.includes("유효 레코드: 0건"));
+
+      const samplePath = join(tempDir, "audit.jsonl");
+      writeFileSync(
+        samplePath,
+        [
+          JSON.stringify({
+            ts: "2026-11-25T08:00:00.000Z",
+            eventType: "gate_verify",
+            attemptInTurn: 1,
+            sessionRole: "main",
+            schemaRegister: "neutral",
+            verdict: "PASS",
+            riskTier: "TIER_0",
+            riskReasons: [],
+            blockedRules: [],
+            warnedRules: [],
+            metrics: { unverifiedScopeCount: 0, fillerUnverifiedCount: 0, ledgerScanMs: 12.5, gitScanMs: 7.5 },
+          }),
+        ].join("\n") + "\n",
+        "utf8",
+      );
+
+      const jsonRes = spawnSync(
+        process.execPath,
+        [CLI_PATH, "--file", samplePath, "--since", "2026-11-25", "--group-by", "week", "--json"],
+        { encoding: "utf8" },
+      );
+      assert.equal(jsonRes.status, 0);
+      const parsedJson = JSON.parse(jsonRes.stdout);
+      assert.equal(parsedJson.overview.gateVerifyTotal, 1);
+      assert.equal(parsedJson.periodTrend[0].period, "2026-W48");
+      assert.equal(parsedJson.scanLatencyMs.ledgerScanMs.p50, 12.5);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
