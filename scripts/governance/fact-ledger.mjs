@@ -98,6 +98,31 @@ const PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS = new Set([
 ]);
 const GO_VERIFICATION_SUBCOMMANDS = new Set(["test", "vet", "build"]);
 const GO_EXEC_FLAG_RE = /^--?(?:exec|toolexec|vettool)(?:=|$)/;
+const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
+const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
+  /^(?:--if-present|--script-shell|--userconfig|--globalconfig|--prefix|--dir|--cwd|-C|--preload|-r|--require|--import|--loader)(?:=|$)/;
+const NODE_TSX_VALUE_FLAGS = new Set([
+  "-r",
+  "--require",
+  "--import",
+  "--loader",
+  "--conditions",
+  "-C",
+  "--env-file",
+  "--env-file-if-exists",
+  "--tsconfig",
+  "--test-reporter",
+  "--test-reporter-destination",
+  "--test-name-pattern",
+  "--test-skip-pattern",
+  "--test-shard",
+  "--test-concurrency",
+  "--test-timeout",
+  "-e",
+  "--eval",
+  "-p",
+  "--print",
+]);
 const VERIFY_SCRIPT_NAME_RE = /(?:^|[:_-])(?:test|tests|check|verify|lint|typecheck|tsc|spec|build|e2e|unit|ci)(?:$|[:_-])/i;
 const WRITE_SCRIPT_NAME_RE = /(?:^|[:_-])(?:fix|format|fmt|write|mutate|clean|deploy|release|publish|start|dev)(?:$|[:_-])/i;
 const BARE_SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
@@ -450,24 +475,46 @@ function inlineInterpreterBody(bin, args) {
   if (SHELL_INTERPRETERS.has(bin)) {
     let inline = false;
     let pipefail = false;
+    let noexec = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][euxv]*o$/.test(arg)) {
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][euxvn]*o$/.test(arg)) {
+        if (arg.includes("n")) {
+          noexec = arg[0] === "-";
+        }
         if (args[i + 1] === "pipefail") {
           pipefail = arg[0] === "-";
+        } else if (args[i + 1] === "noexec") {
+          noexec = arg[0] === "-";
         }
         i += 1;
       } else if (/^[-+][A-Za-z]+$/.test(arg)) {
+        if (arg.includes("n")) {
+          noexec = arg[0] === "-";
+        }
         inline ||= arg[0] === "-" && arg.includes("c");
       } else if (/^-[A-Za-z]*c/.test(arg)) {
+        const prefixFlags = arg.slice(1, arg.indexOf("c"));
+        if (prefixFlags.includes("n")) {
+          noexec = true;
+        }
+        if (noexec) {
+          return "";
+        }
         // Words after the body become $0, $1…, which the body may run; only a body with nothing after it counts.
         const body = i === args.length - 1 ? arg.slice(arg.indexOf("c") + 1) : "";
         return pipefail && body ? `set -o pipefail && ${body}` : body;
       } else if (!arg.startsWith("--") || arg === "--") {
+        if (noexec) {
+          return "";
+        }
         const bodyIdx = arg === "--" ? i + 1 : i;
         const body = bodyIdx === args.length - 1 ? args[bodyIdx] : "";
         return inline ? (pipefail && body ? `set -o pipefail && ${body}` : body) : null;
       }
+    }
+    if (noexec) {
+      return "";
     }
     return inline ? "" : null;
   }
@@ -688,7 +735,7 @@ const CHECK_SCRIPT_RE = /(?:^|\/)tests?\/|(?:^|\/)[^/]*(?:test|check|verify|lint
 // `--version` and friends print and exit, so they neither check nor write. pytest's `-v` is verbose, not a probe,
 // and `version`/`help` are subcommands only for go and cargo (`make help` is a target, `sh help` a script).
 function isVersionProbe(bin, arg) {
-  if (!VERIFICATION_BINARIES.has(bin)) {
+  if (!VERIFICATION_BINARIES.has(bin) && !PACKAGE_EXEC_VERIFICATION_TOOLS.has(bin)) {
     return false;
   }
   if (arg === "version" || arg === "help") {
@@ -754,6 +801,32 @@ function isValidSetCommandArgs(args) {
   return true;
 }
 
+function extractSetCommandArgs(words) {
+  if (words[0] === "set") {
+    return words.slice(1);
+  }
+  if (words[0] !== "command") {
+    return null;
+  }
+  let idx = 1;
+  while (idx < words.length) {
+    const arg = words[idx];
+    if (arg === "--") {
+      idx += 1;
+      break;
+    }
+    if (arg === "-p") {
+      idx += 1;
+      continue;
+    }
+    if (arg.startsWith("-")) {
+      return null;
+    }
+    break;
+  }
+  return words[idx] === "set" ? words.slice(idx + 1) : null;
+}
+
 // cd/pushd/popd, `set` with errexit/nounset/xtrace/pipefail only, safe assignments or exports, or a read-only command.
 function isPrefixCommand({ words, raw }) {
   const [bin, ...args] = words;
@@ -763,22 +836,28 @@ function isPrefixCommand({ words, raw }) {
   if (bin === "cd" || bin === "pushd" || bin === "popd") {
     return args.length <= 1;
   }
-  if (bin === "set") {
+  const setArgs = extractSetCommandArgs(words);
+  if (setArgs !== null) {
     // `set -n` (noexec) would skip the runner and exit 0, so only these flags pass.
-    return isValidSetCommandArgs(args);
+    return isValidSetCommandArgs(setArgs);
+  }
+  const innerIdx = skipCommandPrefix(words);
+  if (innerIdx !== -1 && words[innerIdx] === "set") {
+    return false;
   }
   return bin !== "export" && classifySingleSegment(raw) === "read_only";
 }
 
 function applyPipefailState({ words }, current) {
-  if (words[0] !== "set") {
+  const setArgs = extractSetCommandArgs(words);
+  if (setArgs === null) {
     return current;
   }
   let state = current;
-  for (let i = 1; i < words.length; i += 1) {
-    const tok = words[i];
+  for (let i = 0; i < setArgs.length; i += 1) {
+    const tok = setArgs[i];
     if (SET_FLAG_RE.test(tok) && tok.endsWith("o")) {
-      if (words[i + 1] === "pipefail") {
+      if (setArgs[i + 1] === "pipefail") {
         state = tok[0] === "-";
       }
       i += 1;
@@ -787,16 +866,31 @@ function applyPipefailState({ words }, current) {
   return state;
 }
 
-function isTsxVerification(args) {
-  if (inlineInterpreterBody("tsx", args) !== null) {
+function isNodeOrTsxVerification(bin, args) {
+  if (inlineInterpreterBody(bin, args) !== null) {
     return false;
   }
-  const sepIdx = args.indexOf("--");
-  const headArgs = sepIdx === -1 ? args : args.slice(0, sepIdx);
-  if (headArgs.some((tok) => tok === "--test")) {
-    return true;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--") {
+      return NODE_TEST_FILE_RE.test(args[i + 1] ?? "");
+    }
+    if (arg === "--test") {
+      return true;
+    }
+    if (arg.startsWith("-")) {
+      if (NODE_TSX_VALUE_FLAGS.has(arg)) {
+        i += 1;
+      }
+      continue;
+    }
+    return NODE_TEST_FILE_RE.test(arg);
   }
-  return headArgs.filter((tok) => !tok.startsWith("-")).some((tok) => NODE_TEST_FILE_RE.test(tok));
+  return false;
+}
+
+function isTsxVerification(args) {
+  return isNodeOrTsxVerification("tsx", args);
 }
 
 function isEslintSafeArgs(toolArgs) {
@@ -828,6 +922,11 @@ function isPackageExecVerification(args) {
     return false;
   }
   const toolArgs = args.slice(toolIdx + 1);
+  const toolSepIdx = toolArgs.indexOf("--");
+  const toolHead = toolSepIdx === -1 ? toolArgs : toolArgs.slice(0, toolSepIdx);
+  if (toolHead.some((a) => isVersionProbe(tool, a))) {
+    return false;
+  }
   if (tool === "prettier") {
     const hasCheck = toolArgs.some((a) => a === "--check" || a === "-c" || a === "--list-different" || a === "-l");
     const hasWrite = toolArgs.some((a) => a === "--write" || a === "-w");
@@ -848,7 +947,24 @@ function isPackageExecVerification(args) {
 function isScriptRunnerVerification(baseBin, args) {
   const sepIdx = args.indexOf("--");
   const headArgs = sepIdx === -1 ? args : args.slice(0, sepIdx);
-  const positional = headArgs.filter((tok) => !tok.startsWith("-"));
+  const positional = [];
+  for (let i = 0; i < headArgs.length; i += 1) {
+    const tok = headArgs[i];
+    if (SCRIPT_RUNNER_BLOCKED_FLAG_RE.test(tok)) {
+      return false;
+    }
+    if (SCRIPT_RUNNER_SAFE_VALUE_FLAGS.has(tok)) {
+      const val = headArgs[i + 1];
+      if (!val || val.startsWith("-")) {
+        return false;
+      }
+      i += 1;
+      continue;
+    }
+    if (!tok.startsWith("-")) {
+      positional.push(tok);
+    }
+  }
   const sub = positional[0] ?? "";
   const isNamedRun = (sub === "run" || sub === "run-script") && isVerificationScriptName(positional[1]);
   if (baseBin === "bun") {
@@ -872,8 +988,12 @@ function isChainPrepCommand({ words, redirects }) {
   if (baseBin !== "npm") {
     return false;
   }
-  const positional = words.slice(idx + 1).filter((tok) => !tok.startsWith("-"));
-  return positional[0] === "ci" || positional[0] === "install";
+  const args = words.slice(idx + 1);
+  if (args.some((a) => SCRIPT_RUNNER_BLOCKED_FLAG_RE.test(a) || /^--save|^-(?:D|S|g)$|^--global$/.test(a))) {
+    return false;
+  }
+  const positional = args.filter((tok) => !tok.startsWith("-"));
+  return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
 }
 
 // A known test runner, optionally behind safe assignments and wrappers. A shell `-c` body must itself match the
@@ -889,12 +1009,11 @@ function isRunnerCommand({ words, redirects }) {
   if (!VERIFICATION_BINARIES.has(baseBin) && !rawBin.startsWith("./") && !rawBin.startsWith("../")) {
     return false;
   }
-  const scriptArgs = args.filter((tok) => !tok.startsWith("-"));
   if (args.length === 1 && isVersionProbe(baseBin, args[0])) {
     return false;
   }
   // `node <script>` runs any program, so node counts only for its test runner or a test file.
-  if (baseBin === "node" && !args.some((tok) => tok === "--test") && !scriptArgs.some((tok) => NODE_TEST_FILE_RE.test(tok))) {
+  if (baseBin === "node" && !isNodeOrTsxVerification("node", args)) {
     return false;
   }
   if (baseBin === "tsx" && !isTsxVerification(args)) {
@@ -924,6 +1043,34 @@ function isRunnerCommand({ words, redirects }) {
     return CHECK_SCRIPT_RE.test(shellScriptArg(args));
   }
   return body === null || (body !== "" && redirects === 0 && matchesVerificationGrammar(body));
+}
+
+export function commandHasPrepSideEffect(commandLine) {
+  if (typeof commandLine !== "string" || commandLine.trim().length === 0) {
+    return false;
+  }
+  const cmds = lexVerificationChain(commandLine);
+  if (!cmds) {
+    return false;
+  }
+  for (let i = 0; i < cmds.length; i += 1) {
+    const cmd = cmds[i];
+    if (cmd.op === "|" || cmd.op === "") {
+      const idx = skipCommandPrefix(cmd.words);
+      if (idx !== -1 && idx < cmd.words.length) {
+        const baseBin = posix.basename(toPosix(cmd.words[idx]));
+        const body = inlineInterpreterBody(baseBin, cmd.words.slice(idx + 1));
+        if (body && commandHasPrepSideEffect(body)) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (isChainPrepCommand(cmd)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // [prefix &&]… [VAR=value]… RUNNER ARGS [REDIRECT]…, plus one `| tail/head/grep` when pipefail is on.
@@ -1930,6 +2077,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               stepIndex,
               command,
               kind: classifyCommand(command),
+              hasPrepSideEffect: commandHasPrepSideEffect(command),
               passed: true,
               status: "",
               error: "",
@@ -1946,6 +2094,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               subCommands: commands,
               checkLabels: labels,
               kind: classifyMcpCheckCommands(commands),
+              hasPrepSideEffect: commands.some((cmd) => commandHasPrepSideEffect(cmd)),
               passed: true,
               status: "",
               error: "",
@@ -2587,6 +2736,7 @@ export function snapshotWorkingTree(cwd) {
     files[relPath] = statSnapshotFile(gitRoot, relPath);
   }
 
+  let untrackedFiles = {};
   let untrackedTruncated = false;
   try {
     const untrackedOut = execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "-z"], {
@@ -2596,7 +2746,6 @@ export function snapshotWorkingTree(cwd) {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-    const untrackedFiles = {};
     let untrackedCodeCount = 0;
     for (const relPath of untrackedOut.split("\0")) {
       if (!relPath || isExemptDocOrAssetPath(relPath)) {
@@ -2605,18 +2754,17 @@ export function snapshotWorkingTree(cwd) {
       untrackedCodeCount += 1;
       if (untrackedCodeCount > SNAPSHOT_MAX_FILES) {
         untrackedTruncated = true;
+        untrackedFiles = null;
         break;
       }
       untrackedFiles[relPath] = statSnapshotFile(gitRoot, relPath);
     }
-    if (!untrackedTruncated) {
-      Object.assign(files, untrackedFiles);
-    }
   } catch {
     untrackedTruncated = true;
+    untrackedFiles = null;
   }
 
-  return { gitRoot, head, files, untrackedTruncated };
+  return { gitRoot, head, files, untrackedFiles, untrackedTruncated, capturedAtMs: Date.now() };
 }
 
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";

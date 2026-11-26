@@ -414,7 +414,9 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
           gitRoot: snapshot.gitRoot,
           head: snapshot.head,
           files: snapshot.files,
+          untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
           untrackedTruncated: Boolean(snapshot.untrackedTruncated),
+          capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
         },
       });
       return true;
@@ -444,7 +446,9 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
           gate: {
             head: snapshot.head,
             files: snapshot.files,
+            untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
             untrackedTruncated: Boolean(snapshot.untrackedTruncated),
+            capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
           },
         },
       });
@@ -470,12 +474,29 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   }
   // head is null for a snapshot that predates HEAD recording, so no commit range is checked.
   const headOf = (raw) => (typeof raw?.head === "string" ? raw.head : null);
+  const untrackedOf = (raw) =>
+    raw?.untrackedFiles && typeof raw.untrackedFiles === "object" && !Array.isArray(raw.untrackedFiles) ? raw.untrackedFiles : null;
+  const capturedAtOf = (raw) => (Number.isFinite(raw?.capturedAtMs) ? raw.capturedAtMs : null);
   const gateFiles = snap.gate?.files;
   const gate =
     gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles)
-      ? { head: headOf(snap.gate), files: gateFiles, untrackedTruncated: Boolean(snap.gate?.untrackedTruncated) }
+      ? {
+          head: headOf(snap.gate),
+          files: gateFiles,
+          untrackedFiles: untrackedOf(snap.gate),
+          untrackedTruncated: Boolean(snap.gate?.untrackedTruncated),
+          capturedAtMs: capturedAtOf(snap.gate),
+        }
       : null;
-  return { gitRoot: snap.gitRoot, head: headOf(snap), files: snap.files, untrackedTruncated: Boolean(snap.untrackedTruncated), gate };
+  return {
+    gitRoot: snap.gitRoot,
+    head: headOf(snap),
+    files: snap.files,
+    untrackedFiles: untrackedOf(snap),
+    untrackedTruncated: Boolean(snap.untrackedTruncated),
+    capturedAtMs: capturedAtOf(snap),
+    gate,
+  };
 }
 
 function statSignature(gitRoot, relPath) {
@@ -491,6 +512,10 @@ function sameFileSignature(a, b) {
   return Array.isArray(a) && Array.isArray(b) ? a[0] === b[0] && a[1] === b[1] : a === b;
 }
 
+function isRiskyShellExec(exec) {
+  return exec.kind === "other" || exec.hasPrepSideEffect === true;
+}
+
 // Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
 // Returns true when an arbitrary shell command ran in a git tree that could not be diffed (fail closed).
 export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), dataDir = resolvePluginDataDir() }) {
@@ -499,11 +524,11 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
     return false;
   }
-  const unclassifiedShellExecs = shellExecs.filter((exec) => exec.kind === "other");
+  const riskyShellExecs = shellExecs.filter(isRiskyShellExec);
   // Date a change at the last command that could have made it: a writer, else a read-only-looking command, else a check.
   const datingStep = (execs) =>
-    (execs.findLast((exec) => exec.kind === "other") ?? execs.findLast((exec) => exec.kind === "read_only") ?? execs.at(-1)).stepIndex;
-  const otherStep = shellExecs.findLast((exec) => exec.kind === "other")?.stepIndex ?? -1;
+    (execs.findLast(isRiskyShellExec) ?? execs.findLast((exec) => exec.kind === "read_only") ?? execs.at(-1)).stepIndex;
+  const riskyStep = riskyShellExecs.at(-1)?.stepIndex ?? -1;
   const record = (relPath, step) => {
     ledger.turnWrittenFiles.add(relPath);
     ledger.turnCodeWrittenFiles.add(relPath);
@@ -511,7 +536,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
   };
   // A write tool already dated its own file; with no writer command in the turn, a check must not re-date it.
-  const keepsToolDate = (relPath) => otherStep === -1 && ledger.turnWrittenFiles.has(relPath);
+  const keepsToolDate = (relPath) => riskyStep === -1 && ledger.turnWrittenFiles.has(relPath);
   const baseline = readTurnSnapshot({ conversationId: conversationKey, turnStartStepIndex: ledger.turnStartStepIndex, dataDir });
   const current = baseline ? snapshotWorkingTree(cwd) : null;
   // Commits made this turn leave a clean tree, so the files they touched count as changed too.
@@ -520,61 +545,88 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
   const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
   if (!sinceTurn || !sinceGate) {
-    if (unclassifiedShellExecs.length === 0 || !resolveGitRootFast(cwd)) {
+    if (riskyShellExecs.length === 0 || !resolveGitRootFast(cwd)) {
       return false;
     }
-    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, otherStep);
-    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, otherStep);
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, riskyStep);
+    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, riskyStep);
     // Without a diff any dirty code file may be the shell's, so each one needs reporting and a check after it.
     for (const relPath of dirtyFiles) {
       if (!isExemptDocOrAssetPath(relPath) && !keepsToolDate(relPath)) {
-        record(relPath, otherStep);
+        record(relPath, riskyStep);
       }
     }
     return true;
   }
   // A committed file is clean now, so its signature comes from disk; one that still matches the snapshot was
   // dirty before the turn and only committed, not edited.
-  const changedSince = (files, committed, relPath) => {
-    const now = relPath in current.files ? current.files[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
-    return relPath in files ? !sameFileSignature(files[relPath], now) : now !== undefined;
+  const changedSince = (baseMap, curMap, committed, relPath) => {
+    const now = relPath in curMap ? curMap[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
+    return relPath in baseMap ? !sameFileSignature(baseMap[relPath], now) : now !== undefined;
   };
-  // A change the snapshot of the last passing verify_completion did not see happened after it, whatever the
-  // command looked like, so it is dated among the shell calls after that gate. A write tool's own later date
-  // stands when no writer command ran after the gate.
   const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
-  const postGateWriter = postGateShell.some((exec) => exec.kind === "other");
+  const postGateWriter = postGateShell.some(isRiskyShellExec);
   const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
-  // A file the gate saw as it is now was verified, even if a later commit touched it, so only the shell calls
-  // before the gate can have made it.
   const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
-  const preGateKeepsToolDate = (relPath) => !preGateShell.some((exec) => exec.kind === "other") && ledger.turnWrittenFiles.has(relPath);
-  for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
-    if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
-      continue;
-    }
-    if (postGateShell.length > 0 && changedSince(baseline.gate.files, sinceGate, relPath)) {
-      if (postGateWriter || !toolWroteAfterGate(relPath)) {
-        record(relPath, datingStep(postGateShell));
+  const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
+
+  const canDiffTurnUntracked = Boolean(!baseline.untrackedTruncated && !current.untrackedTruncated && baseline.untrackedFiles && current.untrackedFiles);
+  const canDiffGateUntracked = Boolean(
+    postGateShell.length > 0 &&
+      baseline.gate &&
+      !baseline.gate.untrackedTruncated &&
+      !current.untrackedTruncated &&
+      baseline.gate.untrackedFiles &&
+      current.untrackedFiles,
+  );
+  const trackedKeys = new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn]);
+  const untrackedKeys = canDiffTurnUntracked
+    ? new Set([...Object.keys(current.untrackedFiles), ...Object.keys(baseline.untrackedFiles)])
+    : new Set();
+
+  const recordDiffPaths = (keys, baseMap, curMap, gateMap, canDiffGate) => {
+    for (const relPath of keys) {
+      if (!changedSince(baseMap, curMap, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
+        continue;
       }
-    } else if (!preGateKeepsToolDate(relPath)) {
-      record(relPath, preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex);
+      if (postGateShell.length > 0 && canDiffGate && changedSince(gateMap, curMap, sinceGate, relPath)) {
+        if (postGateWriter || !toolWroteAfterGate(relPath)) {
+          record(relPath, datingStep(postGateShell));
+        }
+      } else if (!preGateKeepsToolDate(relPath)) {
+        record(relPath, preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex);
+      }
     }
+  };
+
+  recordDiffPaths(trackedKeys, baseline.files, current.files, baseline.gate?.files, Boolean(baseline.gate));
+  if (canDiffTurnUntracked) {
+    recordDiffPaths(untrackedKeys, baseline.untrackedFiles, current.untrackedFiles, baseline.gate?.untrackedFiles, canDiffGateUntracked);
   }
+
   const untrackedIncomplete = Boolean(
     current.untrackedTruncated || baseline.untrackedTruncated || (postGateShell.length > 0 && baseline.gate?.untrackedTruncated),
   );
-  if (untrackedIncomplete && unclassifiedShellExecs.length > 0) {
-    if (postGateWriter) {
-      const postStep = datingStep(postGateShell);
-      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postStep);
-      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, postStep);
-      return true;
-    }
-    if (lastGateStep === -1 || otherStep > lastGateStep) {
-      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, otherStep);
-      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, otherStep);
+  if (untrackedIncomplete && riskyShellExecs.length > 0) {
+    const baseMs = postGateWriter && baseline.gate?.capturedAtMs ? baseline.gate.capturedAtMs : baseline.capturedAtMs;
+    const cutoffMs = Number.isFinite(baseMs) ? baseMs - 1000 : 0;
+    const targetStep = postGateWriter ? datingStep(postGateShell) : riskyStep;
+    const markRecentUntracked = (step) => {
+      for (const relPath of dirtyFiles) {
+        if (isExemptDocOrAssetPath(relPath) || relPath in baseline.files || relPath in current.files) {
+          continue;
+        }
+        const sig = statSignature(current.gitRoot, relPath);
+        if (sig && sig[0] >= cutoffMs && !keepsToolDate(relPath)) {
+          record(relPath, step);
+        }
+      }
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
+      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
+    };
+    if (postGateWriter || lastGateStep === -1 || riskyStep > lastGateStep) {
+      markRecentUntracked(targetStep);
       return true;
     }
   }
