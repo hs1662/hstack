@@ -556,7 +556,7 @@ function classifySingleSegment(segment) {
   if (READ_ONLY_BINARIES.has(baseBin) || SHELL_NEUTRAL_BUILTINS.has(baseBin)) {
     return hasFileRedirect ? "other" : "read_only";
   }
-  if (baseBin === "node" && tokens.length === idx + 2 && /^(?:-v|--version)$/.test(tokens[idx + 1])) {
+  if (tokens.length === idx + 2 && isVersionProbe(baseBin, tokens[idx + 1])) {
     return hasFileRedirect ? "other" : "read_only";
   }
   if (BARE_SCRIPT_RUNNERS.has(baseBin)) {
@@ -638,6 +638,54 @@ function lexVerificationChain(line) {
 }
 
 const NODE_TEST_FILE_RE = /(?:^|\/)test\/|\.(?:test|spec)\.[cm]?[jt]sx?$/;
+const PYTHON_TEST_FILE_RE = /(?:^|\/)tests?\/|(?:^|\/)test_[^/]*\.py$|_test\.py$/;
+const CHECK_SCRIPT_RE = /(?:^|\/)tests?\/|(?:^|\/)[^/]*(?:test|check|verify|lint|spec)[^/]*$/i;
+
+// `--version` and friends print and exit, so they neither check nor write. pytest's `-v` is verbose, not a probe,
+// and `version`/`help` are subcommands only for go and cargo (`make help` is a target, `sh help` a script).
+function isVersionProbe(bin, arg) {
+  if (!VERIFICATION_BINARIES.has(bin)) {
+    return false;
+  }
+  if (arg === "version" || arg === "help") {
+    return bin === "go" || bin === "cargo";
+  }
+  return arg === "--version" || arg === "-V" || arg === "--help" || arg === "-h" || (arg === "-v" && bin !== "pytest");
+}
+
+// python runs any program, so it counts only for `-m pytest|unittest` or a test file.
+function pythonRunsTests(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (!arg.startsWith("-")) {
+      return PYTHON_TEST_FILE_RE.test(arg);
+    }
+    const flag = /^-[A-Za-z]*?([cmWX]|$)/.exec(arg)?.[1];
+    if (flag === "m") {
+      const module = arg.slice(arg.indexOf("m") + 1) || (args[i + 1] ?? "");
+      return module === "pytest" || module === "unittest";
+    }
+    if (PYTHON_FLAGS_WITH_ARG.has(arg)) {
+      i += 1;
+    }
+  }
+  return false;
+}
+
+// The script a shell runs from a file (`bash x.sh`), or "" when it reads stdin.
+function shellScriptArg(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg)) {
+      i += 1;
+    } else if (arg === "--") {
+      return args[i + 1] ?? "";
+    } else if (!/^[-+]/.test(arg)) {
+      return arg;
+    }
+  }
+  return "";
+}
 
 function isSafeAssign(tok) {
   return ENV_ASSIGN_RE.test(tok) && !isExecHijackAssign(tok);
@@ -677,14 +725,31 @@ function isRunnerCommand({ words, redirects }) {
     return false;
   }
   const scriptArgs = args.filter((tok) => !tok.startsWith("-"));
+  if (args.length === 1 && isVersionProbe(baseBin, args[0])) {
+    return false;
+  }
   // `node <script>` runs any program, so node counts only for its test runner or a test file.
   if (baseBin === "node" && !args.some((tok) => tok === "--test") && !scriptArgs.some((tok) => NODE_TEST_FILE_RE.test(tok))) {
+    return false;
+  }
+  if ((baseBin === "python" || baseBin === "python3") && !pythonRunsTests(args)) {
+    return false;
+  }
+  // `bun <file>` and `bun run <file>` run any program; `bun test` and `bun run test` run the tests.
+  if (baseBin === "bun" && !(scriptArgs[0] === "test" || (scriptArgs[0] === "run" && scriptArgs[1] === "test"))) {
+    return false;
+  }
+  // A local script or one a shell reads from a file runs anything, so only a test or check script counts.
+  if (!VERIFICATION_BINARIES.has(baseBin) && !CHECK_SCRIPT_RE.test(rawBin)) {
     return false;
   }
   if (BARE_SCRIPT_RUNNERS.has(baseBin) && scriptArgs.length === 1 && (scriptArgs[0] === "run" || scriptArgs[0] === "run-script")) {
     return false;
   }
   const body = inlineInterpreterBody(baseBin, args);
+  if (body === null && SHELL_INTERPRETERS.has(baseBin)) {
+    return CHECK_SCRIPT_RE.test(shellScriptArg(args));
+  }
   return body === null || (body !== "" && redirects === 0 && matchesVerificationGrammar(body));
 }
 
