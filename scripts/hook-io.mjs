@@ -111,7 +111,6 @@ function startJsonValue(state, b) {
   }
 }
 
-// Bytes that end a plain run inside a JSON string.
 const STRING_SPECIAL_RE = /["\\\x00-\x1f]/g;
 const NATIVE_SCAN_MIN_BYTES = 4096;
 
@@ -430,9 +429,7 @@ function isValidSkippedShortLine(buf) {
  */
 export function streamTranscriptRecords(filePath, visitor, options = {}) {
   const onSkipped = typeof options?.onSkipped === "function" ? options.onSkipped : null;
-  // Checked after each line: a head scan stops once it has what it needs.
   const shouldStop = typeof options?.shouldStop === "function" ? options.shouldStop : () => false;
-  // A positive startOffset streams from the first full line after that byte.
   let filePos = Number.isSafeInteger(options?.startOffset) && options.startOffset > 0 ? options.startOffset : 0;
   let discardPartialLine = filePos > 0;
   const fd = openSync(filePath, "r");
@@ -447,7 +444,6 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
   let lineBytes = 0;
   let skipValidator = null;
   let isFirstLine = !discardPartialLine;
-  // Start of the current line in the current read buffer, or -1 once the line spans an earlier read.
   let lineStartPos = 0;
 
   const startSkipValidator = (buffers) => {
@@ -744,7 +740,6 @@ export function findLastLine(filePath, needle, accept, { start = 0, end = Infini
         got += n;
       }
       const firstNl = lo === 0 ? -1 : buf.indexOf(NEWLINE_BYTE);
-      // Lines that start at or after `complete` lie wholly in `buf`.
       const complete = lo === 0 ? 0 : firstNl === -1 ? buf.length : firstNl + 1;
       for (let from = buf.length; from >= complete; ) {
         const hit = buf.lastIndexOf(needleBuf, from);

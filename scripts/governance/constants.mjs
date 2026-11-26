@@ -277,7 +277,6 @@ function formatCodeList(items) {
   return items.map((item) => `\`${item}\``).join(", ");
 }
 
-// A pipe, `;` or `||` lets a failing runner exit 0, so such a run is not evidence; say how to rerun it.
 function maskedVerificationHint(commands, ending = "다시 실행해 주세요") {
   return commands.length > 0
     ? ` 다음 실행은 파이프나 \`||\`, \`;\` 등 때문에 실패해도 종료 상태가 성공으로 바뀌므로 검증으로 인정하지 않습니다: ${formatCodeList(commands)}. 파이프 없이 다시 실행하거나 \`set -o pipefail && npm test 2>&1 | tail -20\`처럼 앞에 \`set -o pipefail &&\`를 붙여 ${ending}.`

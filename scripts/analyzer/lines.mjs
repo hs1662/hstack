@@ -303,7 +303,6 @@ function makeLine(text, paragraph) {
   };
 }
 
-// Splits natural text once. `paragraph` increments at every blank-line boundary.
 export function buildAnalyzedLines(naturalText) {
   const lines = [];
   let paragraph = 0;
@@ -323,7 +322,6 @@ export function proseLinesOf(lines) {
   return lines.filter((line) => !line.structured);
 }
 
-// Additive metrics over prose lines (equal to measuring their "\n"-joined text).
 export function sumProseMetrics(proseLines) {
   let hangulCount = 0;
   let latinCount = 0;

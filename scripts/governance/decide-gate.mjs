@@ -94,7 +94,6 @@ function runnerPrefixLength(tokens) {
   return prefix ? { kind: "all", end: start + prefix.length } : null;
 }
 
-// Indexes of `failed` tokens that `passed` drops, when `passed` is `failed` minus some tokens; else null.
 function droppedTokenIndexes(failed, passed) {
   const dropped = [];
   let j = 0;

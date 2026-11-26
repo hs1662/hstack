@@ -97,7 +97,6 @@ const PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS = new Set([
   "verify",
 ]);
 const GO_VERIFICATION_SUBCOMMANDS = new Set(["test", "vet", "build"]);
-// `npm run` with no script name only lists scripts.
 const BARE_SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
 const ALLOWED_SUBAGENT_SYSTEM_SOURCES = new Set(["SYSTEM"]);
 const SESSION_ROLE_PRIORITY = { main: 0, worker: 1, challenger: 2, auditor: 3 };
@@ -292,7 +291,6 @@ export function normalizeWorkspacePath(rawPath, cwd = "", gitRoot = "") {
   return stripTrailingSlashes(normalized);
 }
 
-// Quote-aware split into { text, op } pairs, where op is the shell operator that follows the segment.
 function splitShellChain(commandLine) {
   const chain = [];
   let current = "";

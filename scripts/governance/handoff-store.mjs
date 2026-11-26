@@ -477,7 +477,6 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   return { gitRoot: snap.gitRoot, head: headOf(snap), files: snap.files, untrackedTruncated: Boolean(snap.untrackedTruncated), gate };
 }
 
-// The [mtimeMs, size] signature snapshotWorkingTree records, or null for a missing file.
 function statSignature(gitRoot, relPath) {
   try {
     const st = statSync(join(gitRoot, relPath));
@@ -492,9 +491,7 @@ function sameFileSignature(a, b) {
 }
 
 // Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
-// Returns true when a possibly writing shell command ran in a git tree that could not be diffed (fail closed).
-// Stop and verify_completion both call this, so a shell edit gets the same rules as a write-tool edit.
-// dirtyFiles (git status paths) stand in for the diff when there is no snapshot to diff against.
+// Returns true when an arbitrary shell command ran in a git tree that could not be diffed (fail closed).
 export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), dataDir = resolvePluginDataDir() }) {
   // run_command and mcp_agy-fast_fast_run_checks both run arbitrary shell commands.
   const shellExecs = ledger.turnExecutions;

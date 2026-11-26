@@ -201,7 +201,6 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
   return autoHandoffMessage;
 }
 
-// One transcript pass yields both the drift steps and the ledger the audit stage needs.
 function loadContextWithLedger(stdinText) {
   const payload = parseHookPayload(stdinText, "PostInvocation");
   if (!payload) return null;
