@@ -16,6 +16,8 @@ const NEWLINE_BYTE = 0x0a;
 const PROBE_MAX_BYTES = 1024 * 1024;
 const TAIL_SCAN_MIN_BYTES = 1024 * 1024;
 const TAIL_START_BYTES = 256 * 1024;
+// Bounds each backward read so a long search does not hold one huge buffer.
+const TAIL_MAX_CHUNK_BYTES = 4 * 1024 * 1024;
 
 function isAsciiWhitespace(byte) {
   return byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a;
@@ -718,17 +720,18 @@ export function readTailTranscriptSteps(filePath, limit) {
 }
 
 // Byte offset of the last line before `end` that contains `needle` and that `accept` takes (it returns a truthy
-// value, given back as `value`), reading backwards in chunks that double from 256KiB. Null when no line qualifies.
-export function findLastLine(filePath, needle, accept, end) {
+// value, given back as `value`), reading backwards in chunks that double from 256KiB. Null when no line that
+// starts at or after `start` qualifies.
+export function findLastLine(filePath, needle, accept, { start = 0, end = Infinity } = {}) {
   const needleBuf = Buffer.from(needle);
   const fd = openSync(filePath, "r");
   try {
-    let hi = Math.min(end ?? Infinity, fstatSync(fd).size);
+    let hi = Math.min(end, fstatSync(fd).size);
     // Bytes past `hi` that belong to the first, possibly partial, line of the region already searched; they are
     // read again with the next chunk rather than copied, since that line is usually short.
     let carryLen = 0;
-    for (let chunk = TAIL_START_BYTES; hi > 0; chunk *= 2) {
-      const lo = Math.max(0, hi - chunk);
+    for (let chunk = TAIL_START_BYTES; hi > start; chunk = Math.min(chunk * 2, TAIL_MAX_CHUNK_BYTES)) {
+      const lo = Math.max(start, hi - chunk);
       const buf = Buffer.allocUnsafe(hi - lo + carryLen);
       for (let got = 0; got < buf.length; ) {
         const n = readSync(fd, buf, got, buf.length - got, lo + got);

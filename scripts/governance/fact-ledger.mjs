@@ -1794,7 +1794,10 @@ function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
   if (sessionRole === null) {
     return undefined;
   }
-  const turn = findLastLine(filePath, '"USER_INPUT"', (lineBuf) => lineRecordOfType(lineBuf, "USER_INPUT"));
+  // A turn longer than half the file saves under half the full scan, so the search stops there.
+  const turn = findLastLine(filePath, '"USER_INPUT"', (lineBuf) => lineRecordOfType(lineBuf, "USER_INPUT"), {
+    start: Math.floor(statSync(filePath).size / 2),
+  });
   if (!turn || turn.value === AMBIGUOUS_LINE || turn.offset === 0) {
     return undefined;
   }
@@ -1809,7 +1812,7 @@ function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
       const parsed = lineRecordOfType(lineBuf, "PLANNER_RESPONSE");
       return parsed === AMBIGUOUS_LINE ? parsed : parsed && extractLatestTokens(parsed);
     },
-    turn.offset,
+    { end: turn.offset },
   );
   if (earlier?.value === AMBIGUOUS_LINE) {
     return undefined;
