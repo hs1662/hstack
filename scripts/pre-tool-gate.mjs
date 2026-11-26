@@ -307,9 +307,9 @@ function analyzeChallengerState(ledger) {
 // The role alone needs only the transcript header, so a run_command or an off-mode write stays O(header).
 function resolveSessionRole(transcriptPath, options) {
   if (options?.ledger) {
-    return options.ledger.transcriptAvailable ? options.ledger.sessionRole : (transcriptPath ? "unknown" : "main");
+    return options.ledger.transcriptAvailable ? options.ledger.sessionRole : "unknown";
   }
-  return transcriptPath ? readSessionRole(transcriptPath) : "main";
+  return readSessionRole(transcriptPath);
 }
 
 function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options }) {

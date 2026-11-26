@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import {
   extractLinePrefixType,
@@ -104,7 +104,7 @@ const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench",
 const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
 const JS_TEST_LIST_FLAGS = new Set(["--listTests", "--list-tests", "--list", "--showConfig", "--show-config"]);
 const MAKE_DRY_RUN_LONG_FLAGS = new Set(["--just-print", "--dry-run", "--recon", "--question", "--touch", "--print-data-base", "--help", "--version"]);
-const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "o", "W", "l", "j", "O", "E"]);
+const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "o", "W", "l", "j", "E"]);
 const MAKE_NOOP_SHORT_FLAGS = new Set(["n", "q", "t", "p", "h", "v"]);
 const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
 const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
@@ -1079,6 +1079,9 @@ function isMakeVerification(args) {
         if (MAKE_NOOP_SHORT_FLAGS.has(ch)) {
           return false;
         }
+        if (ch === "O") {
+          break;
+        }
         if (MAKE_VALUE_FLAGS.has(ch)) {
           const rest = chars.slice(j + 1);
           if (ch === "j" || ch === "l") {
@@ -1233,7 +1236,20 @@ export function extractChainPrepSignature(segment) {
   if (idx === -1 || idx >= parsed.words.length) {
     return null;
   }
-  return ["npm", ...parsed.words.slice(idx + 1)].join(" ");
+  const dirParts = [];
+  for (let i = 0; i < idx; i += 1) {
+    const w = parsed.words[i];
+    if ((w === "-C" || w === "--chdir" || w === "-D") && i + 1 < idx) {
+      dirParts.push(parsed.words[i + 1]);
+      i += 1;
+    } else if (w.startsWith("--chdir=")) {
+      dirParts.push(w.slice("--chdir=".length));
+    } else if (/^-(?:[A-Za-z]*[CD])(.+)$/.test(w)) {
+      dirParts.push(w.replace(/^-[A-Za-z]*[CD]/, ""));
+    }
+  }
+  const prefixTag = dirParts.length > 0 ? `@wrapperDir(${dirParts.join("->")}) ` : "";
+  return `${prefixTag}${["npm", ...parsed.words.slice(idx + 1)].join(" ")}`;
 }
 
 // A known test runner, optionally behind safe assignments and wrappers. A shell `-c` body must itself match the
@@ -2351,6 +2367,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               kind: classifyCommand(command),
               hasPrepSideEffect: commandHasPrepSideEffect(command),
               passed: true,
+              hasResult: false,
               status: "",
               error: "",
               tail: "",
@@ -2370,6 +2387,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               kind: classifyMcpCheckCommands(commands),
               hasPrepSideEffect: commands.some((cmd) => commandHasPrepSideEffect(cmd)),
               passed: true,
+              hasResult: false,
               status: "",
               error: "",
               tail: "",
@@ -2485,6 +2503,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
             Boolean(pending.entry.toolName) &&
             typeof parsed.content === "string" &&
             RUN_CHECKS_FAIL_BLOCK_RE.test(parsed.content);
+          pending.entry.hasResult = true;
           pending.entry.status = status;
           pending.entry.error = error;
           pending.entry.tail = tail;
@@ -2736,7 +2755,7 @@ export function readTurnLedger(transcriptPath, cwd = "", gitRoot = "", { partial
 // The session role alone, from the header window: O(header) on any transcript size.
 export function readSessionRole(transcriptPath) {
   if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
-    return "main";
+    return "unknown";
   }
   for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
     try {
@@ -2950,8 +2969,13 @@ const SNAPSHOT_MAX_BUFFER = 16 * 1024 * 1024;
 
 export function statSnapshotFile(gitRoot, relPath) {
   try {
-    const st = statSync(join(gitRoot, relPath));
-    return [st.mtimeMs, st.size, (st.mode & 0o170000) | (st.mode & 0o111)];
+    const fullPath = join(gitRoot, relPath);
+    const st = lstatSync(fullPath);
+    const modeSig = (st.mode & 0o170000) | (st.mode & 0o111);
+    if (st.isSymbolicLink()) {
+      return [st.mtimeMs, st.size, modeSig, readlinkSync(fullPath)];
+    }
+    return [st.mtimeMs, st.size, modeSig];
   } catch {
     return null;
   }

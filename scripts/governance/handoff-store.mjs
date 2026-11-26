@@ -510,7 +510,7 @@ const statSignature = statSnapshotFile;
 
 function sameFileSignature(a, b) {
   return Array.isArray(a) && Array.isArray(b)
-    ? a[0] === b[0] && a[1] === b[1] && (a.length < 3 || b.length < 3 || a[2] === b[2])
+    ? a.length === b.length && a.every((v, i) => v === b[i])
     : a === b;
 }
 
@@ -557,6 +557,9 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
   const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
   if (!sinceTurn || !sinceGate) {
+    if (baseline && baseline.head !== null && (!current || current.head !== baseline.head) && (!sinceTurn || !sinceGate)) {
+      ledger.commitNumstatUnavailable = true;
+    }
     if (riskyShellExecs.length === 0 || !resolveGitRootFast(cwd)) {
       return false;
     }

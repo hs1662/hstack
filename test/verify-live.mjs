@@ -856,6 +856,7 @@ export const CASES = [
       expectStopContinueGate: true,
       expectStopBeforeFinalPass: true,
       expectPostEditTestPass: true,
+      expectPostEditTestCommand: "node --test",
       expectMaxStopExecutionNumBelow: 2,
       expectFinalVerdict: "PASS",
     },
@@ -1681,6 +1682,7 @@ export function summarizeGovernance({
   let maxStepCacheReadTokens = null;
   let lastEditOrShellStepOrder = -1;
   let lastPassingTestStepOrder = -1;
+  let postEditPassingCommands = [];
   let pendingExecs = [];
 
   const collectRoleCandidates = (call, targetAgentName) => {
@@ -1717,6 +1719,7 @@ export function summarizeGovernance({
       const exec = pendingExecs.shift();
       if (exec.isTest && !inferExecutionFailure(step)) {
         lastPassingTestStepOrder = exec.order;
+        postEditPassingCommands.push({ order: exec.order, command: exec.command });
       }
       continue;
     }
@@ -1736,12 +1739,12 @@ export function summarizeGovernance({
               : extractMcpCheckCommands(call).map((c) => c.command).join(" && ");
           const kind = classifyCommand(cmd);
           if (kind === "verification") {
-            pendingExecs.push({ order: sIdx, isTest: true });
+            pendingExecs.push({ order: sIdx, isTest: true, command: cmd });
           } else {
             if (kind === "other") {
               lastEditOrShellStepOrder = sIdx;
             }
-            pendingExecs.push({ order: sIdx, isTest: false });
+            pendingExecs.push({ order: sIdx, isTest: false, command: cmd });
           }
         }
         if (name === GATE_TOOL_NAME) {
@@ -1880,15 +1883,23 @@ export function summarizeGovernance({
     (firstStopAuditIndex === -1 || hasPassAuditAfterStop);
 
   const safeLedgerExecs = Array.isArray(ledgerExecutions) ? ledgerExecutions : [];
-  let hasPostEditTestPass = lastEditOrShellStepOrder !== -1 && lastPassingTestStepOrder > lastEditOrShellStepOrder;
+  let resolvedPostEditCommands = postEditPassingCommands
+    .filter((entry) => entry.order > lastEditOrShellStepOrder)
+    .map((entry) => entry.command);
+  let hasPostEditTestPass = lastEditOrShellStepOrder !== -1 && resolvedPostEditCommands.length > 0;
   if (safeLedgerExecs.length > 0) {
     const lastLedgerOtherStep = Math.max(
       Number.isFinite(ledgerLastWriteStepIndex) ? ledgerLastWriteStepIndex : -1,
       ...safeLedgerExecs.filter((e) => e && e.kind === "other").map((e) => e.stepIndex ?? -1),
     );
-    hasPostEditTestPass =
-      lastLedgerOtherStep !== -1 &&
-      safeLedgerExecs.some((e) => e && e.kind === "verification" && e.passed === true && (e.stepIndex ?? -1) > lastLedgerOtherStep);
+    const passingLedgerExecs =
+      lastLedgerOtherStep !== -1
+        ? safeLedgerExecs.filter(
+            (e) => e && e.kind === "verification" && e.hasResult !== false && e.passed === true && (e.stepIndex ?? -1) > lastLedgerOtherStep,
+          )
+        : [];
+    resolvedPostEditCommands = passingLedgerExecs.map((e) => String(e.command ?? ""));
+    hasPostEditTestPass = passingLedgerExecs.length > 0;
   }
 
   return {
@@ -1917,6 +1928,7 @@ export function summarizeGovernance({
     shellExecCalls,
     stopBeforeFinalPass,
     hasPostEditTestPass,
+    postEditPassingCommands: resolvedPostEditCommands,
     stopContinueGateCount,
     stopMaxExecutionNum,
     cacheReadTokens,
@@ -2047,6 +2059,15 @@ export function evaluateGovernanceCase(
 
   if (exp.expectPostEditTestPass === true && !governance.hasPostEditTestPass) {
     failures.push("Expected passing post-edit verification command execution after shell/file modification");
+  }
+
+  if (typeof exp.expectPostEditTestCommand === "string" && exp.expectPostEditTestCommand.trim().length > 0) {
+    const expectedNorm = exp.expectPostEditTestCommand.trim().replace(/\s+/g, " ");
+    const cmds = Array.isArray(governance.postEditPassingCommands) ? governance.postEditPassingCommands : [];
+    const matched = cmds.some((c) => typeof c === "string" && c.trim().replace(/\s+/g, " ").includes(expectedNorm));
+    if (!matched) {
+      failures.push(`Expected post-edit passing verification command "${expectedNorm}", got [${cmds.join(", ")}]`);
+    }
   }
 
   if (exp.expectStopContinueGate === true && governance.stopContinueGateCount < 1) {

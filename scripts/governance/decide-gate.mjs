@@ -141,19 +141,81 @@ function isPathTarget(token, runnerPrefix = []) {
 
 const EXCLUDED_TEST_DIRS_RE = /(?:^|\/)(?:node_modules|\.git|\.venv|venv|__pycache__|build|dist|\.tox|\.nox|\.eggs)(?:\/|$)/;
 
+function normalizeTestpathItem(raw) {
+  return raw.trim().replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+function parseIniTestpaths(text, targetSections) {
+  const lines = text.split(/\r?\n/);
+  let inTargetSection = false;
+  let foundKey = false;
+  const collected = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed.startsWith(";")) {
+      continue;
+    }
+    const secMatch = /^\[([^\]]+)\]\s*$/.exec(trimmed);
+    if (secMatch) {
+      inTargetSection = targetSections.has(secMatch[1].trim().toLowerCase());
+      continue;
+    }
+    if (!inTargetSection) {
+      continue;
+    }
+    const keyMatch = /^testpaths\s*=\s*(.*)$/i.exec(trimmed);
+    if (keyMatch) {
+      foundKey = true;
+      const firstVal = keyMatch[1].replace(/\s+[#;].*$/, "").trim();
+      if (firstVal) {
+        for (const item of firstVal.split(/[\s,]+/)) {
+          const norm = normalizeTestpathItem(item);
+          if (norm) collected.push(norm);
+        }
+      }
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const nextLine = lines[j];
+        const nextTrimmed = nextLine.trim();
+        if (!nextTrimmed || nextTrimmed.startsWith("#") || nextTrimmed.startsWith(";")) {
+          continue;
+        }
+        if (/^[ \t]+/.test(nextLine) && !nextTrimmed.startsWith("[") && !nextTrimmed.includes("=")) {
+          const clean = nextTrimmed.replace(/\s+[#;].*$/, "").trim();
+          for (const item of clean.split(/[\s,]+/)) {
+            const norm = normalizeTestpathItem(item);
+            if (norm) collected.push(norm);
+          }
+          i = j;
+        } else {
+          break;
+        }
+      }
+    }
+  }
+  return foundKey ? { restricted: true, paths: collected } : null;
+}
+
 function readPytestTestpaths(execDir) {
   if (!execDir || !existsSync(execDir)) {
-    return null;
+    return { restricted: false, paths: [] };
   }
-  const iniPath = join(execDir, "pytest.ini");
-  if (existsSync(iniPath)) {
+  for (const [fileName, sections] of [
+    ["pytest.ini", new Set(["pytest"])],
+    ["tox.ini", new Set(["pytest", "tool:pytest"])],
+    ["setup.cfg", new Set(["tool:pytest"])],
+  ]) {
+    const cfgPath = join(execDir, fileName);
+    if (!existsSync(cfgPath)) {
+      continue;
+    }
     try {
-      const m = /^[ \t]*testpaths[ \t]*=[ \t]*(.+)$/m.exec(readFileSync(iniPath, "utf8"));
-      if (m) {
-        return m[1].trim().split(/[\s,]+/).filter(Boolean).map((p) => p.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""));
+      const parsed = parseIniTestpaths(readFileSync(cfgPath, "utf8"), sections);
+      if (parsed) {
+        return parsed;
       }
     } catch {
-      return null;
+      return { restricted: true, paths: [] };
     }
   }
   const pyprojPath = join(execDir, "pyproject.toml");
@@ -161,20 +223,19 @@ function readPytestTestpaths(execDir) {
     try {
       const text = readFileSync(pyprojPath, "utf8");
       const sect = /\[tool\.pytest\.ini_options\]([\s\S]*?)(?:\n\[|$)/.exec(text);
-      if (sect) {
-        const arrMatch = /testpaths\s*=\s*\[([^\]]*)\]/.exec(sect[1]);
-        if (arrMatch) {
-          return arrMatch[1]
-            .split(",")
-            .map((s) => s.trim().replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, ""))
-            .filter(Boolean);
+      if (sect && /(?:^|\n)[ \t]*testpaths[ \t]*=/.test(sect[1])) {
+        const arrMatch = /testpaths[ \t]*=[ \t]*\[([\s\S]*?)\]/.exec(sect[1]);
+        if (!arrMatch) {
+          return { restricted: true, paths: [] };
         }
+        const paths = arrMatch[1].split(",").map(normalizeTestpathItem).filter(Boolean);
+        return { restricted: true, paths };
       }
     } catch {
-      return null;
+      return { restricted: true, paths: [] };
     }
   }
-  return null;
+  return { restricted: false, paths: [] };
 }
 
 const RUNNER_VALUE_FLAGS = new Set([
@@ -234,9 +295,9 @@ function isDefaultDiscoverableTestTarget(target, runnerPrefix, execDir = "") {
     if (!/(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm)) {
       return false;
     }
-    const testpaths = readPytestTestpaths(execDir);
-    if (testpaths && testpaths.length > 0) {
-      return testpaths.some((tp) => tp === "." || norm === tp || norm.startsWith(`${tp}/`));
+    const tpConfig = readPytestTestpaths(execDir);
+    if (tpConfig.restricted) {
+      return tpConfig.paths.some((tp) => tp === "." || norm === tp || norm.startsWith(`${tp}/`));
     }
     return true;
   }
