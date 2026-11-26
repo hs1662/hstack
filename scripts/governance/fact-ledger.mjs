@@ -1130,6 +1130,7 @@ function createEmptyLedger(transcriptAvailable = false) {
     turnAutoHandoffTriggered: false,
     turnWorkerDispatched: false,
     turnWorkerCompleted: false,
+    turnWorkerConversationIds: [],
     latestTokens: { inputTokens: null, cacheReadTokens: null, outputTokens: null },
     gateBlockedThisTurn: false,
   };
@@ -1214,6 +1215,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     ledger.turnAutoHandoffTriggered = false;
     ledger.turnWorkerDispatched = false;
     ledger.turnWorkerCompleted = false;
+    ledger.turnWorkerConversationIds = [];
     ledger.gateBlockedThisTurn = false;
     pendingCalls = [];
     asyncAuditsByConversationId.clear();
@@ -1536,6 +1538,11 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
             setCompletedOnSync: true,
           });
           if (pending.workerEntries && pending.workerEntries.length > 0 && !isDenial) {
+            for (const wid of convIds) {
+              if (wid && !ledger.turnWorkerConversationIds.includes(wid)) {
+                ledger.turnWorkerConversationIds.push(wid);
+              }
+            }
             if (isLaunchAck && convIds.length > 0) {
               for (const w of pending.workerEntries) {
                 const wid = w.totalSlots > 1 ? (convIds[w.slotIndex] ?? "") : (convIds[0] ?? "");

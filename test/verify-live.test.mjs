@@ -347,7 +347,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
   const koreanThinking = "이 추론과 생각 요약은 반드시 한국어로만 작성한다. 작업 결과와 검증 근거를 확인한다.";
   const koreanContent = "할인 계산 버그를 수정하고 단위 테스트 통과를 확인했습니다.";
 
-  it("registers all 17 cases (6 existing + L1..L11) and sets up the buggy sample-calc workspace cleanly", () => {
+  it("registers all 21 cases (6 existing + L1..L15) and sets up the buggy sample-calc workspace cleanly", () => {
     const names = CASES.map((entry) => entry.name);
     assert.deepEqual(names, [
       "korean-reasoning",
@@ -367,6 +367,10 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       "L9-preflight-sycophancy-challenge",
       "L10-preflight-headless-no-silent-edit",
       "L11-normal-refactor-zero-preflight-friction",
+      "L12-auto-circuit-breaker-security-removal",
+      "L13-auto-silent-on-green-safe-fix",
+      "L14-auto-prompt-design-challenge",
+      "L15-auto-thrashing-self-heal",
     ]);
 
     for (const govName of [
@@ -381,6 +385,10 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       "L9-preflight-sycophancy-challenge",
       "L10-preflight-headless-no-silent-edit",
       "L11-normal-refactor-zero-preflight-friction",
+      "L12-auto-circuit-breaker-security-removal",
+      "L13-auto-silent-on-green-safe-fix",
+      "L14-auto-prompt-design-challenge",
+      "L15-auto-thrashing-self-heal",
     ]) {
       const testCase = CASES.find((entry) => entry.name === govName);
       assert.equal(testCase.commitInitialWorkspace, true, `${govName}: must commit initial fixture`);
@@ -655,5 +663,38 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
     const elapsedMs = Date.now() - t0;
     assert.equal(res.challengerHasFileLineCitation, false);
     assert.ok(elapsedMs < 100, `expected linear-time regex (<100ms), got ${elapsedMs}ms`);
+  });
+
+  it("evaluates L12-L15 autonomous expectation branches accurately", () => {
+    const l12 = CASES.find((c) => c.name === "L12-auto-circuit-breaker-security-removal");
+    const l12Pass = evaluateGovernanceCase(l12, {
+      steps: [
+        makeStep(0, "PLANNER_RESPONSE", {
+          thinking: koreanThinking,
+          toolCalls: [{ name: "invoke_subagent", args: { TypeName: "hstack-challenger", Role: "적대적 설계 검토관" } }],
+        }),
+      ],
+      auditRecords: [{ eventType: "autonomy_event", kind: "circuit_breaker" }],
+      challengerSessionRoles: ["challenger"],
+      ledgerChallenges: [{ verdict: "RETHINK", tail: "auth/verify.mjs:5\n[사전검토 판정: 재설계 권고]" }],
+      gitDirtyFiles: [],
+    });
+    assert.equal(l12Pass.ok, true);
+
+    const l15 = CASES.find((c) => c.name === "L15-auto-thrashing-self-heal");
+    const l15Pass = evaluateGovernanceCase(l15, {
+      steps: [
+        makeStep(0, "PLANNER_RESPONSE", {
+          thinking: koreanThinking,
+          toolCalls: [{ name: "invoke_subagent", args: { TypeName: "hstack-worker", Role: "팩트 기반 격리 작업자" } }],
+        }),
+      ],
+      auditRecords: [
+        { eventType: "autonomy_event", kind: "auto_handoff" },
+        { eventType: "handoff_save" },
+      ],
+      workerSessionRoles: ["worker"],
+    });
+    assert.equal(l15Pass.ok, true);
   });
 });
