@@ -2,13 +2,14 @@
 // and mcp_agy-fast_fast_run_checks is gated like run_command.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { classifyCommand, readFactLedger } from "../scripts/governance/fact-ledger.mjs";
+import { resolveSessionStatePath } from "../scripts/governance/handoff-store.mjs";
 import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
@@ -120,7 +121,7 @@ describe("G3 a shell edit counts for verify_completion exactly like a write_file
 
   // The edit is made by `via`: write_file, run_command or the agy-fast check tool. Then each step runs, then the
   // real PreToolUse hook and MCP server judge `claim`, then Stop.
-  function runTurn(via, file, content, after, claim) {
+  function runTurn(via, file, content, after, claim, { dropSnapshot = false } = {}) {
     const repo = makeRepo();
     const conversationId = `p7-${via}-${Math.random().toString(36).slice(2)}`;
     const transcriptPath = join(repo, ".t.jsonl");
@@ -136,6 +137,10 @@ describe("G3 a shell edit counts for verify_completion exactly like a write_file
       dataDir: DATA_DIR,
       skipAuditLog: true,
     });
+    if (dropSnapshot) {
+      // What a turn-start git snapshot that timed out under load leaves behind.
+      rmSync(resolveSessionStatePath(conversationId, DATA_DIR), { force: true });
+    }
     writeFileSync(join(repo, file), content);
     const sed = `sed -i s/x/y/ ${file}`;
     if (via === "write_file") {
@@ -169,7 +174,7 @@ describe("G3 a shell edit counts for verify_completion exactly like a write_file
 
   const claim = (files, runs) => ({
     modified_files: files,
-    inspected_files: files,
+    inspected_files: [],
     verification_runs: runs.map((command) => ({ command, outcome: "pass" })),
     unverified_scope: ["없음"],
     self_assessment: "수정 사항과 테스트 통과 결과를 직접 확인했습니다.",
@@ -196,6 +201,12 @@ describe("G3 a shell edit counts for verify_completion exactly like a write_file
     assert.notEqual(got.verdict, VERDICT_HEADERS.PASS);
     assert.equal(got.stop.decision, "continue");
     assert.ok(got.stop.reason.includes(GATE_STOP_MARKER), got.stop.reason);
+  });
+
+  it("still rejects the unreported shell auth edit when the turn-start snapshot is missing", () => {
+    const got = runTurn("run_command", "src/auth/token.mjs", "x(a, b);\n", [], claim([], []), { dropSnapshot: true });
+    assert.notEqual(got.verdict, VERDICT_HEADERS.PASS);
+    assert.equal(got.stop.decision, "continue");
   });
 
   it("escalates a tested shell auth edit to the independent audit", () => {
