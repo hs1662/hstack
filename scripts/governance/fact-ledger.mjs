@@ -922,11 +922,13 @@ export function extractMcpCheckCommands(call) {
   return { commands, labels };
 }
 
+// With no commands the tool runs the project's configured checks; otherwise each command is judged like run_command.
 function classifyMcpCheckCommands(commands) {
   if (commands.length === 0) {
     return "verification";
   }
-  return commands.some((cmd) => classifyCommand(cmd) !== "read_only") ? "verification" : "read_only";
+  const kinds = commands.map(classifyCommand);
+  return kinds.includes("other") ? "other" : kinds.includes("verification") ? "verification" : "read_only";
 }
 
 function extractHead(content) {
