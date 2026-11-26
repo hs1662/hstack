@@ -409,7 +409,7 @@ describe("fact-ledger Phase 2 extensions, git numstat, and 5MB performance", () 
     writeFileSync(
       auditorPath,
       toJsonl([
-        { step_index: 0, type: "USER_INPUT", content: `코드 검토\n\n${AUDITOR_SESSION_MARKER}` },
+        { step_index: 0, type: "USER_INPUT", content: `코드 검토\n\n${AUDITOR_SESSION_MARKER}\n작업 경로: \`/repo\`` },
         { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "a.mjs" } }] },
       ]),
       "utf8",
@@ -821,7 +821,7 @@ describe("pre-tool-gate invoke_subagent dual-schema overwrite and stop.mjs audit
     writeFileSync(
       auditorTranscript,
       toJsonl([
-        { step_index: 0, type: "USER_INPUT", content: `독립 검토 요청\n${AUDITOR_SESSION_MARKER}` },
+        { step_index: 0, type: "USER_INPUT", content: `독립 검토 요청\n${AUDITOR_SESSION_MARKER}\n작업 경로: \`${dir}\`` },
         { step_index: 1, type: "PLANNER_RESPONSE", thinking: "한국어로 검토합니다.", tool_calls: [{ name: "write_file", args: { Path: "tmp.mjs" } }] },
         { step_index: 2, type: "PLANNER_RESPONSE", thinking: "검토를 마칩니다.", content: "결함이 없습니다.\n[감사 판정: 통과]" },
       ]),

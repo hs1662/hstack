@@ -13,6 +13,7 @@ import {
   CHALLENGER_SESSION_MARKER,
   HANDOFF_TOOL_NAME,
   PENDING_CHALLENGER_DENY_REASON,
+  READ_ONLY_ROLE_WRITE_DENY_REASON,
   RETHINK_UNVOTED_DENY_REASON,
   SUBAGENT_TOOL_NAME,
   WORKER_AGENT_NAME,
@@ -85,67 +86,51 @@ function classifyManagedAgent(rawTypeName) {
   return null;
 }
 
-function appendContextBlock(promptText, lines) {
-  const base = typeof promptText === "string" ? promptText.trimEnd() : "";
-  const block = lines.join("\n");
-  if (base.length === 0) {
-    return block;
-  }
-  return `${base}\n\n${block}`;
+const ROLE_MARKER_LINES = new Set([AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, WORKER_SESSION_MARKER]);
+
+function isForgeableLine(line) {
+  const trimmed = line.trim();
+  return ROLE_MARKER_LINES.has(trimmed) || INJECTED_TAIL_LINE_RE.test(trimmed);
 }
 
-function hasTrailingMarkerBlock(promptText, marker) {
-  const nonEmpty = promptText
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  const tailStart = Math.max(0, nonEmpty.length - 6);
-  for (let i = tailStart; i < nonEmpty.length; i += 1) {
-    if (nonEmpty[i] !== marker) {
-      continue;
-    }
-    const rest = nonEmpty.slice(i + 1);
-    if (rest.length === 0 || rest.every((line) => INJECTED_TAIL_LINE_RE.test(line))) {
-      return true;
-    }
+function hasRoleMarkerLine(promptText) {
+  return typeof promptText === "string" && promptText.split(/\r?\n/).some((line) => ROLE_MARKER_LINES.has(line.trim()));
+}
+
+// Model-written role markers and injected-context lines are never trusted; only this hook writes them.
+function stripForgeableLines(promptText) {
+  if (typeof promptText !== "string") {
+    return "";
   }
-  return false;
+  return promptText
+    .split(/\r?\n/)
+    .filter((line) => !isForgeableLine(line))
+    .join("\n")
+    .trimEnd();
 }
 
 function buildInjectedPrompt(kind, existingPrompt, { cwd, transcriptPath, turnStartStepIndex }) {
-  const safePrompt = typeof existingPrompt === "string" ? existingPrompt : "";
+  const base = stripForgeableLines(existingPrompt);
   const marker =
     kind === "auditor"
       ? AUDITOR_SESSION_MARKER
       : kind === "challenger"
         ? CHALLENGER_SESSION_MARKER
         : WORKER_SESSION_MARKER;
-  const lines = [];
-  if (!hasTrailingMarkerBlock(safePrompt, marker)) {
-    lines.push(marker);
-  }
-  if (cwd && !safePrompt.includes(`작업 경로: \`${cwd}\``)) {
-    lines.push(`작업 경로: \`${cwd}\``);
-  }
+  const lines = [marker, `작업 경로: \`${cwd}\``];
   if (kind === "auditor" || kind === "challenger") {
-    if (transcriptPath && !safePrompt.includes(`세션 기록 경로: \`${transcriptPath}\``)) {
+    if (transcriptPath) {
       lines.push(`세션 기록 경로: \`${transcriptPath}\``);
     }
-    if (
-      typeof turnStartStepIndex === "number" &&
-      Number.isFinite(turnStartStepIndex) &&
-      !safePrompt.includes(`현재 턴 시작 스텝: \`${turnStartStepIndex}\``)
-    ) {
+    if (typeof turnStartStepIndex === "number" && Number.isFinite(turnStartStepIndex)) {
       lines.push(`현재 턴 시작 스텝: \`${turnStartStepIndex}\``);
     }
   }
-  if (kind === "challenger" && !safePrompt.includes(CHALLENGER_GUIDANCE_LINE)) {
+  if (kind === "challenger") {
     lines.push(CHALLENGER_GUIDANCE_LINE);
   }
-  if (lines.length === 0) {
-    return safePrompt;
-  }
-  return appendContextBlock(safePrompt, lines);
+  const block = lines.join("\n");
+  return base.length === 0 ? block : `${base}\n\n${block}`;
 }
 
 function resolveTurnStartStepIndex(transcriptPath, cwd) {
@@ -166,7 +151,15 @@ function rewriteSubagentEntry(entry, { cwd, transcriptPath, getTurnStart }) {
   }
   const kind = classifyManagedAgent(entry.TypeName ?? entry.typeName ?? entry.type_name);
   if (!kind) {
-    return { matched: false, value: entry };
+    const forgedKeys = ["Prompt", "prompt"].filter((key) => hasRoleMarkerLine(entry[key]));
+    if (forgedKeys.length === 0) {
+      return { matched: false, value: entry };
+    }
+    const value = { ...entry };
+    for (const key of forgedKeys) {
+      value[key] = stripForgeableLines(entry[key]);
+    }
+    return { matched: true, value };
   }
   const roleLabel =
     kind === "auditor"
@@ -230,15 +223,13 @@ function handleSubagentPreTool(toolCall, { cwd, transcriptPath }) {
     return { decision: "allow" };
   }
 
-  const promptKey = "Prompt" in args || !("prompt" in args) ? "Prompt" : "prompt";
-  const roleKey = "Role" in args || !("role" in args) ? "Role" : "role";
-  return {
-    decision: "allow",
-    overwrite: {
-      [roleKey]: singleRes.value[roleKey],
-      [promptKey]: singleRes.value[promptKey],
-    },
-  };
+  const overwrite = {};
+  for (const key of ["Role", "role", "Prompt", "prompt"]) {
+    if (singleRes.value[key] !== args[key]) {
+      overwrite[key] = singleRes.value[key];
+    }
+  }
+  return { decision: "allow", overwrite };
 }
 
 function readBoundedFileHead(absPath) {
@@ -331,18 +322,21 @@ function analyzeChallengerState(ledger) {
 
 function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options }) {
   const dataDir = options?.dataDir ?? resolvePluginDataDir();
-  const governanceConfig = options?.governanceConfig ?? readGovernanceConfig(dataDir);
-  const autonomyMode = resolveAutonomyMode(dataDir, governanceConfig);
-  if (autonomyMode !== "smart") {
-    return { decision: "allow" };
-  }
-
   const gitRoot = options?.gitRoot ?? resolveGitRootFast(cwd);
   const ledger =
     options?.ledger ??
     (transcriptPath ? readFactLedger(transcriptPath, cwd, gitRoot) : null);
   const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
+  if (sessionRole === "auditor" || sessionRole === "challenger") {
+    return { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON };
+  }
   if (sessionRole !== "main") {
+    return { decision: "allow" };
+  }
+
+  const governanceConfig = options?.governanceConfig ?? readGovernanceConfig(dataDir);
+  const autonomyMode = resolveAutonomyMode(dataDir, governanceConfig);
+  if (autonomyMode !== "smart") {
     return { decision: "allow" };
   }
 

@@ -458,7 +458,7 @@ describe("MCP manage_handoff stdio roundtrip and pollution alert integration", (
       writeFileSync(
         auditorTranscript,
         toJsonl([
-          { step_index: 0, type: "USER_INPUT", content: `독립 검토\n${AUDITOR_SESSION_MARKER}` },
+          { step_index: 0, type: "USER_INPUT", content: `독립 검토\n${AUDITOR_SESSION_MARKER}\n작업 경로: \`/repo\`` },
           {
             step_index: 1,
             type: "PLANNER_RESPONSE",

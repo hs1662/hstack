@@ -749,7 +749,7 @@ describe("Checkpoint 4 audit regression tests (Red -> Green)", () => {
         hookEventName: "PreInvocation",
         invocationNum: 0,
         conversationId: "conv-sub-notr",
-        lastUserInput: `${prompt}\n[hstack:독립감사]`,
+        lastUserInput: `${prompt}\n[hstack:독립감사]\n작업 경로: \`/repo\``,
       }),
       { dataDir: createTempDir("hstack-subnotr-") },
     );

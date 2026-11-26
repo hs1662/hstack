@@ -911,7 +911,7 @@ function pickHigherSessionRole(current, candidate) {
   return candidateRank > currentRank ? candidate : current;
 }
 
-export function classifySessionRoleFromText(content, { requireBlockStructure = false } = {}) {
+export function classifySessionRoleFromText(content) {
   const lines = normalizeRoleLines(content);
   if (lines.length === 0) {
     return "main";
@@ -930,12 +930,12 @@ export function classifySessionRoleFromText(content, { requireBlockStructure = f
     if (!candidate) {
       continue;
     }
-    if (requireBlockStructure) {
-      const remaining = lines.slice(i + 1);
-      const validBlock = remaining.length === 0 || remaining.every((line) => INJECTED_CONTEXT_LINE_RE.test(line));
-      if (!validBlock) {
-        continue;
-      }
+    // Only the hook-injected trailing block (marker, then 작업 경로:, then other injected lines) carries a role.
+    const remaining = lines.slice(i + 1);
+    const validBlock =
+      remaining.length > 0 && remaining[0].startsWith("작업 경로:") && remaining.every((line) => INJECTED_CONTEXT_LINE_RE.test(line));
+    if (!validBlock) {
+      continue;
     }
     detected = pickHigherSessionRole(detected, candidate);
     if (detected === "auditor") {
@@ -946,7 +946,7 @@ export function classifySessionRoleFromText(content, { requireBlockStructure = f
 }
 
 export function detectSessionRoleFromUserInput(content) {
-  return classifySessionRoleFromText(content, { requireBlockStructure: false });
+  return classifySessionRoleFromText(content);
 }
 
 export function detectSessionRoleFromHeaderStep(step) {
@@ -958,14 +958,14 @@ export function detectSessionRoleFromHeaderStep(step) {
     return "main";
   }
   if (step.type === "USER_INPUT") {
-    return classifySessionRoleFromText(content, { requireBlockStructure: false });
+    return classifySessionRoleFromText(content);
   }
   if (step.type === "SYSTEM_MESSAGE") {
     const rawSource = typeof step.source === "string" ? step.source.trim() : "";
     if (rawSource.length > 0 && !ALLOWED_SUBAGENT_SYSTEM_SOURCES.has(rawSource)) {
       return "main";
     }
-    return classifySessionRoleFromText(content, { requireBlockStructure: true });
+    return classifySessionRoleFromText(content);
   }
   return "main";
 }
