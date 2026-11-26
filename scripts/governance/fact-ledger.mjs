@@ -385,6 +385,53 @@ function hasUnquotedFileRedirection(segment) {
   return false;
 }
 
+const SHELL_INTERPRETERS = new Set(["sh", "bash"]);
+const SHELL_OPTION_FLAGS_WITH_ARG = new Set(["-o", "+o", "-O", "+O"]);
+const PYTHON_FLAGS_WITH_ARG = new Set(["-W", "-X"]);
+const INLINE_CODE_FLAG_RE = {
+  node: /^(?:-e|-p|-pe|-ep|--eval|--print)(?:=|$)/,
+  bun: /^(?:-e|-p|--eval|--print)(?:=|$)/,
+};
+
+// The inline body of an interpreter given code on its command line, or null for a script or a plain run.
+// A shell `-c` body is shell, so it is returned for classification; any other language returns "" (never verification).
+function inlineInterpreterBody(bin, args) {
+  if (SHELL_INTERPRETERS.has(bin)) {
+    let inline = false;
+    for (let i = 0; i < args.length; i += 1) {
+      const arg = args[i];
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg)) {
+        i += 1;
+      } else if (/^[-+][A-Za-z]+$/.test(arg)) {
+        inline ||= arg[0] === "-" && arg.includes("c");
+      } else if (!arg.startsWith("--") || arg === "--") {
+        return inline ? (arg === "--" ? (args[i + 1] ?? "") : arg) : null;
+      }
+    }
+    return inline ? "" : null;
+  }
+  if (bin === "python" || bin === "python3") {
+    for (let i = 0; i < args.length; i += 1) {
+      const arg = args[i];
+      if (arg === "-m" || !arg.startsWith("-")) {
+        return null;
+      }
+      if (PYTHON_FLAGS_WITH_ARG.has(arg)) {
+        i += 1;
+      } else if (/^-[A-Za-z]+$/.test(arg) && arg.includes("c")) {
+        return "";
+      }
+    }
+    return null;
+  }
+  if (bin === "deno") {
+    return args.find((arg) => !arg.startsWith("-")) === "eval" ? "" : null;
+  }
+  const flagRe = INLINE_CODE_FLAG_RE[bin];
+  const end = args.indexOf("--");
+  return flagRe && (end === -1 ? args : args.slice(0, end)).some((arg) => flagRe.test(arg)) ? "" : null;
+}
+
 function classifySingleSegment(segment) {
   const cleaned = segment.trim().replace(/^[(!\s]+/, "");
   if (cleaned.length === 0) {
@@ -435,6 +482,11 @@ function classifySingleSegment(segment) {
   const writerFlagRe = READ_ONLY_BINARY_WRITER_FLAG_RE[baseBin];
   if (writerFlagRe && tokens.slice(idx + 1).some((tok) => writerFlagRe.test(tok))) {
     return "other";
+  }
+
+  const inlineBody = inlineInterpreterBody(baseBin, tokens.slice(idx + 1));
+  if (inlineBody !== null) {
+    return classifyCommand(inlineBody) === "verification" ? "verification" : "other";
   }
 
   if (baseBin === "git") {
