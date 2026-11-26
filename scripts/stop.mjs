@@ -2,7 +2,7 @@
 
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { PASSING_VERDICTS, isExemptDocOrAssetPath } from "./governance/constants.mjs";
-import { readFactLedgerAndSteps, readGitLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import { readFactLedgerAndSteps, readGitLedger, resolveGitRootFast, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
 import { readTurnSnapshot, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
 import { isDirectExecution, loadHookContext, parseHookPayload, payloadTranscriptPath, runHookCli } from "./hook-io.mjs";
 import { DRIFT_MARKER, GATE_STOP_MARKER, decideStopAction } from "./transcript.mjs";
@@ -36,11 +36,14 @@ function sameFileSignature(a, b) {
 }
 
 // Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
+// Returns true when a possibly writing shell command ran in a git tree that could not be diffed (fail closed).
 function mergeShellWrittenFiles(ledger, payload, cwd) {
   const shellExecs = ledger.turnExecutions.filter((exec) => !exec.toolName);
   if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
-    return;
+    return false;
   }
+  const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
+  const writeStep = (writers.length > 0 ? writers : shellExecs).at(-1).stepIndex;
   const rawConversationId = payload.conversationId ?? payload.conversation_id;
   const baseline = readTurnSnapshot({
     conversationId: resolveEffectiveConversationKey(typeof rawConversationId === "string" ? rawConversationId : "", cwd),
@@ -48,10 +51,12 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
   });
   const current = baseline ? snapshotWorkingTree(cwd) : null;
   if (!current || current.gitRoot !== baseline.gitRoot) {
-    return;
+    if (writers.length === 0 || !resolveGitRootFast(cwd)) {
+      return false;
+    }
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
+    return true;
   }
-  const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
-  const writeStep = (writers.length > 0 ? writers : shellExecs).at(-1).stepIndex;
   // A change the verify_completion snapshot did not see happened after it, whatever the command looked like.
   const lastGateStep = ledger.turnGateAttempts.at(-1)?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
@@ -67,6 +72,7 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
     ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
   }
+  return false;
 }
 
 export function handleStop(stdinText, readTextFile) {
@@ -107,9 +113,7 @@ export function handleStop(stdinText, readTextFile) {
   if (steps.length === 0) {
     return {};
   }
-  if (ledger?.transcriptAvailable) {
-    mergeShellWrittenFiles(ledger, payload, cwd);
-  }
+  const undiffableShellWrite = Boolean(ledger?.transcriptAvailable && mergeShellWrittenFiles(ledger, payload, cwd));
 
   const isReadOnlyGovernanceRole = ledger?.sessionRole === "auditor" || ledger?.sessionRole === "challenger";
   const hasPendingAsyncAuditor = Boolean(ledger && ledger.pendingAsyncAuditsAfterLastWrite > 0);
@@ -127,7 +131,7 @@ export function handleStop(stdinText, readTextFile) {
       !hasPendingAsyncChallenges &&
       ledger &&
       ledger.transcriptAvailable &&
-      ledger.turnWrittenFiles.size > 0 &&
+      (ledger.turnWrittenFiles.size > 0 || undiffableShellWrite) &&
       !hasPassingPostWriteGate,
   );
 
