@@ -11,6 +11,7 @@ import {
   CHALLENGER_AGENT_NAME,
   CHALLENGER_ROLE_LABEL,
   CHALLENGER_SESSION_MARKER,
+  EXEC_TOOL_NAMES,
   GATE_TOOL_NAME,
   HANDOFF_TOOL_NAME,
   PENDING_CHALLENGER_DENY_REASON,
@@ -24,7 +25,15 @@ import {
   buildCircuitBreakerDenyReason,
 } from "./governance/constants.mjs";
 import { detectDestructiveEdit, normalizeWriteOperations } from "./governance/destructive-edit.mjs";
-import { normalizeWorkspacePath, readFactLedger, resolveGitRootFast, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import {
+  asObject,
+  classifyCommand,
+  normalizeWorkspacePath,
+  pickString,
+  readFactLedger,
+  resolveGitRootFast,
+  snapshotWorkingTree,
+} from "./governance/fact-ledger.mjs";
 import {
   claimAutonomyTurnFlag,
   hasAutonomyTurnFlag,
@@ -437,6 +446,15 @@ export function handlePreToolGate(stdinText, options = {}) {
 
   if (WRITE_TOOL_NAMES.has(toolName)) {
     return handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options });
+  }
+
+  // Read-only roles may still read and run checks, but never a shell command that can write.
+  if (EXEC_TOOL_NAMES.has(toolName)) {
+    const ledger = options?.ledger ?? (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
+    const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
+    const kind = classifyCommand(pickString(asObject(toolCall.args) ?? {}, ["CommandLine", "commandLine", "command"]));
+    const readOnlyRole = sessionRole === "auditor" || sessionRole === "challenger";
+    return readOnlyRole && kind === "other" ? { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON } : { decision: "allow" };
   }
 
   if (!HSTACK_MCP_TOOL_RE.test(toolName)) {
