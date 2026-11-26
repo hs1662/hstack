@@ -134,7 +134,7 @@ describe("hooks.json PreToolUse matcher contract", () => {
     assert.equal(gateEntries.length, 1);
     assert.equal(
       gateEntries[0].matcher,
-      "^(mcp_hstack_.*|invoke_subagent|run_command|edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content|mcp_agy-fast_fast_apply_edits|mcp_agy-fast_apply_edits)$",
+      "^(mcp_hstack_.*|invoke_subagent|run_command|edit_file|write_file|write_to_file|replace_file_content|multi_replace_file_content|mcp_agy-fast_fast_apply_edits|mcp_agy-fast_apply_edits|mcp_agy-fast_fast_run_checks)$",
     );
     assert.equal(gateEntries[0].hooks[0].type, "command");
     assert.equal(gateEntries[0].hooks[0].command, "node ./scripts/pre-tool-gate.mjs");

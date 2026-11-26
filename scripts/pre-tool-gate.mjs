@@ -13,6 +13,7 @@ import {
   CHALLENGER_SESSION_MARKER,
   EXEC_TOOL_NAMES,
   HANDOFF_TOOL_NAME,
+  MCP_VERIFICATION_TOOL_NAMES,
   PENDING_CHALLENGER_DENY_REASON,
   READ_ONLY_ROLE_WRITE_DENY_REASON,
   RETHINK_UNVOTED_DENY_REASON,
@@ -450,7 +451,7 @@ export function handlePreToolGate(stdinText, options = {}) {
   }
 
   // Test runners and npx run arbitrary code, so no command string proves a shell call read-only.
-  if (EXEC_TOOL_NAMES.has(toolName)) {
+  if (EXEC_TOOL_NAMES.has(toolName) || MCP_VERIFICATION_TOOL_NAMES.has(toolName)) {
     const sessionRole = resolveSessionRole(transcriptPath, options);
     return sessionRole === "auditor" || sessionRole === "challenger"
       ? { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON }
