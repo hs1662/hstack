@@ -737,10 +737,14 @@ export function loadHandoffSnapshot({
     };
   }
 
-  let snapshot;
+  let snapshot = null;
   try {
     snapshot = JSON.parse(readFileSync(targetPath, "utf8"));
   } catch {
+    snapshot = null;
+  }
+  // `null`, arrays and scalars parse fine but are not snapshots.
+  if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     return {
       ok: false,
       error: "저장된 스냅샷 파일을 읽을 수 없습니다. 파일이 손상되었는지 확인해 주세요.",
@@ -802,6 +806,9 @@ export function listHandoffSnapshots({ cwd = "", gitLedger = null, dataDir = res
   for (const file of files) {
     try {
       const parsed = JSON.parse(readFileSync(file.fullPath, "utf8"));
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        continue;
+      }
       items.push({
         snapshotId: parsed.snapshotId || file.name.replace(/\.json$/, ""),
         savedAt: parsed.savedAt || "",
