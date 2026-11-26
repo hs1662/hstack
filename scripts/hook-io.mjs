@@ -719,9 +719,11 @@ export function readTailTranscriptSteps(filePath, limit) {
   return readTranscriptStepsFast(filePath).steps;
 }
 
+export const LINE_TOO_LONG = Symbol("line too long");
+
 // Byte offset of the last line before `end` that contains `needle` and that `accept` takes (it returns a truthy
 // value, given back as `value`), reading backwards in chunks that double from 256KiB. Null when no line that
-// starts at or after `start` qualifies.
+// starts at or after `start` qualifies; LINE_TOO_LONG when a line over 4MiB is in the way, so buffers stay bounded.
 export function findLastLine(filePath, needle, accept, { start = 0, end = Infinity } = {}) {
   const needleBuf = Buffer.from(needle);
   const fd = openSync(filePath, "r");
@@ -731,7 +733,8 @@ export function findLastLine(filePath, needle, accept, { start = 0, end = Infini
     // read again with the next chunk rather than copied, since that line is usually short.
     let carryLen = 0;
     for (let chunk = TAIL_START_BYTES; hi > start; chunk = Math.min(chunk * 2, TAIL_MAX_CHUNK_BYTES)) {
-      const lo = Math.max(start, hi - chunk);
+      // Reading one byte before `start` shows whether a line begins exactly at `start`.
+      const lo = hi - chunk > start ? hi - chunk : Math.max(0, start - 1);
       const buf = Buffer.allocUnsafe(hi - lo + carryLen);
       for (let got = 0; got < buf.length; ) {
         const n = readSync(fd, buf, got, buf.length - got, lo + got);
@@ -755,6 +758,9 @@ export function findLastLine(filePath, needle, accept, { start = 0, end = Infini
           return { offset: lo + lineStart, value };
         }
         from = lineStart - 1;
+      }
+      if (lo > start && complete > TAIL_MAX_CHUNK_BYTES) {
+        return LINE_TOO_LONG;
       }
       carryLen = complete;
       hi = lo;

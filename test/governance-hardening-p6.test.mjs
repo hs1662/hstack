@@ -264,12 +264,12 @@ describe("F5 findLastLine stays bounded and sees the line at its start offset", 
     const path = join(dir, "huge-turn.jsonl");
     const pad = "가".repeat(200);
     const rows = [{ step_index: 0, type: "USER_INPUT", content: "처음 요청" }];
-    for (let i = 1; i < 6000; i += 1) {
+    for (let i = 1; i < 15000; i += 1) {
       rows.push({ step_index: i, type: "GENERIC", status: "DONE", content: pad });
     }
-    rows.push({ step_index: 6000, type: "USER_INPUT", content: `x${"y".repeat(5 * 1024 * 1024)}` });
-    rows.push({ step_index: 6001, type: "PLANNER_RESPONSE", content: "답변" });
+    rows.push({ step_index: 15000, type: "USER_INPUT", content: `x${"y".repeat(9 * 1024 * 1024)}` });
+    rows.push({ step_index: 15001, type: "PLANNER_RESPONSE", content: "답변" });
     writeFileSync(path, toJsonl(rows));
-    assert.equal(readFactLedger(path, "", "").turnStartStepIndex, 6000);
+    assert.equal(readFactLedger(path, "", "").turnStartStepIndex, 15000);
   });
 });

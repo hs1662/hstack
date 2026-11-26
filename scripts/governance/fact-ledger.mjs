@@ -4,6 +4,7 @@ import { dirname, join, posix, resolve } from "node:path";
 import {
   extractLinePrefixType,
   findLastLine,
+  LINE_TOO_LONG,
   readTailTranscriptSteps,
   readTranscriptSteps,
   resolveTranscriptCandidates,
@@ -1883,7 +1884,7 @@ function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
   const turn = findLastLine(filePath, '"USER_INPUT"', (lineBuf) => lineRecordOfType(lineBuf, "USER_INPUT"), {
     start: Math.floor(statSync(filePath).size / 2),
   });
-  if (!turn || turn.value === AMBIGUOUS_LINE || turn.offset === 0) {
+  if (!turn || turn === LINE_TOO_LONG || turn.value === AMBIGUOUS_LINE || turn.offset === 0) {
     return undefined;
   }
   const ledger = scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput, { offset: turn.offset, sessionRole });
@@ -1899,7 +1900,7 @@ function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
     },
     { start: Math.max(0, turn.offset - TOKEN_FALLBACK_WINDOW_BYTES), end: turn.offset },
   );
-  if (earlier?.value === AMBIGUOUS_LINE) {
+  if (earlier === LINE_TOO_LONG || earlier?.value === AMBIGUOUS_LINE) {
     return undefined;
   }
   if (earlier) {
