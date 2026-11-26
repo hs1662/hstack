@@ -218,10 +218,17 @@ describe("readFactLedger performance and turn semantics", () => {
     assert.ok(Buffer.byteLength(payload, "utf8") >= 5 * 1024 * 1024);
     writeFileSync(transcriptPath, payload, "utf8");
 
+    // Median of 5 is the operator's stated metric; a single cold run mostly measures JIT warm-up and sibling-file load.
     const { ledger, elapsedMs } = withCpuLock(() => {
-      const start = performance.now();
-      const scanned = readFactLedger(transcriptPath, "/repo", "/repo");
-      return { ledger: scanned, elapsedMs: performance.now() - start };
+      const samples = [];
+      let scanned;
+      for (let run = 0; run < 5; run += 1) {
+        const start = performance.now();
+        scanned = readFactLedger(transcriptPath, "/repo", "/repo");
+        samples.push(performance.now() - start);
+      }
+      samples.sort((a, b) => a - b);
+      return { ledger: scanned, elapsedMs: samples[2] };
     });
 
     assert.equal(ledger.transcriptAvailable, true);
@@ -233,7 +240,7 @@ describe("readFactLedger performance and turn semantics", () => {
     assert.ok(ledger.turnExecutions[0].tail.length <= 2048);
     assert.ok(ledger.turnExecutions[0].tail.includes("ℹ fail 0"));
     assert.deepEqual(ledger.latestTokens, { inputTokens: 12000, cacheReadTokens: 8000, outputTokens: 450 });
-    assert.ok(elapsedMs <= 100, `5MB transcript scan took ${elapsedMs.toFixed(2)}ms (> 100ms)`);
+    assert.ok(elapsedMs <= 100, `5MB transcript scan median of 5 took ${elapsedMs.toFixed(2)}ms (> 100ms)`);
   });
 
   it("resets turn-scoped facts on USER_INPUT while preserving cumulative sessionReadFiles and tracks gate attempts", () => {
