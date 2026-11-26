@@ -1814,6 +1814,10 @@ const ALWAYS_PARSED_PREFIX_TYPES = new Set([null, "USER_INPUT", "PLANNER_RESPONS
 const AMBIGUOUS_LINE = Symbol("ambiguous");
 // Every token key extractLatestTokens reads ends in `okens`.
 const TOKEN_KEY_NEEDLE = 'okens"';
+// shortcut: tokens from a planner more than 4MiB before the last turn read as null (the full scan would find
+// them), since parsing every null-token planner back to the header took ~500ms on a 77MB session; widen it if
+// the context-pollution check ever needs token counts that stale.
+const TOKEN_FALLBACK_WINDOW_BYTES = 4 * 1024 * 1024;
 
 function lineRecordOfType(lineBuf, type) {
   const parsed = parseRawRecord(lineBuf.toString("utf8"));
@@ -1879,7 +1883,7 @@ function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
       const parsed = lineRecordOfType(lineBuf, "PLANNER_RESPONSE");
       return parsed === AMBIGUOUS_LINE ? parsed : parsed && extractLatestTokens(parsed);
     },
-    { end: turn.offset },
+    { start: Math.max(0, turn.offset - TOKEN_FALLBACK_WINDOW_BYTES), end: turn.offset },
   );
   if (earlier?.value === AMBIGUOUS_LINE) {
     return undefined;
