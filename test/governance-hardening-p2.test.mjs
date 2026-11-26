@@ -539,3 +539,25 @@ describe("#7 head and tail scans read only the header and the current turn of a 
     });
   });
 });
+
+describe("#7 a record that starts exactly on a 256KiB read boundary keeps its first bytes", () => {
+  it("reads the write in a planner whose line begins at byte 262144", () => {
+    const dir = createTempDir("hstack-p2-boundary-");
+    const path = join(dir, "t.jsonl");
+    const first = { step_index: 0, type: "USER_INPUT", content: "" };
+    first.content = "가".repeat(Math.floor((256 * 1024 - Buffer.byteLength(JSON.stringify(first)) - 1) / 3));
+    let line = JSON.stringify(first);
+    line = JSON.stringify({ ...first, content: first.content + "x".repeat(256 * 1024 - 1 - Buffer.byteLength(line)) });
+    assert.equal(Buffer.byteLength(line) + 1, 256 * 1024);
+    const rest = [
+      { step_index: 1, type: "PLANNER_RESPONSE", content: KOREAN_PROSE, tool_calls: [{ name: "edit_file", args: { Path: "/repo/src/edge.mjs" } }] },
+      { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+    ];
+    writeFileSync(path, `${line}\n${toJsonl(rest)}`, "utf8");
+    assert.equal(readFactLedger(path, "/repo", "/repo").turnWrittenFiles.has("src/edge.mjs"), true);
+    assert.deepEqual(
+      readTranscriptSteps(path).map((s) => s.stepIndex),
+      [0, 1],
+    );
+  });
+});
