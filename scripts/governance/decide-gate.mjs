@@ -191,7 +191,8 @@ const RUNNER_VALUE_FLAGS = new Set([
 function isDefaultDiscoverableTestTarget(target, runnerPrefix) {
   const norm = target.replace(/\\/g, "/").replace(/^\.\//, "");
   if (runnerPrefix.includes("pytest")) {
-    return /(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm);
+    const filePart = norm.split("::")[0];
+    return /(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(filePart);
   }
   if (runnerPrefix[0] === "node" && runnerPrefix[1] === "--test") {
     return /(?:^|\/)test(?:\/|$)|(?:^|\/)test-[^/]*\.[cm]?js$|(?:^|\/)test\.[cm]?js$|[._-]test\.[cm]?js$/.test(norm);
