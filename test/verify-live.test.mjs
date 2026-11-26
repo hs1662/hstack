@@ -347,7 +347,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
   const koreanThinking = "이 추론과 생각 요약은 반드시 한국어로만 작성한다. 작업 결과와 검증 근거를 확인한다.";
   const koreanContent = "할인 계산 버그를 수정하고 단위 테스트 통과를 확인했습니다.";
 
-  it("registers all 21 cases (6 existing + L1..L15) and sets up the buggy sample-calc workspace cleanly", () => {
+  it("registers all 22 cases (6 existing + L1..L16) and sets up the buggy sample-calc workspace cleanly", () => {
     const names = CASES.map((entry) => entry.name);
     assert.deepEqual(names, [
       "korean-reasoning",
@@ -371,6 +371,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       "L13-auto-silent-on-green-safe-fix",
       "L14-auto-prompt-design-challenge",
       "L15-auto-thrashing-self-heal",
+      "L16-shell-edit-stop-gate",
     ]);
 
     for (const govName of [
@@ -389,6 +390,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       "L13-auto-silent-on-green-safe-fix",
       "L14-auto-prompt-design-challenge",
       "L15-auto-thrashing-self-heal",
+      "L16-shell-edit-stop-gate",
     ]) {
       const testCase = CASES.find((entry) => entry.name === govName);
       assert.equal(testCase.commitInitialWorkspace, true, `${govName}: must commit initial fixture`);
@@ -696,5 +698,45 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       workerSessionRoles: ["worker"],
     });
     assert.equal(l15Pass.ok, true);
+  });
+
+  it("evaluates L16-shell-edit-stop-gate: shell-only edit must hit the Stop evidence gate", () => {
+    const l16 = CASES.find((c) => c.name === "L16-shell-edit-stop-gate");
+    const sedCall = { name: "run_command", args: { CommandLine: "sed -i 's|(1 + percent / 100)|(1 - percent / 100)|' src/calc.mjs" } };
+    const stopBlock = makeStep(3, "SYSTEM_MESSAGE", {
+      content: wrapAntigravityHookMessage(`${GATE_STOP_MARKER} 완료 검증이 필요합니다.`, "Stop"),
+    });
+    const passRecords = [
+      { event: "stop_decision", decision: "continue_gate", executionNum: 0 },
+      { event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 },
+    ];
+    const l16Pass = evaluateGovernanceCase(l16, {
+      steps: [
+        makeStep(0, "USER_INPUT", { content: l16.prompt }),
+        makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [sedCall] }),
+        makeStep(2, "PLANNER_RESPONSE", { thinking: koreanThinking, content: koreanContent }),
+        stopBlock,
+        makeStep(4, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
+      ],
+      auditRecords: passRecords,
+    });
+    assert.equal(l16Pass.ok, true, l16Pass.failures.join("; "));
+
+    const l16EditTool = evaluateGovernanceCase(l16, {
+      steps: [
+        makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: "replace_file_content", args: {} }] }),
+        stopBlock,
+      ],
+      auditRecords: passRecords,
+    });
+    assert.equal(l16EditTool.ok, false);
+    assert.ok(l16EditTool.failures.some((msg) => msg.includes("writeToolCalls=0")));
+
+    const l16NoGate = evaluateGovernanceCase(l16, {
+      steps: [makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [sedCall] })],
+      auditRecords: [{ event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 }],
+    });
+    assert.equal(l16NoGate.ok, false);
+    assert.ok(l16NoGate.failures.some((msg) => msg.includes("stopGateBlocks=1")));
   });
 });
