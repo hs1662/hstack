@@ -87,6 +87,57 @@ function isPathTarget(token) {
   return !token.startsWith("-") && !token.includes("=") && (/[/\\*]/.test(token) || /\.[A-Za-z0-9]+$/.test(token));
 }
 
+const RUNNER_VALUE_FLAGS = new Set([
+  "-c",
+  "--config",
+  "-r",
+  "--reporter",
+  "--test-reporter",
+  "--test-reporter-destination",
+  "--test-name-pattern",
+  "--test-skip-pattern",
+  "--test-shard",
+  "--test-concurrency",
+  "--test-timeout",
+  "-t",
+  "--testNamePattern",
+  "--testPathPattern",
+  "--testPathIgnorePatterns",
+  "--root",
+  "--dir",
+  "--environment",
+  "--mode",
+  "--project",
+  "--projects",
+  "--outputFile",
+  "--coverage.reporter",
+  "--setupFiles",
+  "--setupFilesAfterEnv",
+  "-k",
+  "-m",
+  "-o",
+  "--rootdir",
+  "--confcutdir",
+  "--junitxml",
+  "-n",
+  "--maxfail",
+  "--tb",
+  "-p",
+  "--import",
+  "--require",
+  "--loader",
+  "--env-file",
+  "--tsconfig",
+]);
+
+function isDefaultDiscoverableTestTarget(target, runnerPrefix) {
+  const norm = target.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (runnerPrefix.includes("pytest")) {
+    return /(?:^|\/)tests?(?:\/|$)|(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm);
+  }
+  return /(?:^|\/)(?:__tests__|tests?)(?:\/|$)|[._-](?:test|spec)\.[cm]?[jt]sx?$/i.test(norm);
+}
+
 function runnerPrefixLength(tokens) {
   let start = 0;
   while (start < tokens.length && ENV_ASSIGNMENT_RE.test(tokens[start])) {
@@ -94,10 +145,10 @@ function runnerPrefixLength(tokens) {
   }
   const matches = (prefix) => prefix.every((word, k) => tokens[start + k] === word);
   if (tokens[start] === "go" && tokens[start + 1] === "test") {
-    return { kind: "go", end: start + 2 };
+    return { kind: "go", prefix: ["go", "test"], end: start + 2 };
   }
   const prefix = ALL_TESTS_WITHOUT_TARGETS.filter(matches).sort((x, y) => y.length - x.length)[0];
-  return prefix ? { kind: "all", end: start + prefix.length } : null;
+  return prefix ? { kind: "all", prefix, end: start + prefix.length } : null;
 }
 
 function droppedTokenIndexes(failed, passed) {
@@ -145,13 +196,12 @@ function segmentResolvedBy(failedSeg, passedSeg) {
   if (!dropped || dropped.length === 0 || dropped.some((index) => index < runner.end)) {
     return false;
   }
-  // A value right after a bare flag belongs to that flag, not to the target list.
   const isTarget = (tokens, index) =>
-    isPathTarget(tokens[index]) && !(index - 1 >= runner.end && /^-[^=]*$/.test(tokens[index - 1]) && tokens[index - 1] !== "--");
+    isPathTarget(tokens[index]) && !(index - 1 >= runner.end && RUNNER_VALUE_FLAGS.has(tokens[index - 1]));
   const droppedOnlyTargets = dropped.every((index) =>
     failed[index] === "--"
       ? failed.slice(index + 1).every((_, k) => dropped.includes(index + 1 + k))
-      : isTarget(failed, index),
+      : isTarget(failed, index) && isDefaultDiscoverableTestTarget(failed[index], runner.prefix),
   );
   return droppedOnlyTargets && !passed.some((_, index) => index >= runner.end && isTarget(passed, index));
 }

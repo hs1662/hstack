@@ -155,9 +155,15 @@ const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--n
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const SYSTEM_PATH_ENTRY_RE = /^(?:\$PATH|\$\{PATH\}|\/usr(?:\/local)?\/s?bin|\/s?bin)$/;
 
-// Assignments that change which binary or code runs: PATH with a non-system dir, preload and startup hooks, GIT_*.
+const NPM_BLOCKED_CONFIG_ENV_RE =
+  /^(?:npm|pnpm|yarn)_config_(?:if[-_]present|script[-_]shell|userconfig|globalconfig|prefix|dir|cwd|ignore[-_]scripts|dry[-_]run)=/i;
+
+// Assignments that change which binary or code runs: PATH with a non-system dir, preload and startup hooks, GIT_*, and unsafe package-manager env configs.
 function isExecHijackAssign(tok) {
   if (/^(?:GIT_[A-Za-z0-9_]*|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/.test(tok)) {
+    return true;
+  }
+  if (NPM_BLOCKED_CONFIG_ENV_RE.test(tok)) {
     return true;
   }
   return tok.startsWith("PATH=") && tok.slice(5).split(":").some((entry) => !SYSTEM_PATH_ENTRY_RE.test(entry));
@@ -542,8 +548,57 @@ function inlineInterpreterBody(bin, args) {
     return args.find((arg) => !arg.startsWith("-")) === "eval" ? "" : null;
   }
   const flagRe = INLINE_CODE_FLAG_RE[bin];
-  const end = args.indexOf("--");
-  return flagRe && (end === -1 ? args : args.slice(0, end)).some((arg) => flagRe.test(arg)) ? "" : null;
+  if (!flagRe) {
+    return null;
+  }
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--") {
+      break;
+    }
+    if (flagRe.test(arg)) {
+      return "";
+    }
+    if (arg.startsWith("-")) {
+      if (NODE_TSX_VALUE_FLAGS.has(arg)) {
+        i += 1;
+      }
+      continue;
+    }
+    break;
+  }
+  return null;
+}
+
+function isCommandProbeInvocation(tokens) {
+  let idx = 0;
+  while (idx < tokens.length && (tokens[idx] === "!" || tokens[idx] === "(" || ENV_ASSIGN_RE.test(tokens[idx]))) {
+    if (isExecHijackAssign(tokens[idx])) {
+      return false;
+    }
+    idx += 1;
+  }
+  if (tokens[idx] !== "command") {
+    return false;
+  }
+  idx += 1;
+  let seenProbe = false;
+  while (idx < tokens.length) {
+    const arg = tokens[idx];
+    if (arg === "--") {
+      return seenProbe && idx + 1 < tokens.length;
+    }
+    if (!arg.startsWith("-")) {
+      return seenProbe;
+    }
+    if (/^-[pvV]+$/.test(arg)) {
+      seenProbe ||= /[vV]/.test(arg);
+      idx += 1;
+      continue;
+    }
+    return false;
+  }
+  return false;
 }
 
 // The index of the binary after leading assignments and wrappers (sudo, env, time…), or -1 when one of them
@@ -571,6 +626,16 @@ function skipCommandPrefix(tokens) {
         if (arg === "--") {
           idx += 1;
           break;
+        }
+        if (tok === "command") {
+          if (arg === "-p") {
+            idx += 1;
+            continue;
+          }
+          if (!arg.startsWith("-")) {
+            break;
+          }
+          return -1;
         }
         if (valueFlags && valueFlags.has(arg)) {
           idx += 2;
@@ -601,6 +666,9 @@ function classifySingleSegment(segment) {
   }
   const hasFileRedirect = hasUnquotedFileRedirection(cleaned);
   const tokens = tokenizeSegment(cleaned);
+  if (isCommandProbeInvocation(tokens)) {
+    return hasFileRedirect ? "other" : "read_only";
+  }
   const idx = skipCommandPrefix(tokens);
   if (idx === -1) {
     return "other";
@@ -866,6 +934,26 @@ function applyPipefailState({ words }, current) {
   return state;
 }
 
+function hasLeadingVersionProbe(bin, args) {
+  if (!VERIFICATION_BINARIES.has(bin) && !PACKAGE_EXEC_VERIFICATION_TOOLS.has(bin)) {
+    return false;
+  }
+  const verboseDashVAllowed =
+    bin === "pytest" || bin === "go" || bin === "cargo" || bin === "make" || bin === "ctest" || bin === "rspec";
+  const sepIdx = args.indexOf("--");
+  const head = sepIdx === -1 ? args : args.slice(0, sepIdx);
+  for (let i = 0; i < head.length; i += 1) {
+    const arg = head[i];
+    if (arg === "--version" || arg === "-V" || arg === "--help" || arg === "-h" || (arg === "-v" && !verboseDashVAllowed)) {
+      return true;
+    }
+    if ((bin === "node" || bin === "tsx") && NODE_TSX_VALUE_FLAGS.has(arg)) {
+      i += 1;
+    }
+  }
+  return false;
+}
+
 function isNodeOrTsxVerification(bin, args) {
   if (inlineInterpreterBody(bin, args) !== null) {
     return false;
@@ -874,6 +962,9 @@ function isNodeOrTsxVerification(bin, args) {
     const arg = args[i];
     if (arg === "--") {
       return NODE_TEST_FILE_RE.test(args[i + 1] ?? "");
+    }
+    if (isVersionProbe(bin, arg)) {
+      return false;
     }
     if (arg === "--test") {
       return true;
@@ -1012,6 +1103,9 @@ function isRunnerCommand({ words, redirects }) {
   if (args.length === 1 && isVersionProbe(baseBin, args[0])) {
     return false;
   }
+  if (baseBin !== "node" && baseBin !== "tsx" && !SHELL_INTERPRETERS.has(baseBin) && hasLeadingVersionProbe(baseBin, args)) {
+    return false;
+  }
   // `node <script>` runs any program, so node counts only for its test runner or a test file.
   if (baseBin === "node" && !isNodeOrTsxVerification("node", args)) {
     return false;
@@ -1055,19 +1149,19 @@ export function commandHasPrepSideEffect(commandLine) {
   }
   for (let i = 0; i < cmds.length; i += 1) {
     const cmd = cmds[i];
-    if (cmd.op === "|" || cmd.op === "") {
-      const idx = skipCommandPrefix(cmd.words);
-      if (idx !== -1 && idx < cmd.words.length) {
-        const baseBin = posix.basename(toPosix(cmd.words[idx]));
-        const body = inlineInterpreterBody(baseBin, cmd.words.slice(idx + 1));
-        if (body && commandHasPrepSideEffect(body)) {
-          return true;
-        }
-      }
-      return false;
-    }
-    if (isChainPrepCommand(cmd)) {
+    if (cmd.op !== "|" && cmd.op !== "" && isChainPrepCommand(cmd)) {
       return true;
+    }
+    const idx = skipCommandPrefix(cmd.words);
+    if (idx !== -1 && idx < cmd.words.length) {
+      const baseBin = posix.basename(toPosix(cmd.words[idx]));
+      const body = inlineInterpreterBody(baseBin, cmd.words.slice(idx + 1));
+      if (body && commandHasPrepSideEffect(body)) {
+        return true;
+      }
+    }
+    if (cmd.op === "|" || cmd.op === "") {
+      return false;
     }
   }
   return false;
@@ -2722,18 +2816,25 @@ export function snapshotWorkingTree(cwd) {
     if (entry.length < 4) {
       continue;
     }
-    if ("RC".includes(entry[0]) || "RC".includes(entry[1])) {
+    const isRename = entry[0] === "R" || entry[1] === "R";
+    const isCopy = entry[0] === "C" || entry[1] === "C";
+    let origPath = "";
+    if (isRename || isCopy) {
+      origPath = trackedTokens[i + 1] ?? "";
       i += 1;
     }
-    const relPath = entry.slice(3);
-    if (isExemptDocOrAssetPath(relPath)) {
-      continue;
+    const destPath = entry.slice(3);
+    const candidates = isRename && origPath && origPath !== destPath ? [origPath, destPath] : [destPath];
+    for (const relPath of candidates) {
+      if (isExemptDocOrAssetPath(relPath)) {
+        continue;
+      }
+      trackedCodeCount += 1;
+      if (trackedCodeCount > SNAPSHOT_MAX_FILES) {
+        return null;
+      }
+      files[relPath] = statSnapshotFile(gitRoot, relPath);
     }
-    trackedCodeCount += 1;
-    if (trackedCodeCount > SNAPSHOT_MAX_FILES) {
-      return null;
-    }
-    files[relPath] = statSnapshotFile(gitRoot, relPath);
   }
 
   let untrackedFiles = {};

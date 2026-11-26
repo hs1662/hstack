@@ -558,11 +558,31 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     }
     return true;
   }
-  // A committed file is clean now, so its signature comes from disk; one that still matches the snapshot was
-  // dirty before the turn and only committed, not edited.
-  const changedSince = (baseMap, curMap, committed, relPath) => {
-    const now = relPath in curMap ? curMap[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
-    return relPath in baseMap ? !sameFileSignature(baseMap[relPath], now) : now !== undefined;
+  const statFreshnessMs = (gitRoot, relPath) => {
+    try {
+      const st = statSync(join(gitRoot, relPath));
+      return Math.max(st.mtimeMs, st.ctimeMs);
+    } catch {
+      return null;
+    }
+  };
+  const signatureIn = (snapObj, relPath) => {
+    if (!snapObj) {
+      return undefined;
+    }
+    if (relPath in snapObj.files) {
+      return snapObj.files[relPath];
+    }
+    if (snapObj.untrackedFiles && relPath in snapObj.untrackedFiles) {
+      return snapObj.untrackedFiles[relPath];
+    }
+    return undefined;
+  };
+  const changedBetween = (fromSnap, committed, relPath) => {
+    const before = signatureIn(fromSnap, relPath);
+    const fromCurrent = signatureIn(current, relPath);
+    const now = fromCurrent !== undefined ? fromCurrent : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
+    return before !== undefined ? !sameFileSignature(before, now) : now !== undefined;
   };
   const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
@@ -580,29 +600,38 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       baseline.gate.untrackedFiles &&
       current.untrackedFiles,
   );
-  const trackedKeys = new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn]);
-  const untrackedKeys = canDiffTurnUntracked
+
+  const trackedKeySet = new Set([
+    ...Object.keys(current.files),
+    ...Object.keys(baseline.files),
+    ...Object.keys(baseline.gate?.files ?? {}),
+    ...sinceTurn,
+    ...sinceGate,
+  ]);
+  const turnUntrackedKeySet = canDiffTurnUntracked
     ? new Set([...Object.keys(current.untrackedFiles), ...Object.keys(baseline.untrackedFiles)])
     : new Set();
+  const gateUntrackedKeySet = canDiffGateUntracked
+    ? new Set([...Object.keys(current.untrackedFiles), ...Object.keys(baseline.gate.untrackedFiles)])
+    : new Set();
+  const allDiffKeys = new Set([...trackedKeySet, ...turnUntrackedKeySet, ...gateUntrackedKeySet]);
 
-  const recordDiffPaths = (keys, baseMap, curMap, gateMap, canDiffGate) => {
-    for (const relPath of keys) {
-      if (!changedSince(baseMap, curMap, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
-        continue;
-      }
-      if (postGateShell.length > 0 && canDiffGate && changedSince(gateMap, curMap, sinceGate, relPath)) {
-        if (postGateWriter || !toolWroteAfterGate(relPath)) {
-          record(relPath, datingStep(postGateShell));
-        }
-      } else if (!preGateKeepsToolDate(relPath)) {
-        record(relPath, preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex);
-      }
+  for (const relPath of allDiffKeys) {
+    if (isExemptDocOrAssetPath(relPath)) {
+      continue;
     }
-  };
-
-  recordDiffPaths(trackedKeys, baseline.files, current.files, baseline.gate?.files, Boolean(baseline.gate));
-  if (canDiffTurnUntracked) {
-    recordDiffPaths(untrackedKeys, baseline.untrackedFiles, current.untrackedFiles, baseline.gate?.untrackedFiles, canDiffGateUntracked);
+    const isTrackedCandidate = trackedKeySet.has(relPath);
+    const canCheckGate = postGateShell.length > 0 && baseline.gate && (isTrackedCandidate || gateUntrackedKeySet.has(relPath));
+    if (canCheckGate && changedBetween(baseline.gate, sinceGate, relPath)) {
+      if (postGateWriter || !toolWroteAfterGate(relPath)) {
+        record(relPath, datingStep(postGateShell));
+      }
+      continue;
+    }
+    const canCheckTurn = isTrackedCandidate || turnUntrackedKeySet.has(relPath);
+    if (canCheckTurn && changedBetween(baseline, sinceTurn, relPath) && !preGateKeepsToolDate(relPath)) {
+      record(relPath, preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex);
+    }
   }
 
   const untrackedIncomplete = Boolean(
@@ -610,15 +639,15 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   );
   if (untrackedIncomplete && riskyShellExecs.length > 0) {
     const baseMs = postGateWriter && baseline.gate?.capturedAtMs ? baseline.gate.capturedAtMs : baseline.capturedAtMs;
-    const cutoffMs = Number.isFinite(baseMs) ? baseMs - 1000 : 0;
+    const cutoffMs = Number.isFinite(baseMs) ? baseMs : 0;
     const targetStep = postGateWriter ? datingStep(postGateShell) : riskyStep;
     const markRecentUntracked = (step) => {
       for (const relPath of dirtyFiles) {
         if (isExemptDocOrAssetPath(relPath) || relPath in baseline.files || relPath in current.files) {
           continue;
         }
-        const sig = statSignature(current.gitRoot, relPath);
-        if (sig && sig[0] >= cutoffMs && !keepsToolDate(relPath)) {
+        const freshMs = statFreshnessMs(current.gitRoot, relPath);
+        if (freshMs !== null && freshMs >= cutoffMs && !keepsToolDate(relPath)) {
           record(relPath, step);
         }
       }
