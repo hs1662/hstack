@@ -58,11 +58,22 @@ export function isErrorQuote(text) {
 
 // Code syntax a prose sentence does not have: a leading comment marker, a trailing code
 // delimiter, or an arrow/assignment. Prose and Hangul lines in an unclosed fence or indented block stay analyzed.
-const CODE_LIKE_LINE_RE = /^[ \t]*(?:\/\/|\/\*|#|--|<!--)|[;{}()[\],][ \t]*$|=>|[^=!<>]=[^=]/;
+// A trailing delimiter alone does not make an English sentence code, so prose ending in `,` `)` `;` stays analyzed.
+const CODE_LIKE_LINE_RE = /^[ \t]*(?:\/\/|\/\*|#|--|<!--)|=>|[^=!<>]=[^=]/;
+const TRAILING_CODE_DELIMITER_RE = /[;{}()[\],][ \t]*$/;
 const INDENTED_CODE_LINE_RE = /^(?: {4}|\t)/;
+const MIN_PROSE_LINE_WORDS = 5;
+
+function isEnglishProseLine(line) {
+  const words = englishWords(line);
+  return words.length >= MIN_PROSE_LINE_WORDS && hasEnglishProseFunctionWord(words) && hasEnglishSentenceFiniteWord(words);
+}
 
 function isCodeLikeLine(line) {
-  return CODE_LIKE_LINE_RE.test(line) && !HAS_HANGUL_RE.test(line);
+  if (HAS_HANGUL_RE.test(line)) {
+    return false;
+  }
+  return CODE_LIKE_LINE_RE.test(line) || (TRAILING_CODE_DELIMITER_RE.test(line) && !isEnglishProseLine(line));
 }
 
 export function stripFencedCodeBlocks(text) {
