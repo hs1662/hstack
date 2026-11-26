@@ -504,8 +504,87 @@ describe("audit-report parser and aggregator", () => {
     const table = formatAuditReportTable(summary);
     assert.ok(table.includes("[3] R1~R9 규칙 위반·경고 분포"));
     assert.ok(table.includes("[7] 적대적 사전 검토(Preflight) 현황"));
-    assert.ok(table.includes("총 사전 검토: 3건 | 표결 완료율: 66.7% (2/3)"));
+    assert.ok(table.includes("총 사전 검토: 3건"));
+    assert.ok(table.includes("표결 완료율: 66.7% (2/3)"));
     assert.ok(table.includes("R9_PREFLIGHT_UNVOTED: 차단=1건, 경고=1건"));
+    assert.ok(table.includes("[8] 완전 자율 제어(Autonomy) 현황"));
+    assert.ok(table.includes("총 자율 이벤트: 0건"));
+  });
+
+  it("summarizes autonomy_event kinds, preflight auto/manual modes, and stays backward compatible with v0.1.0 records", () => {
+    const parsed = parseAuditLines(
+      [
+        JSON.stringify({
+          ts: "2026-11-26T10:00:00.000Z",
+          eventType: "autonomy_event",
+          kind: "prompt_route",
+          conversationId: "conv-auto-1",
+          turnStartStepIndex: 0,
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T10:00:05.000Z",
+          eventType: "autonomy_event",
+          kind: "circuit_breaker",
+          conversationId: "conv-auto-1",
+          turnStartStepIndex: 0,
+          reasons: ["safety_primitive_removed", "sensitive_mass_delete"],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T10:01:00.000Z",
+          eventType: "preflight_complete",
+          conversationId: "conv-auto-1",
+          turnStartStepIndex: 0,
+          mode: "auto",
+          verdict: "PROCEED",
+          voted: false,
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T10:02:00.000Z",
+          eventType: "gate_verify",
+          conversationId: "conv-auto-1",
+          turnStartStepIndex: 0,
+          attemptInTurn: 1,
+          sessionRole: "main",
+          verdict: "PASS",
+          preflight: { used: true, verdict: "PROCEED", voted: false, mode: "auto" },
+          blockedRules: [],
+          warnedRules: [],
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T10:03:00.000Z",
+          eventType: "autonomy_event",
+          kind: "auto_handoff",
+          conversationId: "conv-auto-2",
+          turnStartStepIndex: 0,
+        }),
+        JSON.stringify({
+          ts: "2026-11-26T10:04:00.000Z",
+          eventType: "preflight_complete",
+          conversationId: "conv-man-1",
+          turnStartStepIndex: 0,
+          mode: "manual",
+          verdict: "RETHINK",
+          voted: true,
+        }),
+      ].join("\n"),
+    );
+
+    const summary = summarizeAuditRecords(parsed, { filePath: "/tmp/audit.jsonl", fileExists: true });
+    assert.deepEqual(summary.preflight.modes, { auto: 1, manual: 1, unknown: 0 });
+    assert.equal(summary.autonomy.totalEvents, 3);
+    assert.equal(summary.autonomy.circuitBreakerCount, 1);
+    assert.equal(summary.autonomy.promptRouteCount, 1);
+    assert.equal(summary.autonomy.autoHandoffCount, 1);
+    assert.deepEqual(summary.autonomy.circuitBreakerReasons, {
+      safety_primitive_removed: 1,
+      sensitive_mass_delete: 1,
+    });
+
+    const table = formatAuditReportTable(summary);
+    assert.ok(table.includes("mode: auto=1, manual=1"));
+    assert.ok(table.includes("[8] 완전 자율 제어(Autonomy) 현황"));
+    assert.ok(table.includes("서킷브레이커=1건, 프롬프트 라우팅=1건, 자가치유 위임=1건"));
+    assert.ok(table.includes("safety_primitive_removed=1"));
   });
 });
 

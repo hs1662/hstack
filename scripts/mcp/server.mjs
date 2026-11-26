@@ -16,7 +16,7 @@ import { resolveAuditEscalationMode } from "../governance/risk-classifier.mjs";
 import { isDirectExecution } from "../hook-io.mjs";
 
 const PROTOCOL_VERSION_DEFAULT = "2024-11-05";
-const SERVER_INFO = { name: "hstack-gate", version: "0.1.0" };
+const SERVER_INFO = { name: "hstack-gate", version: "0.1.1" };
 const PUBLIC_ARG_KEYS = new Set([
   "modified_files",
   "inspected_files",
@@ -300,7 +300,7 @@ export function createMcpServerHandler(options = {}) {
           schemaRegister,
           verdict: decision.verdict,
           riskTier: decision.risk.tier,
-          preflight: decision.preflight,
+          preflight: { ...decision.preflight, mode: decision.preflightMode ?? "none" },
           blockedRules: decision.blockedRules,
           warnedRules: decision.warnedRules,
           metrics: {
@@ -369,7 +369,7 @@ export function createMcpServerHandler(options = {}) {
         riskTier: decision.risk.tier,
         riskReasons: decision.risk.reasons,
         auditVerdict: decision.auditVerdict,
-        preflight: decision.preflight,
+        preflight: { ...decision.preflight, mode: decision.preflightMode ?? "none" },
         blockedRules: decision.blockedRules,
         warnedRules: decision.warnedRules,
         metrics: {

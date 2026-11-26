@@ -155,6 +155,7 @@ function normalizeEventType(record) {
 
   if (raw === "gate_verify") return "gate_verify";
   if (raw === "preflight_complete") return "preflight_complete";
+  if (raw === "autonomy_event") return "autonomy_event";
   if (raw === "handoff_save") return "handoff_save";
   if (raw === "handoff_load") return "handoff_load";
   if (raw === "post_telemetry" || raw === "post_invocation") return "post_telemetry";
@@ -414,11 +415,19 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
   const eventCounts = {
     gate_verify: 0,
     preflight_complete: 0,
+    autonomy_event: 0,
     handoff_save: 0,
     handoff_load: 0,
     post_telemetry: 0,
     stop_decision: 0,
     other: 0,
+  };
+  const autonomySummary = {
+    totalEvents: 0,
+    circuitBreakerCount: 0,
+    circuitBreakerReasons: new Map(),
+    promptRouteCount: 0,
+    autoHandoffCount: 0,
   };
   const verdictsMap = new Map(VERDICT_ORDER.map((v) => [v, 0]));
   const sessionRoles = { main: 0, auditor: 0, worker: 0, challenger: 0, unknown: 0 };
@@ -453,16 +462,20 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
     syntheticPreflightSeq += 1;
     return `__anon_${syntheticPreflightSeq}`;
   };
-  const recordPreflightTurn = (rec, { verdict, voted }) => {
+  const recordPreflightTurn = (rec, { verdict, voted, mode }) => {
     const key = makePreflightTurnKey(rec);
     const normVerdict = PREFLIGHT_VERDICT_KEYS.includes(verdict) ? verdict : "MISSING_VERDICT";
+    const normMode = mode === "auto" || mode === "manual" ? mode : "unknown";
     const existing = preflightTurnMap.get(key);
     if (!existing) {
-      preflightTurnMap.set(key, { verdict: normVerdict, voted: Boolean(voted) });
+      preflightTurnMap.set(key, { verdict: normVerdict, voted: Boolean(voted), mode: normMode });
       return;
     }
     if (normVerdict !== "MISSING_VERDICT" || existing.verdict === "MISSING_VERDICT") {
       existing.verdict = normVerdict;
+    }
+    if (normMode !== "unknown" && existing.mode === "unknown") {
+      existing.mode = normMode;
     }
     if (voted === true) {
       existing.voted = true;
@@ -521,7 +534,31 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
       recordPreflightTurn(rec, {
         verdict: typeof rec.verdict === "string" ? rec.verdict : "MISSING_VERDICT",
         voted: rec.voted === true,
+        mode: typeof rec.mode === "string" ? rec.mode : "unknown",
       });
+      continue;
+    }
+
+    if (ev === "autonomy_event") {
+      autonomySummary.totalEvents += 1;
+      const kind = typeof rec.kind === "string" ? rec.kind.trim() : "";
+      if (kind === "circuit_breaker") {
+        autonomySummary.circuitBreakerCount += 1;
+        if (Array.isArray(rec.reasons)) {
+          for (const reason of rec.reasons) {
+            if (typeof reason === "string" && reason.length > 0) {
+              autonomySummary.circuitBreakerReasons.set(
+                reason,
+                (autonomySummary.circuitBreakerReasons.get(reason) ?? 0) + 1,
+              );
+            }
+          }
+        }
+      } else if (kind === "prompt_route") {
+        autonomySummary.promptRouteCount += 1;
+      } else if (kind === "auto_handoff") {
+        autonomySummary.autoHandoffCount += 1;
+      }
       continue;
     }
 
@@ -533,6 +570,7 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
       recordPreflightTurn(rec, {
         verdict: typeof rec.preflight.verdict === "string" ? rec.preflight.verdict : "MISSING_VERDICT",
         voted: rec.preflight.voted === true,
+        mode: typeof rec.preflight.mode === "string" ? rec.preflight.mode : "unknown",
       });
     }
 
@@ -672,12 +710,20 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
     ERROR: 0,
     MISSING_VERDICT: 0,
   };
+  const preflightModeCounts = { auto: 0, manual: 0, unknown: 0 };
   let preflightVotedCount = 0;
   for (const item of preflightTurnMap.values()) {
     if (Object.hasOwn(preflightVerdictCounts, item.verdict)) {
       preflightVerdictCounts[item.verdict] += 1;
     } else {
       preflightVerdictCounts.MISSING_VERDICT += 1;
+    }
+    if (item.mode === "auto") {
+      preflightModeCounts.auto += 1;
+    } else if (item.mode === "manual") {
+      preflightModeCounts.manual += 1;
+    } else {
+      preflightModeCounts.unknown += 1;
     }
     if (item.voted) {
       preflightVotedCount += 1;
@@ -748,10 +794,18 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
     preflight: {
       totalChallenges: preflightTotal,
       verdicts: preflightVerdictCounts,
+      modes: preflightModeCounts,
       votedCount: preflightVotedCount,
       voteCompletionRate: preflightTotal > 0 ? round1((preflightVotedCount / preflightTotal) * 100) : 0,
       r9BlockedCount: r9RuleEntry.blocked,
       r9WarnedCount: r9RuleEntry.warned,
+    },
+    autonomy: {
+      totalEvents: autonomySummary.totalEvents,
+      circuitBreakerCount: autonomySummary.circuitBreakerCount,
+      circuitBreakerReasons: mapToPlainCounts(autonomySummary.circuitBreakerReasons),
+      promptRouteCount: autonomySummary.promptRouteCount,
+      autoHandoffCount: autonomySummary.autoHandoffCount,
     },
   };
 }
@@ -761,10 +815,18 @@ export function formatAuditReportTable(summary) {
   const preflight = summary.preflight ?? {
     totalChallenges: 0,
     verdicts: { PROCEED: 0, CONDITIONAL: 0, RETHINK: 0, ERROR: 0, MISSING_VERDICT: 0 },
+    modes: { auto: 0, manual: 0, unknown: 0 },
     votedCount: 0,
     voteCompletionRate: 0,
     r9BlockedCount: 0,
     r9WarnedCount: 0,
+  };
+  const autonomy = summary.autonomy ?? {
+    totalEvents: 0,
+    circuitBreakerCount: 0,
+    circuitBreakerReasons: {},
+    promptRouteCount: 0,
+    autoHandoffCount: 0,
   };
   const rangeLabel =
     meta.dateRange.from && meta.dateRange.to
@@ -864,14 +926,27 @@ export function formatAuditReportTable(summary) {
   lines.push("");
 
   lines.push("[7] 적대적 사전 검토(Preflight) 현황");
+  const preflightModes = preflight.modes ?? { auto: 0, manual: 0, unknown: 0 };
   lines.push(
-    `- 총 사전 검토: ${preflight.totalChallenges}건 | 표결 완료율: ${preflight.totalChallenges > 0 ? `${preflight.voteCompletionRate.toFixed(1)}% (${preflight.votedCount}/${preflight.totalChallenges})` : "-"}`,
+    `- 총 사전 검토: ${preflight.totalChallenges}건 (mode: auto=${preflightModes.auto}, manual=${preflightModes.manual}${preflightModes.unknown > 0 ? `, 미기재=${preflightModes.unknown}` : ""}) | 표결 완료율: ${preflight.totalChallenges > 0 ? `${preflight.voteCompletionRate.toFixed(1)}% (${preflight.votedCount}/${preflight.totalChallenges})` : "-"}`,
   );
   lines.push(
     `- 판정 분포: PROCEED=${preflight.verdicts.PROCEED}, CONDITIONAL=${preflight.verdicts.CONDITIONAL}, RETHINK=${preflight.verdicts.RETHINK}, ERROR=${preflight.verdicts.ERROR}, MISSING_VERDICT=${preflight.verdicts.MISSING_VERDICT}`,
   );
   lines.push(
     `- R9_PREFLIGHT_UNVOTED: 차단=${preflight.r9BlockedCount}건, 경고=${preflight.r9WarnedCount}건`,
+  );
+  lines.push("");
+
+  lines.push("[8] 완전 자율 제어(Autonomy) 현황");
+  lines.push(
+    `- 총 자율 이벤트: ${autonomy.totalEvents}건 | 서킷브레이커=${autonomy.circuitBreakerCount}건, 프롬프트 라우팅=${autonomy.promptRouteCount}건, 자가치유 위임=${autonomy.autoHandoffCount}건`,
+  );
+  const cbReasonParts = Object.entries(autonomy.circuitBreakerReasons ?? {}).map(
+    ([reason, count]) => `${reason}=${count}`,
+  );
+  lines.push(
+    `- 서킷브레이커 사유 분포: ${cbReasonParts.length > 0 ? cbReasonParts.join(", ") : "없음"}`,
   );
 
   return lines.join("\n");

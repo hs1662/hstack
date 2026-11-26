@@ -828,7 +828,7 @@ describe("pre-tool-gate.mjs, stop.mjs, and post-invocation.mjs challenger integr
       .split("\n")
       .map((line) => JSON.parse(line));
     assert.equal(records.length, 1);
-    assert.deepEqual(records[0].preflight, { used: true, verdict: "RETHINK", voted: false });
+    assert.deepEqual(records[0].preflight, { used: true, verdict: "RETHINK", voted: false, mode: "manual" });
     assert.deepEqual(records[0].blockedRules, ["R9_PREFLIGHT_UNVOTED"]);
 
     const challengerMd = readFileSync("agents/hstack-challenger.md", "utf8");
