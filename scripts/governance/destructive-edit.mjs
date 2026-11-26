@@ -1,7 +1,7 @@
 import { posix } from "node:path";
 import { resolveAutonomyThresholds } from "./config.mjs";
 import { DEFAULT_AUTONOMY_THRESHOLDS, isExemptDocOrAssetPath } from "./constants.mjs";
-import { normalizeWorkspacePath } from "./fact-ledger.mjs";
+import { asArray, asObject, normalizeWorkspacePath, pickString } from "./fact-ledger.mjs";
 import { isSensitiveFilePath } from "./risk-classifier.mjs";
 
 const TEST_FILE_PATH_RE = /(?:^|\/)(?:test|tests|__tests__)(?:\/|$)|\.(?:test|spec)\.[^/]+$/i;
@@ -12,12 +12,30 @@ const FILE_LOCK_OPEN_WX_RE = /\bopenSync\s*\([^()\n]{0,120}["']wx["']/g;
 const FILE_LOCK_SYMBOL_RE = /\b(?:flock|acquireLock|withLock|withFileLock|withSessionLock|Mutex|renameSync)\b/g;
 const AUTH_VERIFY_CALL_RE =
   /\b(?:verifyToken|verifySessionToken|authorize|checkPermission|requireAuth|verifyCsrf|csrfToken|validateCsrf)\b/gi;
-const EXPIRY_CHECK_LEFT_RE = /\b(?:expiresAt|expires_at|isExpired|exp)\b[^\n;]{0,60}(?:<=?|>=?|===?|!==?)/gi;
+const EXPIRY_CHECK_LEFT_RE = /\b(?:expiresAt|expires_at|isExpired|exp)\b[ \t]*(?:<=?|>=?|===?|!==?)/gi;
 const EXPIRY_CHECK_RIGHT_RE = /(?:Date\.now\(\)|now)\s*(?:<=?|>=?)\s*[^\n;]{0,40}\b(?:expiresAt|expires_at|exp)\b/gi;
 const EMPTY_TOKEN_GUARD_RE =
   /if\s*\(\s*!(?:token|signature|sig|secret|authHeader|csrf)\b|\b(?:token|signature|secret)\.length\s*===?\s*0\b/gi;
 const LEGACY_TOKEN_RE = /(?:legacy|deprecated)/i;
 const BRANCH_CONTEXT_RE = /(?:\b(?:if|else|case|switch|return|fallback)\b|[?]|\|\||\?\?)/i;
+const TRY_BLOCK_RE = /\btry\s*\{/g;
+const CATCH_BLOCK_RE = /\}\s*catch\b/g;
+const ALT_ERROR_HANDLER_RE = /\.catch\s*\(|\btry\s*\{/;
+const PATH_ARG_KEYS = ["Path", "path", "TargetFile", "target_file", "AbsolutePath", "absolute_path", "file_path"];
+
+function stripCommentsOnly(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    return "";
+  }
+  return text
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/^[ \t]*#[^\n]*/gm, "");
+}
+
+function stripCommentsAndWhitespace(text) {
+  return stripCommentsOnly(text).replace(/\s+/g, "");
+}
 
 function countLegacyBranchLines(text) {
   if (typeof text !== "string" || text.length === 0) {
@@ -25,60 +43,11 @@ function countLegacyBranchLines(text) {
   }
   let count = 0;
   for (const line of text.split(/\r?\n/)) {
-    if (LEGACY_TOKEN_RE.test(line) && (BRANCH_CONTEXT_RE.test(line) || /\bfallback\b|Fallback/i.test(line))) {
+    if (LEGACY_TOKEN_RE.test(line) && BRANCH_CONTEXT_RE.test(line)) {
       count += 1;
     }
   }
   return count;
-}
-const TRY_BLOCK_RE = /\btry\s*\{/g;
-const CATCH_BLOCK_RE = /\}\s*catch\b/g;
-const ALT_ERROR_HANDLER_RE = /\.catch\s*\(|\btry\s*\{/;
-
-function unwrapSerialized(value, depth = 0) {
-  if (typeof value !== "string" || depth >= 2) {
-    return value;
-  }
-  const trimmed = value.trim();
-  const first = trimmed.charAt(0);
-  if (first !== "{" && first !== "[" && first !== '"') {
-    return value;
-  }
-  try {
-    return unwrapSerialized(JSON.parse(trimmed), depth + 1);
-  } catch {
-    return value;
-  }
-}
-
-function asObject(value) {
-  const unwrapped = unwrapSerialized(value);
-  return unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped) ? unwrapped : null;
-}
-
-function asArray(value) {
-  const unwrapped = unwrapSerialized(value);
-  return Array.isArray(unwrapped) ? unwrapped : null;
-}
-
-function pickStr(obj, keys) {
-  for (const key of keys) {
-    if (typeof obj?.[key] === "string" && obj[key].length > 0) {
-      return obj[key];
-    }
-  }
-  return "";
-}
-
-function stripCommentsAndWhitespace(text) {
-  if (typeof text !== "string" || text.length === 0) {
-    return "";
-  }
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/[^\n]*/g, "")
-    .replace(/^\s*#[^\n]*/gm, "")
-    .replace(/\s+/g, "");
 }
 
 function countLines(text) {
@@ -127,9 +96,6 @@ function normalizePathSafe(rawPath, cwd, gitRoot) {
   return normalizeWorkspacePath(rawPath, cwd, gitRoot) || rawPath.trim().replace(/\\/g, "/");
 }
 
-/**
- * 다양한 쓰기 도구 입력 스키마를 파일 단위 편집 레코드 목록으로 정규화한다.
- */
 export function normalizeWriteOperations(toolName, toolInput, cwd = "", gitRoot = "") {
   const args = asObject(toolInput);
   if (!args || typeof toolName !== "string") {
@@ -137,7 +103,7 @@ export function normalizeWriteOperations(toolName, toolInput, cwd = "", gitRoot 
   }
 
   if (toolName === "edit_file") {
-    const rawPath = pickStr(args, ["Path", "path"]);
+    const rawPath = pickString(args, PATH_ARG_KEYS);
     const relPath = normalizePathSafe(rawPath, cwd, gitRoot);
     if (!relPath) return [];
     const target = typeof args.Target === "string" ? args.Target : typeof args.target === "string" ? args.target : "";
@@ -151,7 +117,7 @@ export function normalizeWriteOperations(toolName, toolInput, cwd = "", gitRoot 
   }
 
   if (toolName === "write_file" || toolName === "write_to_file") {
-    const rawPath = pickStr(args, ["Path", "path", "TargetFile", "target_file"]);
+    const rawPath = pickString(args, PATH_ARG_KEYS);
     const relPath = normalizePathSafe(rawPath, cwd, gitRoot);
     if (!relPath) return [];
     const content =
@@ -167,7 +133,7 @@ export function normalizeWriteOperations(toolName, toolInput, cwd = "", gitRoot 
   }
 
   if (toolName === "replace_file_content") {
-    const rawPath = pickStr(args, ["TargetFile", "target_file", "Path", "path"]);
+    const rawPath = pickString(args, PATH_ARG_KEYS);
     const relPath = normalizePathSafe(rawPath, cwd, gitRoot);
     if (!relPath) return [];
     const oldText = typeof args.TargetContent === "string" ? args.TargetContent : "";
@@ -176,7 +142,7 @@ export function normalizeWriteOperations(toolName, toolInput, cwd = "", gitRoot 
   }
 
   if (toolName === "multi_replace_file_content") {
-    const rawPath = pickStr(args, ["TargetFile", "target_file", "Path", "path"]);
+    const rawPath = pickString(args, PATH_ARG_KEYS);
     const relPath = normalizePathSafe(rawPath, cwd, gitRoot);
     if (!relPath) return [];
     const rawChunks = asArray(args.ReplacementChunks ?? args.replacementChunks) ?? [];
@@ -191,13 +157,13 @@ export function normalizeWriteOperations(toolName, toolInput, cwd = "", gitRoot 
   }
 
   if (MULTI_APPLY_TOOLS.has(toolName)) {
-    const baseCwd = pickStr(args, ["cwd"]) || cwd;
+    const baseCwd = pickString(args, ["cwd"]) || cwd;
     const rawEdits = asArray(args.edits) ?? [];
     const ops = [];
     for (const rawEdit of rawEdits) {
       const edit = asObject(rawEdit);
       if (!edit) continue;
-      const rawPath = pickStr(edit, ["path", "Path"]);
+      const rawPath = pickString(edit, PATH_ARG_KEYS);
       const relPath = normalizePathSafe(rawPath, baseCwd, gitRoot);
       if (!relPath) continue;
       if (typeof edit.create === "string") {
@@ -232,24 +198,26 @@ function detectRemovedPrimitives(oldText, newText) {
   if (typeof oldText !== "string" || typeof newText !== "string" || oldText.length === 0) {
     return [];
   }
+  const oldCode = stripCommentsOnly(oldText);
+  const newCode = stripCommentsOnly(newText);
   const removed = [];
 
-  if (countMatches(oldText, TIMING_SAFE_EQUAL_RE) > 0 && countMatches(newText, TIMING_SAFE_EQUAL_RE) === 0) {
+  if (countMatches(oldCode, TIMING_SAFE_EQUAL_RE) > 0 && countMatches(newCode, TIMING_SAFE_EQUAL_RE) === 0) {
     removed.push("timingSafeEqual");
   }
 
-  const oldLockCount = countMatches(oldText, FILE_LOCK_OPEN_WX_RE) + countMatches(oldText, FILE_LOCK_SYMBOL_RE);
-  const newLockCount = countMatches(newText, FILE_LOCK_OPEN_WX_RE) + countMatches(newText, FILE_LOCK_SYMBOL_RE);
+  const oldLockCount = countMatches(oldCode, FILE_LOCK_OPEN_WX_RE) + countMatches(oldCode, FILE_LOCK_SYMBOL_RE);
+  const newLockCount = countMatches(newCode, FILE_LOCK_OPEN_WX_RE) + countMatches(newCode, FILE_LOCK_SYMBOL_RE);
   if (oldLockCount > 0 && newLockCount === 0) {
     removed.push("file_lock_or_atomic");
   }
 
-  const oldAuthCalls = countMatches(oldText, AUTH_VERIFY_CALL_RE);
-  const newAuthCalls = countMatches(newText, AUTH_VERIFY_CALL_RE);
-  const oldExpiry = countMatches(oldText, EXPIRY_CHECK_LEFT_RE) + countMatches(oldText, EXPIRY_CHECK_RIGHT_RE);
-  const newExpiry = countMatches(newText, EXPIRY_CHECK_LEFT_RE) + countMatches(newText, EXPIRY_CHECK_RIGHT_RE);
-  const oldEmptyGuard = countMatches(oldText, EMPTY_TOKEN_GUARD_RE);
-  const newEmptyGuard = countMatches(newText, EMPTY_TOKEN_GUARD_RE);
+  const oldAuthCalls = countMatches(oldCode, AUTH_VERIFY_CALL_RE);
+  const newAuthCalls = countMatches(newCode, AUTH_VERIFY_CALL_RE);
+  const oldExpiry = countMatches(oldCode, EXPIRY_CHECK_LEFT_RE) + countMatches(oldCode, EXPIRY_CHECK_RIGHT_RE);
+  const newExpiry = countMatches(newCode, EXPIRY_CHECK_LEFT_RE) + countMatches(newCode, EXPIRY_CHECK_RIGHT_RE);
+  const oldEmptyGuard = countMatches(oldCode, EMPTY_TOKEN_GUARD_RE);
+  const newEmptyGuard = countMatches(newCode, EMPTY_TOKEN_GUARD_RE);
   if (
     (oldAuthCalls > 0 && newAuthCalls === 0) ||
     (oldExpiry > 0 && newExpiry === 0) ||
@@ -258,29 +226,36 @@ function detectRemovedPrimitives(oldText, newText) {
     removed.push("auth_or_expiry_guard");
   }
 
-  if (countLegacyBranchLines(oldText) > 0 && countLegacyBranchLines(newText) === 0) {
+  if (countLegacyBranchLines(oldCode) > 0 && countLegacyBranchLines(newCode) === 0) {
     removed.push("legacy_compat_fallback");
   }
 
-  const oldTryCount = countMatches(oldText, TRY_BLOCK_RE);
-  const oldCatchCount = countMatches(oldText, CATCH_BLOCK_RE);
-  const newCatchCount = countMatches(newText, CATCH_BLOCK_RE);
-  if (oldTryCount > 0 && oldCatchCount > 0 && newCatchCount === 0 && !ALT_ERROR_HANDLER_RE.test(newText)) {
+  const oldTryCount = countMatches(oldCode, TRY_BLOCK_RE);
+  const oldCatchCount = countMatches(oldCode, CATCH_BLOCK_RE);
+  const newCatchCount = countMatches(newCode, CATCH_BLOCK_RE);
+  if (oldTryCount > 0 && oldCatchCount > 0 && newCatchCount === 0 && !ALT_ERROR_HANDLER_RE.test(newCode)) {
     removed.push("try_catch_removed");
   }
 
   return removed;
 }
 
-function evaluateSingleOperation(op, existingContent, { config, deleteLinesThreshold }) {
+function evaluateSingleOperation(op, existingInfo, { config, deleteLinesThreshold }) {
+  const existingContent =
+    existingInfo && typeof existingInfo === "object" ? existingInfo.content : existingInfo;
+  const effectivePath =
+    existingInfo && typeof existingInfo === "object" && typeof existingInfo.effectivePath === "string" && existingInfo.effectivePath.length > 0
+      ? existingInfo.effectivePath
+      : op.targetPath;
+
   if (existingContent === null || existingContent === undefined) {
-    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [] };
+    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [], targetPath: effectivePath };
   }
-  if (isExemptDestructiveTarget(op.targetPath)) {
-    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [] };
+  if (isExemptDestructiveTarget(effectivePath)) {
+    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [], targetPath: effectivePath };
   }
   if (op.isAppend) {
-    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [] };
+    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [], targetPath: effectivePath };
   }
 
   let oldSample = "";
@@ -290,10 +265,14 @@ function evaluateSingleOperation(op, existingContent, { config, deleteLinesThres
   if (op.isFullOverwrite) {
     oldSample = typeof existingContent === "string" ? existingContent : "";
     newSample = typeof op.fullContent === "string" ? op.fullContent : "";
-    netDeletedLines = Math.max(0, countLines(oldSample) - countLines(newSample));
+    const existingLineCount =
+      existingInfo && typeof existingInfo === "object" && Number.isFinite(existingInfo.lineCount)
+        ? existingInfo.lineCount
+        : countLines(oldSample);
+    netDeletedLines = Math.max(0, existingLineCount - countLines(newSample));
   } else {
     if (!Array.isArray(op.hunks) || op.hunks.length === 0) {
-      return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [] };
+      return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [], targetPath: effectivePath };
     }
     const oldParts = [];
     const newParts = [];
@@ -307,7 +286,7 @@ function evaluateSingleOperation(op, existingContent, { config, deleteLinesThres
   }
 
   if (stripCommentsAndWhitespace(oldSample) === stripCommentsAndWhitespace(newSample)) {
-    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [] };
+    return { destructive: false, reasons: [], deletedLines: 0, removedPrimitives: [], targetPath: effectivePath };
   }
 
   const reasons = [];
@@ -316,9 +295,12 @@ function evaluateSingleOperation(op, existingContent, { config, deleteLinesThres
     reasons.push("safety_primitive_removed");
   }
 
-  if (isSensitiveFilePath(op.targetPath, config)) {
+  if (isSensitiveFilePath(effectivePath, config)) {
     if (op.isFullOverwrite) {
-      const oldLines = countLines(oldSample);
+      const oldLines =
+        existingInfo && typeof existingInfo === "object" && Number.isFinite(existingInfo.lineCount)
+          ? existingInfo.lineCount
+          : countLines(oldSample);
       const newLines = countLines(newSample);
       const shrunkByRatio = oldLines >= deleteLinesThreshold && newLines <= oldLines * 0.6;
       if (netDeletedLines >= deleteLinesThreshold || shrunkByRatio) {
@@ -334,6 +316,7 @@ function evaluateSingleOperation(op, existingContent, { config, deleteLinesThres
     reasons,
     deletedLines: netDeletedLines,
     removedPrimitives,
+    targetPath: effectivePath,
   };
 }
 
@@ -356,9 +339,6 @@ function lookupExistingContent(op, { existingFileContent, existingContentsByPath
   return existingFileContent;
 }
 
-/**
- * 쓰기 도구 호출이 안전장치 삭제나 민감 파일 대규모 삭제에 해당하는지 판정한다.
- */
 export function detectDestructiveEdit({
   toolName,
   toolInput,
@@ -398,7 +378,7 @@ export function detectDestructiveEdit({
     const res = evaluateSingleOperation(op, content, { config, deleteLinesThreshold });
     if (res.destructive) {
       if (!firstTargetPath) {
-        firstTargetPath = op.targetPath;
+        firstTargetPath = res.targetPath || op.targetPath;
       }
       if (res.deletedLines > maxDeletedLines) {
         maxDeletedLines = res.deletedLines;

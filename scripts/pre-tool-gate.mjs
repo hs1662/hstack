@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode, resolveAutonomyThresholds } from "./governance/config.mjs";
 import {
@@ -12,6 +12,7 @@ import {
   CHALLENGER_ROLE_LABEL,
   CHALLENGER_SESSION_MARKER,
   HANDOFF_TOOL_NAME,
+  PENDING_CHALLENGER_DENY_REASON,
   RETHINK_UNVOTED_DENY_REASON,
   SUBAGENT_TOOL_NAME,
   WORKER_AGENT_NAME,
@@ -21,13 +22,17 @@ import {
   buildCircuitBreakerDenyReason,
 } from "./governance/constants.mjs";
 import { detectDestructiveEdit, normalizeWriteOperations } from "./governance/destructive-edit.mjs";
-import { readFactLedger } from "./governance/fact-ledger.mjs";
-import { claimAutonomyTurnFlag, hasAutonomyTurnFlag } from "./governance/handoff-store.mjs";
+import { normalizeWorkspacePath, readFactLedger } from "./governance/fact-ledger.mjs";
+import {
+  claimAutonomyTurnFlag,
+  hasAutonomyTurnFlag,
+  resolveEffectiveConversationKey,
+} from "./governance/handoff-store.mjs";
 import {
   isDirectExecution,
   parseHookPayload,
+  pickPreferredTranscriptPath,
   resolvePluginDataDir,
-  resolveTranscriptCandidates,
   runHookCli,
 } from "./hook-io.mjs";
 
@@ -35,29 +40,33 @@ const HSTACK_MCP_TOOL_RE = /^mcp_hstack_.*$/;
 const GATE_TOOL_SUMMARY = "증거 기반 완료 검증 실행";
 const HANDOFF_TOOL_SUMMARY = "팩트 증류 컨텍스트 핸드오프 처리";
 const MAX_EXISTING_READ_BYTES = 2 * 1024 * 1024;
-
-function pickPreferredTranscriptPath(rawTranscriptPath) {
-  if (typeof rawTranscriptPath !== "string") {
-    return "";
-  }
-  const trimmed = rawTranscriptPath.trim();
-  if (trimmed.length === 0) {
-    return "";
-  }
-  for (const candidate of resolveTranscriptCandidates(trimmed)) {
-    try {
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return trimmed;
-}
-
 const CHALLENGER_GUIDANCE_LINE =
   "위 작업 경로의 실제 파일과 호출 관계를 직접 읽고 사용자의 유도 전제에 동조하지 않은 채 근거(`파일:줄`) 기반 반론과 지정 판정 태그로만 보고하라.";
+const INJECTED_TAIL_LINE_RE =
+  /^(?:작업 경로:|세션 기록 경로:|현재 턴 시작 스텝:|-\s*작업 디렉터리:|위 작업 경로의 실제 파일과 호출 관계를 직접 읽고)/;
+
+function resolveGitRootFast(startDir) {
+  if (typeof startDir !== "string" || startDir.trim().length === 0) {
+    return "";
+  }
+  let dir;
+  try {
+    dir = realpathSync(startDir.trim());
+  } catch {
+    dir = resolve(startDir.trim());
+  }
+  for (let i = 0; i < 20; i += 1) {
+    if (existsSync(resolve(dir, ".git"))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return "";
+}
 
 function classifyManagedAgent(rawTypeName) {
   if (typeof rawTypeName !== "string") {
@@ -84,9 +93,6 @@ function appendContextBlock(promptText, lines) {
   }
   return `${base}\n\n${block}`;
 }
-
-const INJECTED_TAIL_LINE_RE =
-  /^(?:작업 경로:|세션 기록 경로:|현재 턴 시작 스텝:|-\s*작업 디렉터리:|위 작업 경로의 실제 파일과 호출 관계를 직접 읽고)/;
 
 function hasTrailingMarkerBlock(promptText, marker) {
   const nonEmpty = promptText
@@ -235,19 +241,58 @@ function handleSubagentPreTool(toolCall, { cwd, transcriptPath }) {
   };
 }
 
-function readExistingContentsMap(toolName, toolInput, cwd, readTextFile) {
-  const ops = normalizeWriteOperations(toolName, toolInput, cwd);
+function readBoundedFileHead(absPath) {
+  let fd = null;
+  try {
+    fd = openSync(absPath, "r");
+    const size = fstatSync(fd).size;
+    const toRead = Math.min(size, MAX_EXISTING_READ_BYTES);
+    const buf = Buffer.allocUnsafe(toRead);
+    let offset = 0;
+    while (offset < toRead) {
+      const n = readSync(fd, buf, offset, toRead - offset, offset);
+      if (n <= 0) break;
+      offset += n;
+    }
+    const text = buf.subarray(0, offset).toString("utf8");
+    const avgLineCount = size > offset && offset > 0
+      ? Math.ceil((text.split("\n").length / offset) * size)
+      : text.split("\n").length;
+    return { content: text, lineCount: avgLineCount };
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+  }
+}
+
+function readExistingContentsMap(toolName, toolInput, cwd, gitRoot, readTextFile) {
+  const ops = normalizeWriteOperations(toolName, toolInput, cwd, gitRoot);
   const contents = new Map();
   for (const op of ops) {
     const base = op.baseCwd || cwd || process.cwd();
     const candidateAbs = op.rawPath ? resolve(base, op.rawPath) : resolve(base, op.targetPath);
+    let effectivePath = op.targetPath;
+    try {
+      if (existsSync(candidateAbs)) {
+        const realAbs = realpathSync(candidateAbs);
+        const normReal = normalizeWorkspacePath(realAbs, cwd, gitRoot);
+        if (normReal) {
+          effectivePath = normReal;
+        }
+      }
+    } catch {
+    }
     try {
       if (typeof readTextFile === "function") {
         const text = readTextFile(candidateAbs);
-        contents.set(op.targetPath, typeof text === "string" ? text : null);
+        contents.set(op.targetPath, typeof text === "string" ? { content: text, effectivePath } : null);
       } else if (existsSync(candidateAbs)) {
-        const text = readFileSync(candidateAbs, "utf8");
-        contents.set(op.targetPath, text.length <= MAX_EXISTING_READ_BYTES ? text : text.slice(0, MAX_EXISTING_READ_BYTES));
+        const headInfo = readBoundedFileHead(candidateAbs);
+        contents.set(op.targetPath, { content: headInfo.content, lineCount: headInfo.lineCount, effectivePath });
       } else {
         contents.set(op.targetPath, null);
       }
@@ -258,13 +303,14 @@ function readExistingContentsMap(toolName, toolInput, cwd, readTextFile) {
   return contents;
 }
 
-function hasUnvotedRethinkChallenge(ledger) {
+function analyzeChallengerState(ledger) {
   const allChallenges = Array.isArray(ledger?.turnPreflightChallenges) ? ledger.turnPreflightChallenges : [];
   const completed = allChallenges.filter(
     (entry) => typeof entry?.completedStepIndex === "number" && entry.completedStepIndex >= 0,
   );
+  const pendingAsync = Number.isFinite(ledger?.pendingAsyncChallenges) ? ledger.pendingAsyncChallenges : 0;
   if (completed.length === 0) {
-    return { completed, unvotedRethink: false };
+    return { completed, unvotedRethink: false, hasValidVerdict: false, pendingAsync };
   }
   const votes = Array.isArray(ledger?.turnUserVotes) ? ledger.turnUserVotes : [];
   const hasVoteAfter = (challenge) =>
@@ -277,7 +323,10 @@ function hasUnvotedRethinkChallenge(ledger) {
         vote.completedStepIndex > challenge.completedStepIndex,
     );
   const unvotedRethink = completed.some((ch) => ch.verdict === "RETHINK" && !hasVoteAfter(ch));
-  return { completed, unvotedRethink };
+  const hasValidVerdict = completed.some(
+    (ch) => ch.verdict === "PROCEED" || ch.verdict === "CONDITIONAL" || ch.verdict === "RETHINK",
+  );
+  return { completed, unvotedRethink, hasValidVerdict, pendingAsync };
 }
 
 function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options }) {
@@ -288,16 +337,17 @@ function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversa
     return { decision: "allow" };
   }
 
+  const gitRoot = options?.gitRoot ?? resolveGitRootFast(cwd);
   const ledger =
     options?.ledger ??
-    (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
+    (transcriptPath ? readFactLedger(transcriptPath, cwd, gitRoot) : null);
   const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
   if (sessionRole !== "main") {
     return { decision: "allow" };
   }
 
   const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
-  const { completed, unvotedRethink } = hasUnvotedRethinkChallenge(ledger);
+  const { hasValidVerdict, unvotedRethink, pendingAsync } = analyzeChallengerState(ledger);
 
   if (unvotedRethink) {
     if (options?.skipAuditLog !== true) {
@@ -322,24 +372,33 @@ function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversa
     };
   }
 
-  if (completed.length > 0) {
+  if (pendingAsync > 0) {
+    return {
+      decision: "deny",
+      reason: PENDING_CHALLENGER_DENY_REASON,
+    };
+  }
+
+  if (hasValidVerdict) {
     return { decision: "allow" };
   }
 
-  const turnKey = `${conversationId || "anon"}:${turnStartStepIndex}`;
-  if (conversationId && hasAutonomyTurnFlag({ conversationId, flagName: "circuitBreakerTurns", turnKey, dataDir })) {
+  const effectiveCid = resolveEffectiveConversationKey(conversationId, cwd);
+  const turnKey = `${effectiveCid}:${turnStartStepIndex}`;
+  if (hasAutonomyTurnFlag({ conversationId: effectiveCid, flagName: "circuitBreakerTurns", turnKey, dataDir })) {
     return { decision: "allow" };
   }
 
   const thresholds = resolveAutonomyThresholds(dataDir, governanceConfig);
   const existingContentsByPath =
     options?.existingContentsByPath ??
-    readExistingContentsMap(toolCall.name, toolCall.args, cwd, options?.readTextFile);
+    readExistingContentsMap(toolCall.name, toolCall.args, cwd, gitRoot, options?.readTextFile);
 
   const inspection = detectDestructiveEdit({
     toolName: toolCall.name,
     toolInput: toolCall.args,
     cwd,
+    gitRoot,
     existingContentsByPath,
     config: governanceConfig,
     thresholds,
@@ -349,16 +408,14 @@ function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversa
     return { decision: "allow" };
   }
 
-  if (conversationId) {
-    const claimed = claimAutonomyTurnFlag({
-      conversationId,
-      flagName: "circuitBreakerTurns",
-      turnKey,
-      dataDir,
-    });
-    if (!claimed) {
-      return { decision: "allow" };
-    }
+  const claimed = claimAutonomyTurnFlag({
+    conversationId: effectiveCid,
+    flagName: "circuitBreakerTurns",
+    turnKey,
+    dataDir,
+  });
+  if (claimed === false) {
+    return { decision: "allow" };
   }
 
   if (options?.skipAuditLog !== true) {
@@ -368,7 +425,8 @@ function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversa
         event: "autonomy_event",
         eventType: "autonomy_event",
         kind: "circuit_breaker",
-        conversationId,
+        ...(claimed === null ? { subkind: "lock_contended_fail_closed" } : {}),
+        conversationId: effectiveCid,
         turnStartStepIndex,
         toolName: toolCall.name,
         targetPath: inspection.targetPath,

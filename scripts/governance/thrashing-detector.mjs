@@ -1,9 +1,6 @@
 import { resolveAutonomyThresholds } from "./config.mjs";
 import { DEFAULT_AUTONOMY_THRESHOLDS } from "./constants.mjs";
 
-/**
- * 현재 턴의 검증 실패, 동일 파일 수정, 누적 토큰 지표를 바탕으로 반복 삽질 여부를 판정한다.
- */
 export function evaluateThrashing({
   turnVerifyFailures = 0,
   turnConsecutiveVerifyFailures = 0,

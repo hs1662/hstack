@@ -7,6 +7,7 @@ import { detectSessionRoleFromHeaderSteps, readFactLedger } from "./governance/f
 import {
   claimAutonomyTurnFlag,
   markPreflightChallengeLogged,
+  resolveEffectiveConversationKey,
   updateSessionPollutionState,
 } from "./governance/handoff-store.mjs";
 import { evaluateThrashing } from "./governance/thrashing-detector.mjs";
@@ -129,16 +130,15 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
         thresholds: autonomyThresholds,
       });
       if (thrashResult.thrashing) {
-        const turnKey = `${conversationId || "anon"}:${ledger.turnStartStepIndex}`;
-        const claimed =
-          !conversationId ||
-          claimAutonomyTurnFlag({
-            conversationId,
-            flagName: "autoHandoffTurns",
-            turnKey,
-            dataDir,
-          });
-        if (claimed) {
+        const effectiveCid = resolveEffectiveConversationKey(conversationId, cwd);
+        const turnKey = `${effectiveCid}:${ledger.turnStartStepIndex}`;
+        const claimed = claimAutonomyTurnFlag({
+          conversationId: effectiveCid,
+          flagName: "autoHandoffTurns",
+          turnKey,
+          dataDir,
+        });
+        if (claimed === true) {
           appendAuditRecord(
             {
               ts: new Date().toISOString(),

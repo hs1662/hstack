@@ -480,7 +480,7 @@ export function inferExecutionFailure(result) {
   return false;
 }
 
-function unwrapSerialized(value, depth = 0) {
+export function unwrapSerialized(value, depth = 0) {
   if (typeof value !== "string" || depth >= MAX_UNWRAP_DEPTH) {
     return value;
   }
@@ -496,17 +496,17 @@ function unwrapSerialized(value, depth = 0) {
   }
 }
 
-function asObject(value) {
+export function asObject(value) {
   const unwrapped = unwrapSerialized(value);
   return unwrapped && typeof unwrapped === "object" && !Array.isArray(unwrapped) ? unwrapped : null;
 }
 
-function asArray(value) {
+export function asArray(value) {
   const unwrapped = unwrapSerialized(value);
   return Array.isArray(unwrapped) ? unwrapped : null;
 }
 
-function pickString(obj, keys) {
+export function pickString(obj, keys) {
   for (const key of keys) {
     if (typeof obj[key] === "string" && obj[key].trim().length > 0) {
       return obj[key].trim();
@@ -1096,7 +1096,7 @@ function extractLatestTokens(parsed) {
   return { inputTokens, cacheReadTokens, outputTokens };
 }
 
-const PRE_TOOL_WRITE_PROBE_MAX_BYTES = 8192;
+const WRITE_PROBE_MAX_BYTES = 1024 * 1024;
 const MANUAL_PREFLIGHT_CMD_RE = /\/(?:hstack:)?hstack-preflight\b/i;
 
 function createEmptyLedger(transcriptAvailable = false) {
@@ -1114,7 +1114,6 @@ function createEmptyLedger(transcriptAvailable = false) {
     turnVerifyFailures: 0,
     turnConsecutiveVerifyFailures: 0,
     fileEditCounts: new Map(),
-    turnFileEditCounts: null,
     maxSingleFileEdits: 0,
     mostEditedFile: "",
     turnGateAttempts: [],
@@ -1138,11 +1137,10 @@ function createEmptyLedger(transcriptAvailable = false) {
 
 function scanTranscriptToLedger(filePath, cwd, gitRoot) {
   const ledger = createEmptyLedger(true);
-  ledger.turnFileEditCounts = ledger.fileEditCounts;
   let pendingCalls = [];
+  let seenGenericInCurrentPlanner = false;
   let seenFirstUserInput = false;
   let seenFirstPlannerResponse = false;
-  let lastRecordWasPlannerResponse = false;
   const asyncAuditsByConversationId = new Map();
   const asyncChallengesByConversationId = new Map();
   const asyncWorkersByConversationId = new Map();
@@ -1175,9 +1173,9 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     }
   };
 
-  // Commit unconfirmed writes only when transitioning out of a turn/planner boundary that omitted GENERICs (synthetic fixtures).
-  const flushUnresolvedSyntheticWrites = () => {
-    if (pendingCalls.length === 0) {
+  const flushSyntheticWritesWithoutGenerics = () => {
+    if (pendingCalls.length === 0 || seenGenericInCurrentPlanner) {
+      pendingCalls = [];
       return;
     }
     for (const pending of pendingCalls) {
@@ -1199,7 +1197,6 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     ledger.turnVerifyFailures = 0;
     ledger.turnConsecutiveVerifyFailures = 0;
     ledger.fileEditCounts = new Map();
-    ledger.turnFileEditCounts = ledger.fileEditCounts;
     ledger.maxSingleFileEdits = 0;
     ledger.mostEditedFile = "";
     ledger.turnGateAttempts = [];
@@ -1218,6 +1215,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     ledger.turnWorkerConversationIds = [];
     ledger.gateBlockedThisTurn = false;
     pendingCalls = [];
+    seenGenericInCurrentPlanner = false;
     asyncAuditsByConversationId.clear();
     asyncChallengesByConversationId.clear();
     asyncWorkersByConversationId.clear();
@@ -1229,7 +1227,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       return false;
     }
     if (nextPending.kind === "write") {
-      return PRE_TOOL_WRITE_PROBE_MAX_BYTES;
+      return WRITE_PROBE_MAX_BYTES;
     }
     return (
       nextPending.kind === "exec" ||
@@ -1261,7 +1259,6 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       const stepIndex = parseStepIndex(rawIndex, recordIndex);
 
       if (parsed.type === "USER_INPUT") {
-        lastRecordWasPlannerResponse = false;
         const userContent = typeof parsed.content === "string" ? parsed.content : "";
         if (!seenFirstUserInput) {
           seenFirstUserInput = true;
@@ -1272,7 +1269,6 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       }
 
       if (parsed.type === "SYSTEM_MESSAGE") {
-        lastRecordWasPlannerResponse = false;
         applyHeaderSessionRole(parsed);
         const msgContent = typeof parsed.content === "string" ? parsed.content : "";
         if (msgContent.includes(GATE_STOP_MARKER)) {
@@ -1316,9 +1312,9 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       }
 
       if (parsed.type === "PLANNER_RESPONSE") {
-        flushUnresolvedSyntheticWrites();
+        flushSyntheticWritesWithoutGenerics();
         seenFirstPlannerResponse = true;
-        lastRecordWasPlannerResponse = true;
+        seenGenericInCurrentPlanner = false;
         pendingCalls = [];
         const tokens = extractLatestTokens(parsed);
         if (tokens) {
@@ -1455,16 +1451,22 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
       }
 
       if (parsed.type === "GENERIC") {
-        lastRecordWasPlannerResponse = false;
+        seenGenericInCurrentPlanner = true;
         const pending = pendingCalls.shift();
         if (!pending) {
           return true;
         }
         const status = typeof parsed.status === "string" ? parsed.status : "";
         const error = typeof parsed.error === "string" ? parsed.error : "";
+        const normStatus = status.trim().toUpperCase();
 
         if (pending.kind === "write") {
-          if (!isPreToolDenialStep(parsed)) {
+          const denied = isPreToolDenialStep(parsed);
+          if (denied && typeof parsed.content === "string" && parsed.content.includes("서킷브레이커")) {
+            ledger.turnAutoChallengeTriggered = true;
+          }
+          const errored = normStatus === "ERROR" || normStatus === "FAILED" || error.trim().length > 0;
+          if (!denied && !errored) {
             commitWriteToolResult(pending);
           }
           return true;
@@ -1562,21 +1564,15 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     },
     {
       onSkipped(prefixType, isValid) {
-        if (prefixType === "GENERIC" && isValid && pendingCalls.length > 0) {
-          const skipped = pendingCalls.shift();
-          if (skipped && skipped.kind === "write") {
-            commitWriteToolResult(skipped);
+        if (prefixType === "GENERIC" && isValid) {
+          seenGenericInCurrentPlanner = true;
+          if (pendingCalls.length > 0) {
+            pendingCalls.shift();
           }
         }
       },
     },
   );
-
-  // If the file ends right after a synthetic PLANNER_RESPONSE with no trailing GENERICs, preserve legacy fixture compatibility
-  // ONLY when there is no other GENERIC in the stream (if PreToolUse runs before GENERIC is emitted, write wasn't executed yet).
-  if (lastRecordWasPlannerResponse && pendingCalls.length > 0) {
-    // Keep pending writes unconfirmed while tool execution hasn't emitted GENERIC unless later PLANNER_RESPONSE moved past it.
-  }
 
   if (!result.hasContent) {
     return null;

@@ -1,16 +1,15 @@
 #!/usr/bin/env node
 
-import { existsSync } from "node:fs";
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode } from "./governance/config.mjs";
 import { PROMPT_ROUTE_SYSTEM_MESSAGE } from "./governance/constants.mjs";
-import { readFactLedger } from "./governance/fact-ledger.mjs";
-import { claimAutonomyTurnFlag } from "./governance/handoff-store.mjs";
+import { detectSessionRoleFromUserInput, readFactLedger } from "./governance/fact-ledger.mjs";
+import { claimAutonomyTurnFlag, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
 import {
   isDirectExecution,
   parseHookPayload,
+  pickPreferredTranscriptPath,
   resolvePluginDataDir,
-  resolveTranscriptCandidates,
   runHookCli,
 } from "./hook-io.mjs";
 
@@ -25,9 +24,6 @@ const MASSIVE_ARCH_RE =
 const LEADING_REVIEW_CONTEXT_RE =
   /(?:깔끔하지\s*않|맞지|낫지\s*않|괜찮을까|어떨까|바꾸자|바꿔\s*줘|걷어내자|빼고|설계\s*검토|타당성(?:만)?\s*검토|단순화해서|바로\s*수정해\s*줘)/;
 
-/**
- * 사용자 프롬프트가 고위험 안전장치 제거 또는 유도성 아키텍처 변경 제안인지 판별한다.
- */
 export function shouldAutoChallengePrompt(promptText) {
   if (typeof promptText !== "string") {
     return { matched: false, signals: [] };
@@ -45,36 +41,12 @@ export function shouldAutoChallengePrompt(promptText) {
     signals.push("architecture_overhaul_proposal");
   }
 
-  if (signals.length === 0) {
-    return { matched: false, signals: [] };
-  }
-
-  if (!LEADING_REVIEW_CONTEXT_RE.test(trimmed)) {
+  if (signals.length === 0 || !LEADING_REVIEW_CONTEXT_RE.test(trimmed)) {
     return { matched: false, signals: [] };
   }
 
   signals.push("leading_or_design_review_context");
   return { matched: true, signals };
-}
-
-function pickPreferredTranscriptPath(rawTranscriptPath) {
-  if (typeof rawTranscriptPath !== "string") {
-    return "";
-  }
-  const trimmed = rawTranscriptPath.trim();
-  if (trimmed.length === 0) {
-    return "";
-  }
-  for (const candidate of resolveTranscriptCandidates(trimmed)) {
-    try {
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    } catch {
-      continue;
-    }
-  }
-  return trimmed;
 }
 
 export function handlePreInvocation(stdinText, options = {}) {
@@ -83,8 +55,9 @@ export function handlePreInvocation(stdinText, options = {}) {
     return {};
   }
 
-  const invocationNum = payload.invocationNum ?? payload.invocation_num;
-  if (typeof invocationNum === "number" && Number.isFinite(invocationNum) && invocationNum > 0) {
+  const rawInv = payload.invocationNum ?? payload.invocation_num;
+  const invocationNum = rawInv === undefined || rawInv === null || rawInv === "" ? 0 : Number(rawInv);
+  if (Number.isFinite(invocationNum) && invocationNum > 0) {
     return {};
   }
 
@@ -97,6 +70,10 @@ export function handlePreInvocation(stdinText, options = {}) {
   const rawPrompt = payload.lastUserInput ?? payload.last_user_input;
   const evaluation = shouldAutoChallengePrompt(rawPrompt);
   if (!evaluation.matched) {
+    return {};
+  }
+
+  if (typeof rawPrompt === "string" && detectSessionRoleFromUserInput(rawPrompt) !== "main") {
     return {};
   }
 
@@ -114,17 +91,16 @@ export function handlePreInvocation(stdinText, options = {}) {
   }
 
   const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
-  const turnKey = `${conversationId || "anon"}:${turnStartStepIndex}`;
-  if (conversationId) {
-    const claimed = claimAutonomyTurnFlag({
-      conversationId,
-      flagName: "promptRouteTurns",
-      turnKey,
-      dataDir,
-    });
-    if (!claimed) {
-      return {};
-    }
+  const effectiveCid = resolveEffectiveConversationKey(conversationId, cwd);
+  const turnKey = `${effectiveCid}:${turnStartStepIndex}`;
+  const claimed = claimAutonomyTurnFlag({
+    conversationId: effectiveCid,
+    flagName: "promptRouteTurns",
+    turnKey,
+    dataDir,
+  });
+  if (claimed !== true) {
+    return {};
   }
 
   if (options?.skipAuditLog !== true) {
@@ -134,7 +110,7 @@ export function handlePreInvocation(stdinText, options = {}) {
         event: "autonomy_event",
         eventType: "autonomy_event",
         kind: "prompt_route",
-        conversationId,
+        conversationId: effectiveCid,
         turnStartStepIndex,
         signals: evaluation.signals,
       },

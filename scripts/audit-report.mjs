@@ -474,7 +474,7 @@ export function summarizeAuditRecords(parsedInput, options = {}) {
     if (normVerdict !== "MISSING_VERDICT" || existing.verdict === "MISSING_VERDICT") {
       existing.verdict = normVerdict;
     }
-    if (normMode !== "unknown" && existing.mode === "unknown") {
+    if (normMode !== "unknown") {
       existing.mode = normMode;
     }
     if (voted === true) {

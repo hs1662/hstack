@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -591,6 +591,26 @@ export function resolveTranscriptCandidates(transcriptPath) {
     return [join(dirname(transcriptPath), "transcript_full.jsonl"), transcriptPath];
   }
   return [transcriptPath];
+}
+
+export function pickPreferredTranscriptPath(rawTranscriptPath) {
+  if (typeof rawTranscriptPath !== "string") {
+    return "";
+  }
+  const trimmed = rawTranscriptPath.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+  for (const candidate of resolveTranscriptCandidates(trimmed)) {
+    try {
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return trimmed;
 }
 
 function readTranscript(transcriptPath, readTextFile) {

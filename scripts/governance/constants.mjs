@@ -44,6 +44,9 @@ export const DEFAULT_AUTONOMY_THRESHOLDS = {
 export const RETHINK_UNVOTED_DENY_REASON =
   "[서킷브레이커 차단] 적대적 사전 검토관이 재설계 권고 판정을 내렸으므로 사용자 표결 없이 코드를 수정할 수 없습니다. 먼저 `ask_question`으로 사용자 승인을 받거나 비대화형 환경이면 대조 표와 선택지만 보고하고 작업을 멈추세요.";
 
+export const PENDING_CHALLENGER_DENY_REASON =
+  "[서킷브레이커 대기] 적대적 사전 검토관의 판정이 아직 도착하지 않았습니다. 검토 결과를 먼저 확인한 뒤 진행하세요.";
+
 export const PROMPT_ROUTE_SYSTEM_MESSAGE =
   "[자율 사전검토 안내] 고위험 설계·단순화 제안이 감지되었다. 코드 수정이나 결론 제시 전 관련 파일을 직접 읽어 중립 브리프를 정리하고 `invoke_subagent`로 `hstack-challenger`(`적대적 설계 검토관`, `[hstack:자동사전검토]`)의 독립 반론을 먼저 받아라. `진행 가능`·`조건부 진행`은 보완 반영 후 자율 진행(읽기 전용 요청이면 검토 결과만 보고)하고, `재설계 권고`일 때만 `파일:줄` 근거와 대안을 제시해 사용자 확인을 받아라.";
 

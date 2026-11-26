@@ -80,18 +80,19 @@ function withSessionLock(filePath, fn) {
       sleepMsSync(10);
     }
   }
+  if (fd === null) {
+    throw new Error(`Failed to acquire session lock: ${lockPath}`);
+  }
   try {
     return fn();
   } finally {
-    if (fd !== null) {
-      try {
-        closeSync(fd);
-      } catch {
-      }
-      try {
-        unlinkSync(lockPath);
-      } catch {
-      }
+    try {
+      closeSync(fd);
+    } catch {
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
     }
   }
 }
@@ -160,6 +161,17 @@ export function resolveSessionStatePath(conversationId, dataDir = resolvePluginD
     return "";
   }
   return join(dataDir, "sessions", `${safeId}.json`);
+}
+
+export function resolveEffectiveConversationKey(conversationId, cwd = "") {
+  const trimmed = typeof conversationId === "string" ? conversationId.trim() : "";
+  if (trimmed.length > 0) {
+    return trimmed;
+  }
+  if (typeof cwd === "string" && cwd.trim().length > 0) {
+    return `anon-${computeWorkspaceKey(cwd)}`;
+  }
+  return "anon-global";
 }
 
 export function readSessionState(conversationId, dataDir = resolvePluginDataDir()) {
@@ -287,28 +299,28 @@ export function claimAutonomyTurnFlag({
   if (!filePath) {
     return true;
   }
-  return withSessionLock(filePath, () => {
-    const prev = readSessionState(conversationId, dataDir) ?? { conversationId };
-    const existing = Array.isArray(prev[flagName])
-      ? prev[flagName].filter((k) => typeof k === "string" && k.length > 0)
-      : [];
-    if (existing.includes(turnKey)) {
-      return false;
-    }
-    const nextList = [...existing, turnKey].slice(-MAX_AUTONOMY_TURN_KEYS);
-    const nextState = {
-      ...prev,
-      conversationId,
-      updatedAt: new Date().toISOString(),
-      [flagName]: nextList,
-    };
-    try {
+  try {
+    return withSessionLock(filePath, () => {
+      const prev = readSessionState(conversationId, dataDir) ?? { conversationId };
+      const existing = Array.isArray(prev[flagName])
+        ? prev[flagName].filter((k) => typeof k === "string" && k.length > 0)
+        : [];
+      if (existing.includes(turnKey)) {
+        return false;
+      }
+      const nextList = [...existing, turnKey].slice(-MAX_AUTONOMY_TURN_KEYS);
+      const nextState = {
+        ...prev,
+        conversationId,
+        updatedAt: new Date().toISOString(),
+        [flagName]: nextList,
+      };
       atomicWriteJson(filePath, nextState);
       return true;
-    } catch {
-      return false;
-    }
-  });
+    });
+  } catch {
+    return null;
+  }
 }
 
 export function markPreflightChallengeLogged({
