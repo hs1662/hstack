@@ -1658,6 +1658,8 @@ export function summarizeGovernance({
   ledgerChallenges = [],
   ledgerUserVotes = [],
   ledgerCodeWrittenFiles = [],
+  ledgerExecutions = [],
+  ledgerLastWriteStepIndex = -1,
 } = {}) {
   const safeSteps = Array.isArray(steps) ? steps : [];
   const safeRecords = Array.isArray(auditRecords) ? auditRecords : [];
@@ -1877,6 +1879,18 @@ export function summarizeGovernance({
     lastGateToolStepOrder > firstStopGateStepOrder &&
     (firstStopAuditIndex === -1 || hasPassAuditAfterStop);
 
+  const safeLedgerExecs = Array.isArray(ledgerExecutions) ? ledgerExecutions : [];
+  let hasPostEditTestPass = lastEditOrShellStepOrder !== -1 && lastPassingTestStepOrder > lastEditOrShellStepOrder;
+  if (safeLedgerExecs.length > 0) {
+    const lastLedgerOtherStep = Math.max(
+      Number.isFinite(ledgerLastWriteStepIndex) ? ledgerLastWriteStepIndex : -1,
+      ...safeLedgerExecs.filter((e) => e && e.kind === "other").map((e) => e.stepIndex ?? -1),
+    );
+    hasPostEditTestPass =
+      lastLedgerOtherStep !== -1 &&
+      safeLedgerExecs.some((e) => e && e.kind === "verification" && e.passed === true && (e.stepIndex ?? -1) > lastLedgerOtherStep);
+  }
+
   return {
     gateCallCount,
     gateVerdicts,
@@ -1902,7 +1916,7 @@ export function summarizeGovernance({
     writeToolCalls,
     shellExecCalls,
     stopBeforeFinalPass,
-    hasPostEditTestPass: lastEditOrShellStepOrder !== -1 && lastPassingTestStepOrder > lastEditOrShellStepOrder,
+    hasPostEditTestPass,
     stopContinueGateCount,
     stopMaxExecutionNum,
     cacheReadTokens,
@@ -1928,6 +1942,8 @@ export function evaluateGovernanceCase(
     ledgerChallenges = [],
     ledgerUserVotes = [],
     ledgerCodeWrittenFiles = [],
+    ledgerExecutions = [],
+    ledgerLastWriteStepIndex = -1,
   } = {},
 ) {
   const governance = summarizeGovernance({
@@ -1941,6 +1957,8 @@ export function evaluateGovernanceCase(
     ledgerChallenges,
     ledgerUserVotes,
     ledgerCodeWrittenFiles,
+    ledgerExecutions,
+    ledgerLastWriteStepIndex,
   });
   const failures = [];
 
@@ -2349,8 +2367,16 @@ function runLiveCase(model, testCase, options, pluginManifest) {
     const ledgerChallenges = [];
     const ledgerUserVotes = [];
     const ledgerCodeWrittenFiles = new Set();
+    const ledgerExecutions = [];
+    let ledgerLastWriteStepIndex = -1;
     for (const tPath of transcriptPaths) {
       const ledger = readFactLedger(tPath, workspaceDir, gitLedger.gitRoot || "");
+      for (const exec of ledger.turnExecutions ?? []) {
+        ledgerExecutions.push(exec);
+      }
+      if (typeof ledger.lastWriteStepIndex === "number") {
+        ledgerLastWriteStepIndex = Math.max(ledgerLastWriteStepIndex, ledger.lastWriteStepIndex);
+      }
       for (const ch of ledger.turnPreflightChallenges ?? []) {
         ledgerChallenges.push(ch);
         if (ch.conversationId) {
@@ -2393,6 +2419,8 @@ function runLiveCase(model, testCase, options, pluginManifest) {
       ledgerChallenges,
       ledgerUserVotes,
       ledgerCodeWrittenFiles: Array.from(ledgerCodeWrittenFiles),
+      ledgerExecutions,
+      ledgerLastWriteStepIndex,
     });
 
     let status = lastExitCode !== 0 ? "error" : analysis.status;

@@ -16,7 +16,7 @@ import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
 import { handleStop } from "../scripts/stop.mjs";
-import { GATE_STOP_MARKER, buildCorrectionMessage, decideHookAction, isExplicitEnglishOutputRequest } from "../scripts/transcript.mjs";
+import { GATE_STOP_MARKER, buildCorrectionMessage, decideHookAction, isExplicitEnglishOutputRequest, parseTranscriptJsonl } from "../scripts/transcript.mjs";
 import { createTempDir, toJsonl, withCpuLock, wrapAntigravityHookMessage } from "./helpers.mjs";
 import { CASES, evaluateGovernanceCase } from "./verify-live.mjs";
 
@@ -2279,5 +2279,55 @@ describe("H9 OMH gpt-6.2-astra round-5 regressions (P1 F1-F8, P2 F9-F12)", () =>
       gitDirtyFiles: ["src/calc.mjs"],
     });
     assert.equal(valid.ok, true, valid.failures.join("; "));
+
+    const dir = createTempDir("hstack-p10-r5-f12-live-");
+    const evalJsonl = (records, auditRecords) => {
+      const p = join(dir, `${Math.random().toString(36).slice(2)}.jsonl`);
+      const raw = toJsonl(records);
+      writeFileSync(p, raw);
+      const parsedSteps = parseTranscriptJsonl(raw);
+      const ledger = readFactLedger(p, "/repo", "/repo");
+      return evaluateGovernanceCase(l16, {
+        steps: parsedSteps,
+        auditRecords,
+        gitDirtyFiles: ["src/calc.mjs"],
+        ledgerExecutions: ledger.turnExecutions,
+        ledgerLastWriteStepIndex: ledger.lastWriteStepIndex,
+      });
+    };
+
+    const livePass = evalJsonl(
+      [
+        { step_index: 0, type: "USER_INPUT", content: l16.prompt },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "sed -i 's/+//' src/calc.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { step_index: 4, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+        { step_index: 5, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+        { step_index: 6, type: "PLANNER_RESPONSE", tool_calls: [{ name: GATE_TOOL_NAME, args: {} }] },
+      ],
+      [
+        { event: "stop_decision", decision: "continue_gate", executionNum: 0 },
+        { event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 },
+      ],
+    );
+    assert.equal(livePass.ok, true, livePass.failures.join("; "));
+
+    const liveFail = evalJsonl(
+      [
+        { step_index: 0, type: "USER_INPUT", content: l16.prompt },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "sed -i 's/+//' src/calc.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { step_index: 4, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+        { step_index: 5, type: "GENERIC", status: "DONE", content: FAIL_OUTPUT },
+        { step_index: 6, type: "PLANNER_RESPONSE", tool_calls: [{ name: GATE_TOOL_NAME, args: {} }] },
+      ],
+      [
+        { event: "stop_decision", decision: "continue_gate", executionNum: 0 },
+        { event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 },
+      ],
+    );
+    assert.equal(liveFail.ok, false, "L16 parseTranscriptJsonl path must fail when post-edit test failed");
   });
 });
