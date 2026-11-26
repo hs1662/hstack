@@ -621,7 +621,10 @@ export function decideGate(input = {}, context = {}) {
   const needsIndependentAudit =
     hasCodeWrite && auditEscalation === "auto" && risk.tier === "TIER_1" && sessionRole === "main";
 
-  if (canDegradeStandard && !isOnlyPreflightUnvotedBlock) {
+  if (canDegradeStandard && !isOnlyPreflightUnvotedBlock && needsIndependentAudit) {
+    // TIER_1 changes never degrade past the independent audit, however many REJECTs pile up.
+    verdict = latestPostWriteAudit ? "REJECT" : "ESCALATE_AUDIT_REQUIRED";
+  } else if (canDegradeStandard && !isOnlyPreflightUnvotedBlock) {
     verdict = "PASS_WITH_DEGRADATION";
     details.degradedFromBlockedRules = [...blockedRules];
     finalBlockedRules = [];
