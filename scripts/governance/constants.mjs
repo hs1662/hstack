@@ -275,11 +275,18 @@ function formatCodeList(items) {
   return items.map((item) => `\`${item}\``).join(", ");
 }
 
+// A pipe, `;` or `||` lets a failing runner exit 0, so such a run is not evidence; say how to rerun it.
+function maskedVerificationHint(commands, ending = "다시 실행해 주세요") {
+  return commands.length > 0
+    ? ` 다음 실행은 파이프나 \`||\`, \`;\` 등 때문에 실패해도 종료 상태가 성공으로 바뀌므로 검증으로 인정하지 않습니다: ${formatCodeList(commands)}. 파이프 없이 다시 실행하거나 \`set -o pipefail && npm test 2>&1 | tail -20\`처럼 앞에 \`set -o pipefail &&\`를 붙여 ${ending}.`
+    : "";
+}
+
 const NEUTRAL_RULE_MESSAGES = {
   R1_UNREAD_INSPECTED: (files) =>
     `직접 읽은 기록이 없는 파일을 점검 목록에 포함했습니다: ${formatCodeList(files)}`,
-  R2_STALE_VERIFICATION: () =>
-    "마지막 코드 수정 이후에 실행된 검증 명령 기록이 없습니다.",
+  R2_STALE_VERIFICATION: (masked = []) =>
+    `마지막 코드 수정 이후에 실행된 검증 명령 기록이 없습니다.${maskedVerificationHint(masked)}`,
   R3_CONCEALED_FAILURE: (commands) =>
     commands.length > 0
       ? `마지막 검증 실행이 실패로 끝났습니다: ${formatCodeList(commands)}`
@@ -305,8 +312,8 @@ const NEUTRAL_RULE_MESSAGES = {
 const AUDIT_RULE_MESSAGES = {
   R1_UNREAD_INSPECTED: (files) =>
     `세션 열람 원장에 존재하지 않는 파일이 점검 대상으로 기재되었습니다: ${formatCodeList(files)}`,
-  R2_STALE_VERIFICATION: () =>
-    "최종 코드 변경 시점 이후에 수행된 검증 실행 증빙이 누락되었습니다.",
+  R2_STALE_VERIFICATION: (masked = []) =>
+    `최종 코드 변경 시점 이후에 수행된 검증 실행 증빙이 누락되었습니다.${maskedVerificationHint(masked, "재실행하십시오")}`,
   R3_CONCEALED_FAILURE: (commands) =>
     commands.length > 0
       ? `최종 검증 실행의 실패 결과가 누락되거나 통과로 기재되었습니다: ${formatCodeList(commands)}`

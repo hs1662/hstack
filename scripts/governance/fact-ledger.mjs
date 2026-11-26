@@ -402,14 +402,17 @@ const INLINE_CODE_FLAG_RE = {
 function inlineInterpreterBody(bin, args) {
   if (SHELL_INTERPRETERS.has(bin)) {
     let inline = false;
+    let pipefail = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
       if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg)) {
+        pipefail ||= arg === "-o" && args[i + 1] === "pipefail";
         i += 1;
       } else if (/^[-+][A-Za-z]+$/.test(arg)) {
         inline ||= arg[0] === "-" && arg.includes("c");
       } else if (!arg.startsWith("--") || arg === "--") {
-        return inline ? (arg === "--" ? (args[i + 1] ?? "") : arg) : null;
+        const body = arg === "--" ? (args[i + 1] ?? "") : arg;
+        return inline ? (pipefail ? `set -o pipefail && ${body}` : body) : null;
       }
     }
     return inline ? "" : null;
@@ -543,6 +546,12 @@ function classifySingleSegment(segment) {
   return "other";
 }
 
+// `set -o pipefail` (or `-euo pipefail`): a later pipe keeps the runner's failing exit status.
+function setsPipefail(segment) {
+  const tokens = tokenizeSegment(segment.trim());
+  return tokens[0] === "set" && tokens.some((tok, i) => tok === "pipefail" && /^-[A-Za-z]*o$/.test(tokens[i - 1] ?? ""));
+}
+
 // `$(…)` and backticks run even inside double quotes; `<(…)`/`>(…)` only unquoted. Single quotes stay literal.
 function hasCommandSubstitution(commandLine) {
   let quote = null;
@@ -583,6 +592,7 @@ export function classifyCommand(commandLine) {
   while (chain.length > 1 && chain.at(-1).text.trim().length === 0) {
     chain.pop();
   }
+  let pipefail = false;
   let intact = true;
   let sawVerification = false;
   let pipelineVerifies = false;
@@ -593,9 +603,10 @@ export function classifyCommand(commandLine) {
     if (kind === "other") {
       return "other";
     }
-    // Only `&&` keeps a failing exit status; `|`, `;`, `||`, `&` and `!` let it exit 0.
+    pipefail ||= setsPipefail(text);
+    // Only `&&` (or a pipe under pipefail) keeps a failing exit status; `;`, `||`, `&` and `!` let it exit 0.
     const last = i === chain.length - 1;
-    intact &&= !text.trim().startsWith("!") && (last ? op === "" || op === ";" || op === "\n" : op === "&&");
+    intact &&= !text.trim().startsWith("!") && (last ? op === "" || op === ";" || op === "\n" : op === "&&" || (op === "|" && pipefail));
     sawVerification ||= kind === "verification";
     pipelineVerifies ||= kind === "verification";
     if (op !== "|") {

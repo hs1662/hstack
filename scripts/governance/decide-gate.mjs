@@ -258,7 +258,7 @@ function buildRuleLine(rule, details, copy) {
     return "";
   }
   if (rule === "R1_UNREAD_INSPECTED") return builder(details.unreadInspected);
-  if (rule === "R2_STALE_VERIFICATION") return builder();
+  if (rule === "R2_STALE_VERIFICATION") return builder(details.maskedVerifications);
   if (rule === "R3_CONCEALED_FAILURE") return builder(details.failedVerifications);
   if (rule === "R4_UNREPORTED_MODIFIED") return builder(details.unreportedModified);
   if (rule === "R5_FABRICATED_COMMAND") return builder(details.fabricatedCommands);
@@ -413,6 +413,7 @@ export function decideGate(input = {}, context = {}) {
   const details = {
     unreadInspected: [],
     failedVerifications: [],
+    maskedVerifications: [],
     unreportedModified: [],
     fabricatedCommands: [],
     phantomModified: [],
@@ -510,6 +511,11 @@ export function decideGate(input = {}, context = {}) {
     : [];
 
   if (hasCodeWrite && postWriteVerifications.length === 0) {
+    for (const exec of postWriteExecutions) {
+      if (exec.kind === "other" && extractVerificationSegments(exec.command).length > 0) {
+        details.maskedVerifications.push(exec.command);
+      }
+    }
     const hasValidNaClaim = verificationRuns.some(
       (run) => run.outcome === "not_applicable" && run.reason_if_na.length > 0,
     );

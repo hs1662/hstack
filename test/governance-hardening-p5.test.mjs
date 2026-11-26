@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { analyzeField } from "../scripts/analyzer.mjs";
-import { AUDITOR_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
+import { AUDITOR_SESSION_MARKER, GATE_TOOL_NAME, REGISTER_COPY, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
 import { classifyCommand, readFactLedger, readTurnLedger } from "../scripts/governance/fact-ledger.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
@@ -186,6 +186,11 @@ describe("LOW5 a pipe counts as verification only under pipefail", () => {
     assert.ok(r.blockedRules.includes("R2_STALE_VERIFICATION"));
     assert.ok(r.receiptText.includes("set -o pipefail"), r.receiptText);
     assert.equal(analyzeField("content", r.receiptText).status, "korean");
+    for (const register of ["neutral", "audit"]) {
+      const line = REGISTER_COPY[register].ruleMessages.R2_STALE_VERIFICATION(["npm test 2>&1 | tail -20"]);
+      assert.ok(line.includes("set -o pipefail"), line);
+      assert.equal(analyzeField("content", line).status, "korean", line);
+    }
   });
 });
 
