@@ -827,3 +827,368 @@ describe("H5 OMH gpt-6.2-astra audit regressions F1-F10", () => {
     }
   });
 });
+
+describe("H6 OMH gpt-6.2-astra round-2 regressions (P1 F1-F8, P2 F9-F11)", () => {
+  it("R2-F1: blocks Stop when one of two verified files is reverted to turn-start content after verify_completion", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "a.mjs"), "export const a = 1;\n");
+    writeFileSync(join(repo, "b.mjs"), "export const b = 1;\n");
+    git(repo, ["add", "a.mjs", "b.mjs"]);
+    git(repo, ["commit", "-qm", "add a and b"]);
+
+    const { verdicts, out } = runTurnOnRepo(repo, "p10-r2-f1-revert", [
+      { write: "a.mjs", content: "export const a = 2;\n" },
+      { write: "b.mjs", content: "export const b = 2;\n" },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["a.mjs", "b.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "수정과 테스트 통과를 확인했습니다.",
+        },
+      },
+      {
+        cmd: "git checkout -- a.mjs",
+        effect: (r) => git(r, ["checkout", "--", "a.mjs"]),
+      },
+    ]);
+    assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts.join(" | "));
+    assertGateBlocked(out);
+  });
+
+  it("R2-F2: detects source deletion when git mv moves a tracked code file to docs/", () => {
+    const repo = makeRepo();
+    mkdirSync(join(repo, "docs"), { recursive: true });
+    git(repo, ["mv", "app.mjs", "docs/app.md"]);
+    const snap = snapshotWorkingTree(repo);
+    assert.ok(snap && "app.mjs" in snap.files, "snapshotWorkingTree must track deleted source path from rename");
+    assert.equal(snap.files["app.mjs"], null);
+
+    const repo2 = makeRepo();
+    mkdirSync(join(repo2, "docs"), { recursive: true });
+    const { out } = runTurnOnRepo(repo2, "p10-r2-f2-gitmv", [
+      {
+        cmd: "git mv app.mjs docs/app.md",
+        effect: (r) => git(r, ["mv", "app.mjs", "docs/app.md"]),
+      },
+    ]);
+    assertGateBlocked(out);
+  });
+
+  it("R2-F3: catches backdated-mtime sensitive untracked files created during turn under 2,100+ untracked files", () => {
+    withCpuLock(() => {
+      const makeOverflowRepo = () => {
+        const repo = makeRepo();
+        mkdirSync(join(repo, "untracked"));
+        const old = new Date(Date.now() - 86_400_000);
+        for (let i = 0; i < 2100; i += 1) {
+          const fp = join(repo, "untracked", `u${i}.mjs`);
+          writeFileSync(fp, `export const n = ${i};\n`);
+          utimesSync(fp, old, old);
+        }
+        return repo;
+      };
+
+      const repoUnreported = makeOverflowRepo();
+      const resUnreported = runTurnOnRepo(repoUnreported, "p10-r2-f3-r4", [
+        {
+          cmd: "tar -xf drop.tar",
+          effect: (r) => {
+            mkdirSync(join(r, "src", "auth"), { recursive: true });
+            const p = join(r, "src", "auth", "backdated.mjs");
+            writeFileSync(p, "export const s = 1;\n");
+            const backdated = new Date(Date.now() - 365 * 86_400_000);
+            utimesSync(p, backdated, backdated);
+          },
+        },
+        { cmd: "node --test", output: PASS_OUTPUT },
+        {
+          gate: {
+            modified_files: [],
+            inspected_files: [],
+            verification_runs: [{ command: "node --test", outcome: "pass" }],
+            unverified_scope: [],
+            self_assessment: "확인했습니다.",
+          },
+        },
+      ]);
+      assert.equal(resUnreported.verdicts[0], VERDICT_HEADERS.REJECT_NEUTRAL, resUnreported.verdicts.join(" | "));
+
+      const repoSensitive = makeOverflowRepo();
+      const tp = join(repoSensitive, ".t.jsonl");
+      const recs = [{ step_index: 0, type: "USER_INPUT", content: "작업해 줘" }];
+      writeFileSync(tp, toJsonl(recs));
+      handlePreInvocation(
+        JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: "p10-r2-f3-sens", cwd: repoSensitive, transcriptPath: tp }),
+        { dataDir: DATA_DIR, skipAuditLog: true },
+      );
+      mkdirSync(join(repoSensitive, "src", "auth"), { recursive: true });
+      const authFile = join(repoSensitive, "src", "auth", "backdated.mjs");
+      writeFileSync(authFile, "export const s = 1;\n");
+      const backdated = new Date(Date.now() - 365 * 86_400_000);
+      utimesSync(authFile, backdated, backdated);
+      recs.push({ step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "tar -xf drop.tar", Cwd: repoSensitive } }] });
+      recs.push({ step_index: 2, type: "GENERIC", status: "DONE", content: "ok" });
+      recs.push({ step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: repoSensitive } }] });
+      recs.push({ step_index: 4, type: "GENERIC", status: "DONE", content: PASS_OUTPUT });
+      const call = {
+        name: GATE_TOOL_NAME,
+        args: {
+          modified_files: ["src/auth/backdated.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+      };
+      recs.push({ step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [call] });
+      writeFileSync(tp, toJsonl(recs));
+      const pre = handlePreToolGate(
+        JSON.stringify({ hookEventName: "PreToolUse", conversationId: "p10-r2-f3-sens", cwd: repoSensitive, transcriptPath: tp, toolCall: call }),
+        { dataDir: DATA_DIR, skipAuditLog: true },
+      );
+      const server = createMcpServerHandler({ dataDir: DATA_DIR, register: "neutral" });
+      const res = server({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "verify_completion", arguments: { ...call.args, ...pre.overwrite } } });
+      const header = res.result.content[0].text.split("\n")[0];
+      assert.equal(header, VERDICT_HEADERS.ESCALATE_AUDIT_REQUIRED, res.result.content[0].text);
+    });
+  });
+
+  it("R2-F4: rejects multi-argument version/help probes like node --version --test while keeping valid runs", () => {
+    for (const cmd of [
+      "node --version --test",
+      "node -v --test",
+      "node --help test/a.test.mjs",
+      "tsx --version --test",
+      "vitest --version test/a.test.ts",
+      "jest --help test/a.test.ts",
+      "pytest --version tests/",
+      "eslint --version src",
+    ]) {
+      assert.notEqual(classifyCommand(cmd), "verification", cmd);
+    }
+    for (const cmd of ["node --test", "node test/a.test.mjs --version", "pytest -v tests/"]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+  });
+
+  it("R2-F5: classifies command -v/-V probes as read_only instead of runner executions", () => {
+    for (const cmd of ["command -v npm test", "command -V npm test", "command -pv npm test"]) {
+      assert.equal(classifyCommand(cmd), "read_only", cmd);
+    }
+    for (const cmd of ["command npm test", "command -p npm test", "command -- npm test"]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+  });
+
+  it("R2-F6: blocks npm_config_* environment overrides for if-present, script-shell, prefix, and userconfig", () => {
+    for (const cmd of [
+      "npm_config_if_present=true npm run lint",
+      "NPM_CONFIG_IF_PRESENT=1 npm run test",
+      "export npm_config_if_present=true && npm run lint",
+      "npm_config_script_shell=/bin/sh npm test",
+      "npm_config_prefix=/tmp/x npm test",
+      "npm_config_userconfig=/tmp/x npm test",
+      "env npm_config_if_present=true npm run lint",
+    ]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+    for (const cmd of ["CI=1 npm test", "export NODE_ENV=test && npm test"]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+  });
+
+  it("R2-F7: tracks npm ci/install inside non-final shell segments and blocks Stop when snapshot is missing", () => {
+    assert.equal(classifyCommand("bash -c 'npm ci && npm test' && node --test"), "verification");
+    const blocked = runTurnOnRepo(
+      makeRepo(),
+      "p10-r2-f7-prep",
+      [{ cmd: "bash -c 'npm ci && npm test' && node --test", output: PASS_OUTPUT }],
+      { dropSnapshot: true },
+    );
+    assertGateBlocked(blocked.out);
+  });
+
+  it("R2-F8: does not let targetless runner clear failure of a non-default test path like tools/manual-smoke.mjs", () => {
+    const dir = createTempDir("hstack-p10-r2-f8-");
+    let seq = 0;
+    const check = (cmds, claimCmd) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const [cmd, out] of cmds) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd } }] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: out });
+      }
+      const p = join(dir, `f8-${seq++}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: claimCmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    const nonDefault = check(
+      [
+        ["node --test tools/manual-smoke.mjs", FAIL_OUTPUT],
+        ["node --test", PASS_OUTPUT],
+      ],
+      "node --test",
+    );
+    assert.equal(nonDefault.verdict, "REJECT");
+    assert.ok(nonDefault.blockedRules.includes("R3_CONCEALED_FAILURE"));
+
+    const defaultTest = check(
+      [
+        ["node --test test/a.test.mjs", FAIL_OUTPUT],
+        ["node --test", PASS_OUTPUT],
+      ],
+      "node --test",
+    );
+    assert.equal(defaultTest.verdict, "PASS", defaultTest.blockedRules.join(","));
+
+    const sameTarget = check(
+      [
+        ["node --test tools/manual-smoke.mjs", FAIL_OUTPUT],
+        ["node --test tools/manual-smoke.mjs", PASS_OUTPUT],
+      ],
+      "node --test tools/manual-smoke.mjs",
+    );
+    assert.equal(sameTarget.verdict, "PASS", sameTarget.blockedRules.join(","));
+  });
+
+  it("R2-F9: allows committing a newly created verified untracked file without edits, while blocking edits before commit", () => {
+    const repoCleanCommit = makeRepo();
+    const cleanRes = runTurnOnRepo(repoCleanCommit, "p10-r2-f9-clean", [
+      { write: "new_feature.mjs", content: "export const f = 1;\n" },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["new_feature.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "신규 파일과 테스트를 확인했습니다.",
+        },
+      },
+      {
+        cmd: "git add new_feature.mjs && git commit -qm add",
+        effect: (r) => {
+          git(r, ["add", "new_feature.mjs"]);
+          git(r, ["commit", "-qm", "add"]);
+        },
+      },
+    ]);
+    assert.equal(cleanRes.verdicts[0], VERDICT_HEADERS.PASS, cleanRes.verdicts.join(" | "));
+    assert.deepEqual(cleanRes.out, {});
+
+    const repoEditedCommit = makeRepo();
+    const dirtyRes = runTurnOnRepo(repoEditedCommit, "p10-r2-f9-dirty", [
+      { write: "new_feature.mjs", content: "export const f = 1;\n" },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["new_feature.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "신규 파일과 테스트를 확인했습니다.",
+        },
+      },
+      {
+        cmd: "git add new_feature.mjs && git commit -qm add",
+        effect: (r) => {
+          writeFileSync(join(r, "new_feature.mjs"), "export const f = 999;\n");
+          git(r, ["add", "new_feature.mjs"]);
+          git(r, ["commit", "-qm", "add"]);
+        },
+      },
+    ]);
+    assertGateBlocked(dirtyRes.out);
+  });
+
+  it("R2-F10: treats script arguments like --print or -p after script path as script argv rather than inline eval", () => {
+    for (const cmd of [
+      "node test/a.test.mjs --print",
+      "node test/a.test.mjs -p",
+      "tsx test/a.test.ts --print",
+      "node --test test/a.test.mjs --print",
+    ]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+    for (const cmd of ["node --print test/a.test.mjs", 'node -e "1" test/a.test.mjs', "tsx -p test/a.test.ts"]) {
+      assert.equal(classifyCommand(cmd), "other", cmd);
+    }
+  });
+
+  it("R2-F11: resolves pnpx vitest run --coverage test/a.test.ts failure with pnpx vitest run --coverage", () => {
+    const dir = createTempDir("hstack-p10-r2-f11-");
+    let seq = 0;
+    const check = (cmds, claimCmd) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const [cmd, out] of cmds) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd } }] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: out });
+      }
+      const p = join(dir, `f11-${seq++}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: claimCmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    const covResolved = check(
+      [
+        ["pnpx vitest run --coverage test/a.test.ts", FAIL_OUTPUT],
+        ["pnpx vitest run --coverage", "Tests  2 passed (2)"],
+      ],
+      "pnpx vitest run --coverage",
+    );
+    assert.equal(covResolved.verdict, "PASS", covResolved.blockedRules.join(","));
+
+    const configFlagOnly = check(
+      [
+        ["pnpx vitest run --config vitest.config.ts", FAIL_OUTPUT],
+        ["pnpx vitest run", "Tests  2 passed (2)"],
+      ],
+      "pnpx vitest run",
+    );
+    assert.equal(configFlagOnly.verdict, "REJECT");
+    assert.ok(configFlagOnly.blockedRules.includes("R3_CONCEALED_FAILURE"));
+  });
+});
