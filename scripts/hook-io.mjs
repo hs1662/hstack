@@ -551,6 +551,8 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
       filePos += bytesRead;
       const view = chunk.subarray(0, bytesRead);
       let pos = 0;
+      // A line that starts this read starts at byte 0 of it, not where the last read ended.
+      lineStartPos = 0;
       if (discardPartialLine) {
         const nlIdx = view.indexOf(NEWLINE_BYTE);
         if (nlIdx === -1) {
