@@ -56,9 +56,9 @@ export function isErrorQuote(text) {
   return text.length > 0 && text.length <= MAX_ERROR_QUOTE_CHARS && ERROR_QUOTE_RE.test(text);
 }
 
-// Code syntax a prose sentence does not have: a leading comment marker, a trailing code
-// delimiter, or an arrow/assignment. Prose and Hangul lines in an unclosed fence or indented block stay analyzed.
-// A trailing delimiter alone does not make an English sentence code, so prose ending in `,` `)` `;` stays analyzed.
+// Code syntax a prose sentence does not have: a leading comment marker or an arrow/assignment. A trailing code
+// delimiter counts only on a line that is not an English sentence, so prose ending in `,` `)` `;` and Hangul lines
+// in an unclosed fence or indented block stay analyzed.
 const CODE_LIKE_LINE_RE = /^[ \t]*(?:\/\/|\/\*|#|--|<!--)|=>|[^=!<>]=[^=]/;
 const TRAILING_CODE_DELIMITER_RE = /[;{}()[\],][ \t]*$/;
 const INDENTED_CODE_LINE_RE = /^(?: {4}|\t)/;
