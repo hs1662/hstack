@@ -502,18 +502,29 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
 function statSignature(gitRoot, relPath) {
   try {
     const st = statSync(join(gitRoot, relPath));
-    return [st.mtimeMs, st.size];
+    return [st.mtimeMs, st.size, (st.mode & 0o170000) | (st.mode & 0o111 ? 0o111 : 0)];
   } catch {
     return null;
   }
 }
 
 function sameFileSignature(a, b) {
-  return Array.isArray(a) && Array.isArray(b) ? a[0] === b[0] && a[1] === b[1] : a === b;
+  return Array.isArray(a) && Array.isArray(b)
+    ? a[0] === b[0] && a[1] === b[1] && (a.length < 3 || b.length < 3 || a[2] === b[2])
+    : a === b;
 }
 
 function isRiskyShellExec(exec) {
   return exec.kind === "other" || exec.hasPrepSideEffect === true;
+}
+
+function syncPendingAsyncAfterWrite(ledger) {
+  if (Array.isArray(ledger.pendingAsyncAuditLaunchSteps)) {
+    ledger.pendingAsyncAuditsAfterLastWrite = ledger.pendingAsyncAuditLaunchSteps.filter((s) => s > ledger.lastWriteStepIndex).length;
+  }
+  if (Array.isArray(ledger.pendingAsyncChallengeLaunchSteps)) {
+    ledger.pendingAsyncChallengesAfterLastWrite = ledger.pendingAsyncChallengeLaunchSteps.filter((s) => s > ledger.lastWriteStepIndex).length;
+  }
 }
 
 // Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
@@ -534,6 +545,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     ledger.turnCodeWrittenFiles.add(relPath);
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
     ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
+    syncPendingAsyncAfterWrite(ledger);
   };
   // A write tool already dated its own file; with no writer command in the turn, a check must not re-date it.
   const keepsToolDate = (relPath) => riskyStep === -1 && ledger.turnWrittenFiles.has(relPath);
@@ -550,6 +562,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     }
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, riskyStep);
     ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, riskyStep);
+    syncPendingAsyncAfterWrite(ledger);
     // Without a diff any dirty code file may be the shell's, so each one needs reporting and a check after it.
     for (const relPath of dirtyFiles) {
       if (!isExemptDocOrAssetPath(relPath) && !keepsToolDate(relPath)) {
@@ -669,6 +682,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       }
       ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
       ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
+      syncPendingAsyncAfterWrite(ledger);
     };
     if (postGateWriter || lastGateStep === -1 || riskyStep > lastGateStep) {
       markRecentUntracked(targetStep);

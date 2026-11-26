@@ -66,12 +66,22 @@ function advanceDir(currentDir, op, arg, opaqueSeq) {
   return { dir: nextDir, stack };
 }
 
+function isChainPrepText(norm) {
+  const tok = norm.split(" ");
+  if (tok[0] !== "npm") {
+    return false;
+  }
+  const positional = tok.slice(1).filter((t) => !t.startsWith("-"));
+  return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
+}
+
 function extractVerificationEntries(cmd, baseDir = ".") {
   if (typeof cmd !== "string" || cmd.trim().length === 0) {
     return [];
   }
   const entries = [];
   let state = { dir: normalizeExecDir(baseDir), stack: [] };
+  let prepPrefixes = [];
   let seq = 0;
   for (const seg of splitShellSegments(cmd)) {
     const norm = normalizeCommandText(seg);
@@ -84,8 +94,12 @@ function extractVerificationEntries(cmd, baseDir = ".") {
       state = advanceDir(state, dirMatch[1], dirMatch[2]?.trim(), seq);
       continue;
     }
+    if (isChainPrepText(norm)) {
+      prepPrefixes.push(norm);
+      continue;
+    }
     if (classifyCommand(norm) === "verification") {
-      entries.push({ seg: norm, dir: state.dir });
+      entries.push({ seg: norm, dir: state.dir, prepKey: prepPrefixes.join(" && ") });
     }
   }
   return entries;
@@ -177,10 +191,10 @@ const RUNNER_VALUE_FLAGS = new Set([
 function isDefaultDiscoverableTestTarget(target, runnerPrefix) {
   const norm = target.replace(/\\/g, "/").replace(/^\.\//, "");
   if (runnerPrefix.includes("pytest")) {
-    return /(?:^|\/)tests?(?:\/|$)|(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm);
+    return /(?:^|\/)test_[^/]*\.py$|_test\.py$/.test(norm);
   }
   if (runnerPrefix[0] === "node" && runnerPrefix[1] === "--test") {
-    return /(?:^|\/)test(?:\/|$)|(?:^|\/)test\.[cm]?js$|[._-]test\.[cm]?js$/.test(norm);
+    return /(?:^|\/)test(?:\/|$)|(?:^|\/)test-[^/]*\.[cm]?js$|(?:^|\/)test\.[cm]?js$|[._-]test\.[cm]?js$/.test(norm);
   }
   return /(?:^|\/)(?:__tests__|tests?)(?:\/|$)|[._-](?:test|spec)\.[cm]?[jt]sx?$/i.test(norm);
 }
@@ -254,6 +268,16 @@ function segmentResolvedBy(failedSeg, passedSeg) {
   return droppedOnlyTargets && !passed.some((_, index) => index >= runner.end && isTarget(passed, index));
 }
 
+function entriesMatchForResolution(failedEntry, passedEntry) {
+  if (failedEntry.dir !== passedEntry.dir) {
+    return false;
+  }
+  if (failedEntry.prepKey && passedEntry.prepKey !== failedEntry.prepKey) {
+    return false;
+  }
+  return segmentResolvedBy(failedEntry.seg, passedEntry.seg);
+}
+
 function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBaseDir = ".") {
   const failedNorm = normalizeCommandText(failedCmd);
   const passedNorm = normalizeCommandText(passedCmd);
@@ -263,9 +287,7 @@ function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBa
   const failedEntries = extractVerificationEntries(failedCmd, failedBaseDir);
   const passedEntries = extractVerificationEntries(passedCmd, passedBaseDir);
   if (failedEntries.length > 0 && passedEntries.length > 0) {
-    return failedEntries.every((failedEntry) =>
-      passedEntries.some((passedEntry) => failedEntry.dir === passedEntry.dir && segmentResolvedBy(failedEntry.seg, passedEntry.seg)),
-    );
+    return failedEntries.every((failedEntry) => passedEntries.some((passedEntry) => entriesMatchForResolution(failedEntry, passedEntry)));
   }
   return normalizeExecDir(failedBaseDir) === normalizeExecDir(passedBaseDir) && segmentResolvedBy(failedNorm, passedNorm);
 }
@@ -284,21 +306,23 @@ function extractExecutionVerificationEntries(exec, defaultCwd = ".") {
 }
 
 function isExecutionResolvedBy(failedExec, passedExec, defaultCwd = ".") {
-  const failedBase = normalizeExecDir(failedExec?.execCwd || defaultCwd || ".");
-  const passedBase = normalizeExecDir(passedExec?.execCwd || defaultCwd || ".");
-  if (isCommandResolvedBy(failedExec?.command, passedExec?.command, failedBase, passedBase)) {
-    return true;
+  const hasFailedSubs = Array.isArray(failedExec?.subCommands) && failedExec.subCommands.length > 0;
+  const hasPassedSubs = Array.isArray(passedExec?.subCommands) && passedExec.subCommands.length > 0;
+  if (!hasFailedSubs && !hasPassedSubs) {
+    const failedBase = normalizeExecDir(failedExec?.execCwd || defaultCwd || ".");
+    const passedBase = normalizeExecDir(passedExec?.execCwd || defaultCwd || ".");
+    if (isCommandResolvedBy(failedExec?.command, passedExec?.command, failedBase, passedBase)) {
+      return true;
+    }
   }
   const failedEntries = extractExecutionVerificationEntries(failedExec, defaultCwd);
   const passedEntries = extractExecutionVerificationEntries(passedExec, defaultCwd);
   if (failedEntries.length > 0 && passedEntries.length > 0) {
-    return failedEntries.every((failedEntry) =>
-      passedEntries.some((passedEntry) => failedEntry.dir === passedEntry.dir && segmentResolvedBy(failedEntry.seg, passedEntry.seg)),
-    );
+    return failedEntries.every((failedEntry) => passedEntries.some((passedEntry) => entriesMatchForResolution(failedEntry, passedEntry)));
   }
-  const hasSubCommands = Array.isArray(failedExec?.subCommands) && failedExec.subCommands.length > 0;
   return Boolean(
-    !hasSubCommands &&
+    !hasFailedSubs &&
+      !hasPassedSubs &&
       failedExec?.toolName &&
       passedExec?.toolName &&
       failedExec.toolName === passedExec.toolName &&

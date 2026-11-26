@@ -849,8 +849,11 @@ export const CASES = [
     setupWorkspace: setupSampleCalcWorkspace,
     governanceExpectation: {
       expectWriteToolCallsExact: 0,
+      expectShellExecCallsMin: 1,
+      expectModifiedFilesInclude: ["src/calc.mjs"],
       expectStopGateBlocks: 1,
       expectStopContinueGate: true,
+      expectStopBeforeFinalPass: true,
       expectMaxStopExecutionNumBelow: 2,
       expectFinalVerdict: "PASS",
     },
@@ -1668,6 +1671,9 @@ export function summarizeGovernance({
   let handoffCalls = 0;
   let stopGateBlocks = 0;
   let writeToolCalls = 0;
+  let shellExecCalls = 0;
+  let firstStopGateStepOrder = -1;
+  let lastGateToolStepOrder = -1;
   let maxStepCacheReadTokens = null;
 
   const collectRoleCandidates = (call, targetAgentName) => {
@@ -1689,12 +1695,16 @@ export function summarizeGovernance({
     return candidates;
   };
 
-  for (const step of safeSteps) {
+  for (let sIdx = 0; sIdx < safeSteps.length; sIdx += 1) {
+    const step = safeSteps[sIdx];
     if (!step || typeof step !== "object") {
       continue;
     }
     if (step.type === "SYSTEM_MESSAGE" && typeof step.content === "string" && step.content.includes(GATE_STOP_MARKER)) {
       stopGateBlocks += 1;
+      if (firstStopGateStepOrder === -1) {
+        firstStopGateStepOrder = sIdx;
+      }
     }
     if (step.type === "PLANNER_RESPONSE") {
       for (const call of getToolCalls(step)) {
@@ -1702,8 +1712,12 @@ export function summarizeGovernance({
         if (WRITE_TOOL_NAMES.has(name)) {
           writeToolCalls += 1;
         }
+        if (name === "run_command" || name === "mcp_agy-fast_fast_run_checks") {
+          shellExecCalls += 1;
+        }
         if (name === GATE_TOOL_NAME) {
           transcriptGateCalls += 1;
+          lastGateToolStepOrder = sIdx;
         } else if (name === HANDOFF_TOOL_NAME) {
           handoffCalls += 1;
         } else if (USER_VOTE_TOOL_NAMES.has(name)) {
@@ -1841,6 +1855,8 @@ export function summarizeGovernance({
     stopBlocks,
     stopGateBlocks,
     writeToolCalls,
+    shellExecCalls,
+    stopBeforeFinalPass: firstStopGateStepOrder !== -1 && lastGateToolStepOrder > firstStopGateStepOrder,
     stopContinueGateCount,
     stopMaxExecutionNum,
     cacheReadTokens,
@@ -1946,6 +1962,23 @@ export function evaluateGovernanceCase(
 
   if (typeof exp.expectWriteToolCallsExact === "number" && governance.writeToolCalls !== exp.expectWriteToolCallsExact) {
     failures.push(`Expected writeToolCalls=${exp.expectWriteToolCallsExact}, got ${governance.writeToolCalls}`);
+  }
+
+  if (typeof exp.expectShellExecCallsMin === "number" && governance.shellExecCalls < exp.expectShellExecCallsMin) {
+    failures.push(`Expected at least ${exp.expectShellExecCallsMin} shell execution call(s), got ${governance.shellExecCalls}`);
+  }
+
+  if (Array.isArray(exp.expectModifiedFilesInclude)) {
+    const dirtyAndWritten = new Set([...governance.modifiedFiles, ...governance.turnCodeWrittenFiles]);
+    for (const expectedFile of exp.expectModifiedFilesInclude) {
+      if (!dirtyAndWritten.has(expectedFile)) {
+        failures.push(`Expected modified files to include "${expectedFile}", got [${Array.from(dirtyAndWritten).join(", ")}]`);
+      }
+    }
+  }
+
+  if (exp.expectStopBeforeFinalPass === true && !governance.stopBeforeFinalPass) {
+    failures.push("Expected Stop gate block to occur before final verify_completion pass call");
   }
 
   if (exp.expectStopContinueGate === true && governance.stopContinueGateCount < 1) {

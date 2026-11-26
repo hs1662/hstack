@@ -136,9 +136,9 @@ const EN_LANG_CLAUSE_END = "(?=\\s*(?:$|[.,!?;:)]|(?:please|only|from|instead|no
 const EN_SWITCH_REQUEST_RE = new RegExp(
   `(?:^|[,;]\\s*|\\b(?:and|then|so|let['’]?s|let\\s+us|(?:can|could|would|will)\\s+(?:you|we))\\s+)` +
     `(?:(?:please|kindly|just|now|only|always)\\s+)*` +
-    `(?:(?:switch|change|go)\\s+(?:back\\s+|over\\s+)?(?:to|into)\\s+${FOREIGN_LANG_EN}\\b` +
+    `(?:(?:switch|change|go)\\s+(?:back\\s+|over\\s+)?(?:to|into)\\s+${FOREIGN_LANG_EN}${EN_LANG_CLAUSE_END}` +
     `|(?:use|speak|talk|chat|converse|communicate)\\s+(?:only\\s+)?(?:in\\s+)?${FOREIGN_LANG_EN}${EN_LANG_CLAUSE_END})` +
-    `|^\\s*from\\s+now\\s+on\\b[,\\s]+(?:(?:please|just|only)\\s+)*(?:(?:reply|respond|answer|write|speak|talk|use)\\s+)?(?:in\\s+)?${FOREIGN_LANG_EN}\\b`,
+    `|^\\s*from\\s+now\\s+on\\b[,\\s]+(?:(?:please|just|only)\\s+)*(?:(?:reply|respond|answer|write|speak|talk|use)\\s+)?(?:in\\s+)?${FOREIGN_LANG_EN}${EN_LANG_CLAUSE_END}`,
   "gi",
 );
 

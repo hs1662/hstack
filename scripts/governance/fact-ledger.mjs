@@ -103,6 +103,7 @@ const CARGO_VALUE_FLAGS = new Set(["--manifest-path", "--target", "--target-dir"
 const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench", "compile"]);
 const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
 const JS_TEST_LIST_FLAGS = new Set(["--listTests", "--list-tests", "--list", "--showConfig", "--show-config"]);
+const MAKE_DRY_RUN_LONG_FLAGS = new Set(["--just-print", "--dry-run", "--recon", "--question", "--touch", "--print-data-base"]);
 const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
 const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
   /^(?:--if-present|--script-shell|--userconfig|--globalconfig|--prefix|--dir|--cwd|-C|--preload|-r|--require|--import|--loader)(?:=|$)/;
@@ -1047,6 +1048,20 @@ function isJsTestToolArgsSafe(tool, toolArgs) {
   return true;
 }
 
+function isMakeVerification(args) {
+  const sepIdx = args.indexOf("--");
+  const head = sepIdx === -1 ? args : args.slice(0, sepIdx);
+  for (const arg of head) {
+    if (MAKE_DRY_RUN_LONG_FLAGS.has(arg)) {
+      return false;
+    }
+    if (/^-[A-Za-z]+$/.test(arg) && /[nqtp]/.test(arg.slice(1))) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function isVerificationScriptName(name) {
   return Boolean(name) && !/[/\\.]/.test(name) && VERIFY_SCRIPT_NAME_RE.test(name) && !WRITE_SCRIPT_NAME_RE.test(name);
 }
@@ -1191,6 +1206,9 @@ function isRunnerCommand({ words, redirects }) {
     return false;
   }
   if ((baseBin === "vitest" || baseBin === "jest" || baseBin === "playwright" || baseBin === "cypress") && !isJsTestToolArgsSafe(baseBin, args)) {
+    return false;
+  }
+  if (baseBin === "make" && !isMakeVerification(args)) {
     return false;
   }
   if (PACKAGE_EXEC_RUNNERS.has(baseBin) && !isPackageExecVerification(args)) {
@@ -2010,9 +2028,11 @@ function createEmptyLedger(transcriptAvailable = false) {
     turnSubagentAudits: [],
     pendingAsyncAuditorCount: 0,
     pendingAsyncAuditsAfterLastWrite: 0,
+    pendingAsyncAuditLaunchSteps: [],
     turnPreflightChallenges: [],
     pendingAsyncChallenges: 0,
     pendingAsyncChallengesAfterLastWrite: 0,
+    pendingAsyncChallengeLaunchSteps: [],
     turnUserVotes: [],
     turnHasManualPreflightCommand: false,
     turnAutoChallengeTriggered: false,
@@ -2495,6 +2515,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     return null;
   }
   ledger.pendingAsyncAuditorCount = asyncAuditsByConversationId.size;
+  ledger.pendingAsyncAuditLaunchSteps = Array.from(asyncAuditsByConversationId.values()).map((entry) => entry.launchedStepIndex);
   let pendingAfterLastWrite = 0;
   for (const entry of asyncAuditsByConversationId.values()) {
     if (entry.launchedStepIndex > ledger.lastWriteStepIndex) {
@@ -2503,6 +2524,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
   }
   ledger.pendingAsyncAuditsAfterLastWrite = pendingAfterLastWrite;
   ledger.pendingAsyncChallenges = asyncChallengesByConversationId.size;
+  ledger.pendingAsyncChallengeLaunchSteps = Array.from(asyncChallengesByConversationId.values()).map((entry) => entry.launchedStepIndex);
   let pendingChallengesAfterLastWrite = 0;
   for (const entry of asyncChallengesByConversationId.values()) {
     if (entry.launchedStepIndex > ledger.lastWriteStepIndex) {
@@ -2855,7 +2877,7 @@ const SNAPSHOT_MAX_BUFFER = 16 * 1024 * 1024;
 function statSnapshotFile(gitRoot, relPath) {
   try {
     const st = statSync(join(gitRoot, relPath));
-    return [st.mtimeMs, st.size];
+    return [st.mtimeMs, st.size, (st.mode & 0o170000) | (st.mode & 0o111 ? 0o111 : 0)];
   } catch {
     return null;
   }

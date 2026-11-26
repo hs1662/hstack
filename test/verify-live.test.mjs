@@ -717,6 +717,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
         makeStep(4, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
       ],
       auditRecords: passRecords,
+      gitDirtyFiles: ["src/calc.mjs"],
     });
     assert.equal(l16Pass.ok, true, l16Pass.failures.join("; "));
 
@@ -724,8 +725,10 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
       steps: [
         makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: "replace_file_content", args: {} }] }),
         stopBlock,
+        makeStep(4, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] }),
       ],
       auditRecords: passRecords,
+      gitDirtyFiles: ["src/calc.mjs"],
     });
     assert.equal(l16EditTool.ok, false);
     assert.ok(l16EditTool.failures.some((msg) => msg.includes("writeToolCalls=0")));
@@ -733,6 +736,7 @@ describe("verify-live governance cases L1-L4, audit parsing, and panic detection
     const l16NoGate = evaluateGovernanceCase(l16, {
       steps: [makeStep(1, "PLANNER_RESPONSE", { thinking: koreanThinking, toolCalls: [sedCall] })],
       auditRecords: [{ event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 }],
+      gitDirtyFiles: ["src/calc.mjs"],
     });
     assert.equal(l16NoGate.ok, false);
     assert.ok(l16NoGate.failures.some((msg) => msg.includes("stopGateBlocks=1")));
