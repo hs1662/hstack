@@ -49,7 +49,9 @@ export function isPreToolDenialStep(step) {
 }
 
 // Call indexes of a PLANNER_RESPONSE whose result GENERIC is a PreToolUse denial. The k-th result GENERIC
-// belongs to the k-th tool call; step indexes keep that mapping when non-denial GENERICs were not parsed.
+// belongs to the k-th tool call. Readers stamp each kept denial with `resultOrdinal`, its k among all
+// GENERIC records after the planner, since non-denial GENERICs and other record types are not kept;
+// steps built without it fall back to step-index arithmetic.
 export function deniedToolCallIndexes(steps, plannerPos) {
   const denied = new Set();
   const planner = steps[plannerPos];
@@ -68,7 +70,11 @@ export function deniedToolCallIndexes(steps, plannerPos) {
       skipped += 1;
       continue;
     }
-    const offset = base !== null && Number.isFinite(next.stepIndex) ? next.stepIndex - base - 1 - skipped : -1;
+    const offset = Number.isInteger(next.resultOrdinal)
+      ? next.resultOrdinal
+      : base !== null && Number.isFinite(next.stepIndex)
+        ? next.stepIndex - base - 1 - skipped
+        : -1;
     if (isPreToolDenialStep(next)) {
       denied.add(offset >= ordinal ? offset : ordinal);
     }
@@ -120,6 +126,20 @@ export function recordToStep(parsed, fallbackStepIndex) {
   };
 }
 
+// Ordinal of each GENERIC record among the results since the last PLANNER_RESPONSE or USER_INPUT.
+export function createResultOrdinalCounter() {
+  let count = 0;
+  return {
+    next(type) {
+      if (type === "PLANNER_RESPONSE" || type === "USER_INPUT") {
+        count = 0;
+        return -1;
+      }
+      return type === "GENERIC" ? count++ : -1;
+    },
+  };
+}
+
 export function parseTranscriptLine(line, fallbackStepIndex = 0) {
   const parsed = parseRawRecord(line);
   return parsed ? recordToStep(parsed, fallbackStepIndex) : null;
@@ -131,15 +151,20 @@ export function parseTranscriptJsonlWithStats(rawText) {
   }
 
   const steps = [];
+  const results = createResultOrdinalCounter();
   let validRecordCount = 0;
   for (const line of rawText.split(/\r?\n/)) {
     const parsed = parseRawRecord(line);
     if (!parsed) {
       continue;
     }
+    const ordinal = results.next(parsed.type);
     const step = recordToStep(parsed, validRecordCount);
     validRecordCount += 1;
     if (step) {
+      if (step.type === "GENERIC") {
+        step.resultOrdinal = ordinal;
+      }
       steps.push(step);
     }
   }

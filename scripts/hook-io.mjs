@@ -8,7 +8,7 @@ import {
   isPreToolDenialStep,
   parseTranscriptJsonlWithStats,
 } from "./transcript.mjs";
-import { parseRawRecord, parseStepIndex, recordToStep } from "./transcript/steps.mjs";
+import { createResultOrdinalCounter, parseRawRecord, parseStepIndex, recordToStep } from "./transcript/steps.mjs";
 
 const CHUNK_SIZE = 256 * 1024;
 const PREFIX_SCAN_BYTES = 256;
@@ -609,11 +609,15 @@ export function createStepCollector(limit = Infinity) {
   let latestUserStep = null;
   let decision = true;
   let count = 0;
+  // Skipped GENERIC lines still count as results, so ordinals come from the line type, not from kept steps.
+  const results = createResultOrdinalCounter();
+  let ordinal = -1;
   return {
     get count() {
       return count;
     },
     peek(prefixType) {
+      ordinal = prefixType === null ? -1 : results.next(prefixType);
       if (prefixType === null || KEPT_STEP_TYPES.has(prefixType)) {
         decision = true;
       } else {
@@ -622,6 +626,9 @@ export function createStepCollector(limit = Infinity) {
       return decision;
     },
     visit(prefixType, lineBytes, rawLine, parsed, recordIndex) {
+      if (prefixType === null) {
+        ordinal = results.next(parsed.type);
+      }
       if (decision === false || (typeof decision === "number" && lineBytes > decision)) {
         return;
       }
@@ -631,6 +638,9 @@ export function createStepCollector(limit = Infinity) {
       const step = recordToStep(parsed, recordIndex);
       if (!step) {
         return;
+      }
+      if (step.type === "GENERIC") {
+        step.resultOrdinal = ordinal;
       }
       steps.push(step);
       count += 1;
