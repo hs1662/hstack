@@ -2343,8 +2343,9 @@ export function resolveGitRootFast(startDir) {
   return "";
 }
 
-// git status runs ~7ms median here; a 50ms cap timed out under parallel load and silently skipped the gate.
-const SNAPSHOT_GIT_TIMEOUT_MS = 250;
+// git status runs ~7ms median here but reached 589ms under parallel suite load, and a timed-out snapshot fails
+// closed, so 250ms blocked Stop on committed verified work. Stop's four git calls at 750ms fit the 5s hook timeout.
+const SNAPSHOT_GIT_TIMEOUT_MS = 750;
 const SNAPSHOT_MAX_FILES = 2000;
 
 // Cheap working-tree fingerprint: dirty/untracked paths from git status plus [mtimeMs, size] (null when missing).
