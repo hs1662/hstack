@@ -261,7 +261,9 @@ function splitShellChain(commandLine) {
       i += 1;
       continue;
     }
-    if (ch === ";" || ch === "|" || ch === "\n") {
+    // A lone `&` backgrounds its segment; `>&`, `<&` and `&>` are redirections.
+    const isBackground = ch === "&" && next !== ">" && !/[<>]$/.test(current);
+    if (ch === ";" || ch === "|" || ch === "\n" || isBackground) {
       chain.push({ text: current, op: ch });
       current = "";
       continue;
@@ -278,21 +280,16 @@ export function splitShellSegments(commandLine) {
   return splitShellChain(commandLine).map((seg) => seg.text);
 }
 
-const ALWAYS_SUCCESS_SEGMENT_RE = /^(?:true|:|exit\s+0|(?:echo|printf)(?:\s.*)?)$/;
-
-function isAlwaysSuccessSegment(text) {
-  return ALWAYS_SUCCESS_SEGMENT_RE.test(text.trim().replace(/^[(\s]+|[)\s]+$/g, ""));
-}
-
-// `true || npm test` never runs the test; `npm test || true` hides its exit status.
-function hasMaskedOrPair(commandLine) {
+// Only an `&&` chain keeps a runner's failing exit status: `|`, `;`, `||`, `&` and `!` all let a failure exit 0.
+function isExitStatusPreservingChain(commandLine) {
   const chain = splitShellChain(commandLine);
-  for (let i = 0; i + 1 < chain.length; i += 1) {
-    if (chain[i].op === "||" && (isAlwaysSuccessSegment(chain[i].text) || isAlwaysSuccessSegment(chain[i + 1].text))) {
-      return true;
-    }
+  while (chain.length > 1 && chain.at(-1).text.trim().length === 0) {
+    chain.pop();
   }
-  return false;
+  return chain.every(
+    (seg, i) =>
+      !seg.text.trim().startsWith("!") && (i < chain.length - 1 ? seg.op === "&&" : seg.op === "" || seg.op === ";" || seg.op === "\n"),
+  );
 }
 
 function tokenizeSegment(segment) {
@@ -480,7 +477,7 @@ export function classifyCommand(commandLine) {
     }
   }
   if (sawVerification) {
-    return hasMaskedOrPair(commandLine) ? "other" : "verification";
+    return isExitStatusPreservingChain(commandLine) ? "verification" : "other";
   }
   return sawOther ? "other" : "read_only";
 }
