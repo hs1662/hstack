@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import { statSync } from "node:fs";
+import { join } from "node:path";
+
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { PASSING_VERDICTS, isExemptDocOrAssetPath } from "./governance/constants.mjs";
 import {
@@ -37,6 +40,16 @@ function tryLogStopTelemetry(payload, info) {
   }
 }
 
+// The [mtimeMs, size] signature snapshotWorkingTree records, or null for a missing file.
+function statSignature(gitRoot, relPath) {
+  try {
+    const st = statSync(join(gitRoot, relPath));
+    return [st.mtimeMs, st.size];
+  } catch {
+    return null;
+  }
+}
+
 function sameFileSignature(a, b) {
   return Array.isArray(a) && Array.isArray(b) ? a[0] === b[0] && a[1] === b[1] : a === b;
 }
@@ -68,10 +81,12 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
     return true;
   }
-  const changedSince = (files, committed, relPath) =>
-    committed.has(relPath) ||
-    (relPath in files) !== (relPath in current.files) ||
-    (relPath in files && !sameFileSignature(files[relPath], current.files[relPath]));
+  // A committed file is clean now, so its signature comes from disk; one that still matches the snapshot was
+  // dirty before the turn and only committed, not edited.
+  const changedSince = (files, committed, relPath) => {
+    const now = relPath in current.files ? current.files[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
+    return relPath in files ? !sameFileSignature(files[relPath], now) : now !== undefined;
+  };
   // A change the verify_completion snapshot did not see happened after it, whatever the command looked like.
   const lastGateStep = ledger.turnGateAttempts.at(-1)?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
