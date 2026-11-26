@@ -18,8 +18,10 @@ import { resolvePluginDataDir } from "../hook-io.mjs";
 import {
   DEFAULT_POLLUTION_THRESHOLDS,
   HANDOFF_COPY,
+  PASSING_VERDICTS,
+  isExemptDocOrAssetPath,
 } from "./constants.mjs";
-import { normalizeWorkspacePath } from "./fact-ledger.mjs";
+import { listCommittedPaths, normalizeWorkspacePath, resolveGitRootFast, snapshotWorkingTree } from "./fact-ledger.mjs";
 
 const MAX_SNAPSHOTS_PER_WORKSPACE = 20;
 const MAX_LIST_SNAPSHOTS = 10;
@@ -458,6 +460,86 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   const gate =
     gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles) ? { head: headOf(snap.gate), files: gateFiles } : null;
   return { gitRoot: snap.gitRoot, head: headOf(snap), files: snap.files, gate };
+}
+
+// The [mtimeMs, size] signature snapshotWorkingTree records, or null for a missing file.
+function statSignature(gitRoot, relPath) {
+  try {
+    const st = statSync(join(gitRoot, relPath));
+    return [st.mtimeMs, st.size];
+  } catch {
+    return null;
+  }
+}
+
+function sameFileSignature(a, b) {
+  return Array.isArray(a) && Array.isArray(b) ? a[0] === b[0] && a[1] === b[1] : a === b;
+}
+
+// Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
+// Returns true when a possibly writing shell command ran in a git tree that could not be diffed (fail closed).
+// Stop and verify_completion both call this, so a shell edit gets the same rules as a write-tool edit.
+// dirtyFiles (git status paths) stand in for the diff when there is no snapshot to diff against.
+export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), dataDir = resolvePluginDataDir() }) {
+  // run_command and mcp_agy-fast_fast_run_checks both run arbitrary shell commands.
+  const shellExecs = ledger.turnExecutions;
+  if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
+    return false;
+  }
+  const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
+  // Date a change at the last command that could have made it: a writer, else a read-only-looking command, else a check.
+  const byKind = (kind) => shellExecs.filter((exec) => exec.kind === kind).at(-1);
+  const writeStep = (byKind("other") ?? byKind("read_only") ?? shellExecs.at(-1)).stepIndex;
+  const otherStep = byKind("other")?.stepIndex ?? -1;
+  const record = (relPath, step) => {
+    ledger.turnWrittenFiles.add(relPath);
+    ledger.turnCodeWrittenFiles.add(relPath);
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
+    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
+  };
+  // A write tool already dated its own file; with no writer command in the turn, a check must not re-date it.
+  const keepsToolDate = (relPath) => otherStep === -1 && ledger.turnWrittenFiles.has(relPath);
+  const baseline = readTurnSnapshot({ conversationId: conversationKey, turnStartStepIndex: ledger.turnStartStepIndex, dataDir });
+  const current = baseline ? snapshotWorkingTree(cwd) : null;
+  // Commits made this turn leave a clean tree, so the files they touched count as changed too.
+  const committedSince = (head) =>
+    head === null || head === current.head ? new Set() : listCommittedPaths(current.gitRoot, head, current.head);
+  const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
+  const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
+  if (!sinceTurn || !sinceGate) {
+    if (writers.length === 0 || !resolveGitRootFast(cwd)) {
+      return false;
+    }
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
+    // Without a diff any dirty code file may be the shell's, so each one needs reporting and a check after it.
+    for (const relPath of dirtyFiles) {
+      if (!isExemptDocOrAssetPath(relPath) && !keepsToolDate(relPath)) {
+        record(relPath, writeStep);
+      }
+    }
+    return true;
+  }
+  // A committed file is clean now, so its signature comes from disk; one that still matches the snapshot was
+  // dirty before the turn and only committed, not edited.
+  const changedSince = (files, committed, relPath) => {
+    const now = relPath in current.files ? current.files[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
+    return relPath in files ? !sameFileSignature(files[relPath], now) : now !== undefined;
+  };
+  // A change the snapshot of the last passing verify_completion did not see happened after it, whatever the
+  // command looked like.
+  const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
+  const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
+  for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
+    if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
+      continue;
+    }
+    if (postGateShell.length > 0 && changedSince(baseline.gate.files, sinceGate, relPath)) {
+      record(relPath, postGateShell.at(-1).stepIndex);
+    } else if (!keepsToolDate(relPath)) {
+      record(relPath, writeStep);
+    }
+  }
+  return false;
 }
 
 export function markPreflightChallengeLogged({

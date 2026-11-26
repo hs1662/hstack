@@ -9,6 +9,7 @@ import { detectTestInfrastructure, readFactLedger, readGitLedger, snapshotWorkin
 import {
   listHandoffSnapshots,
   loadHandoffSnapshot,
+  mergeShellWrittenFiles,
   readSessionState,
   resolveEffectiveConversationKey,
   saveGateSnapshot,
@@ -337,6 +338,8 @@ export function createMcpServerHandler(options = {}) {
     if (!ledger.transcriptAvailable) {
       return skipNoSession({ ledgerScanMs, gitScanMs });
     }
+    const conversationKey = resolveEffectiveConversationKey(conversationId, cwd);
+    mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles: gitLedger.gitDirtyFiles, dataDir });
     const testInfra = detectTestInfrastructure(cwd, gitLedger.gitRoot || null);
     const governanceConfig = readGovernanceConfig(dataDir);
     const auditEscalation = resolveAuditEscalationMode(dataDir, governanceConfig);
@@ -357,7 +360,7 @@ export function createMcpServerHandler(options = {}) {
 
     // Stop dates later shell-made tree changes against the tree the last passing verify_completion saw.
     if (cwd && PASSING_VERDICTS.has(decision.verdict)) {
-      saveGateSnapshot({ conversationId: resolveEffectiveConversationKey(conversationId, cwd), snapshot: snapshotWorkingTree(cwd), dataDir });
+      saveGateSnapshot({ conversationId: conversationKey, snapshot: snapshotWorkingTree(cwd), dataDir });
     }
 
     const completedPriorAttempts = ledger.turnGateAttempts.filter((attempt) => attempt.verdict !== "UNKNOWN").length;

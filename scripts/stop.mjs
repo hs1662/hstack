@@ -1,18 +1,9 @@
 #!/usr/bin/env node
 
-import { statSync } from "node:fs";
-import { join } from "node:path";
-
 import { appendAuditRecord } from "./governance/audit-log.mjs";
-import { PASSING_VERDICTS, isExemptDocOrAssetPath } from "./governance/constants.mjs";
-import {
-  listCommittedPaths,
-  readFactLedgerAndSteps,
-  readGitLedger,
-  resolveGitRootFast,
-  snapshotWorkingTree,
-} from "./governance/fact-ledger.mjs";
-import { readTurnSnapshot, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
+import { PASSING_VERDICTS } from "./governance/constants.mjs";
+import { readFactLedgerAndSteps, readGitLedger } from "./governance/fact-ledger.mjs";
+import { mergeShellWrittenFiles, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
 import { isDirectExecution, loadHookContext, parseHookPayload, payloadTranscriptPath, runHookCli } from "./hook-io.mjs";
 import { DRIFT_MARKER, GATE_STOP_MARKER, decideStopAction } from "./transcript.mjs";
 
@@ -38,71 +29,6 @@ function tryLogStopTelemetry(payload, info) {
     });
   } catch {
   }
-}
-
-// The [mtimeMs, size] signature snapshotWorkingTree records, or null for a missing file.
-function statSignature(gitRoot, relPath) {
-  try {
-    const st = statSync(join(gitRoot, relPath));
-    return [st.mtimeMs, st.size];
-  } catch {
-    return null;
-  }
-}
-
-function sameFileSignature(a, b) {
-  return Array.isArray(a) && Array.isArray(b) ? a[0] === b[0] && a[1] === b[1] : a === b;
-}
-
-// Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
-// Returns true when a possibly writing shell command ran in a git tree that could not be diffed (fail closed).
-function mergeShellWrittenFiles(ledger, payload, cwd) {
-  const shellExecs = ledger.turnExecutions.filter((exec) => !exec.toolName);
-  if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
-    return false;
-  }
-  const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
-  const writeStep = (writers.length > 0 ? writers : shellExecs).at(-1).stepIndex;
-  const rawConversationId = payload.conversationId ?? payload.conversation_id;
-  const baseline = readTurnSnapshot({
-    conversationId: resolveEffectiveConversationKey(typeof rawConversationId === "string" ? rawConversationId : "", cwd),
-    turnStartStepIndex: ledger.turnStartStepIndex,
-  });
-  const current = baseline ? snapshotWorkingTree(cwd) : null;
-  // Commits made this turn leave a clean tree, so the files they touched count as changed too.
-  const committedSince = (head) =>
-    head === null || head === current.head ? new Set() : listCommittedPaths(current.gitRoot, head, current.head);
-  const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
-  const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
-  if (!sinceTurn || !sinceGate) {
-    if (writers.length === 0 || !resolveGitRootFast(cwd)) {
-      return false;
-    }
-    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
-    return true;
-  }
-  // A committed file is clean now, so its signature comes from disk; one that still matches the snapshot was
-  // dirty before the turn and only committed, not edited.
-  const changedSince = (files, committed, relPath) => {
-    const now = relPath in current.files ? current.files[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
-    return relPath in files ? !sameFileSignature(files[relPath], now) : now !== undefined;
-  };
-  // A change the snapshot of the last passing verify_completion did not see happened after it, whatever the
-  // command looked like.
-  const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
-  const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
-  for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
-    if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
-      continue;
-    }
-    const step =
-      postGateShell.length > 0 && changedSince(baseline.gate.files, sinceGate, relPath) ? postGateShell.at(-1).stepIndex : writeStep;
-    ledger.turnWrittenFiles.add(relPath);
-    ledger.turnCodeWrittenFiles.add(relPath);
-    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, step);
-    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, step);
-  }
-  return false;
 }
 
 export function handleStop(stdinText, readTextFile) {
@@ -143,7 +69,9 @@ export function handleStop(stdinText, readTextFile) {
   if (steps.length === 0) {
     return {};
   }
-  const undiffableShellWrite = Boolean(ledger?.transcriptAvailable && mergeShellWrittenFiles(ledger, payload, cwd));
+  const rawConversationId = payload.conversationId ?? payload.conversation_id;
+  const conversationKey = resolveEffectiveConversationKey(typeof rawConversationId === "string" ? rawConversationId : "", cwd);
+  const undiffableShellWrite = Boolean(ledger?.transcriptAvailable && mergeShellWrittenFiles(ledger, { conversationKey, cwd }));
 
   const isReadOnlyGovernanceRole = ledger?.sessionRole === "auditor" || ledger?.sessionRole === "challenger";
   const hasPendingAsyncAuditor = Boolean(ledger && ledger.pendingAsyncAuditsAfterLastWrite > 0);
