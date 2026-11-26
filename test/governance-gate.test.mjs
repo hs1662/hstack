@@ -141,8 +141,8 @@ describe("decideGate core rules R1-R7", () => {
     assert.deepEqual(concealedPrior.details.failedVerifications, ["npm run lint"]);
   });
 
-  it("R3_CONCEALED_FAILURE resolves a failure only by rerunning the equivalent command, and still blocks unrelated failures", () => {
-    const notResolvedByBroaderRerun = decideGate(
+  it("R3_CONCEALED_FAILURE resolves an earlier narrower failure when a broader superset verification passes later, but still blocks unrelated failures", () => {
+    const resolvedBySuperset = decideGate(
       makeInput({
         verification_runs: [{ command: "node --test", outcome: "pass" }],
       }),
@@ -157,9 +157,8 @@ describe("decideGate core rules R1-R7", () => {
         testInfra: { hasTestSuite: true, indicators: ["test/"] },
       },
     );
-    assert.equal(notResolvedByBroaderRerun.verdict, "REJECT");
-    assert.deepEqual(notResolvedByBroaderRerun.blockedRules, ["R3_CONCEALED_FAILURE"]);
-    assert.deepEqual(notResolvedByBroaderRerun.details.failedVerifications, ["node --test test/app.test.mjs"]);
+    assert.equal(resolvedBySuperset.verdict, "PASS");
+    assert.deepEqual(resolvedBySuperset.blockedRules, []);
 
     const resolvedBySameCommand = decideGate(
       makeInput({
