@@ -18,28 +18,32 @@ import { PLUGIN_ROOT, createTempDir, toJsonl } from "./helpers.mjs";
 
 const HANDOFF_STORE_URL = pathToFileURL(join(PLUGIN_ROOT, "scripts", "governance", "handoff-store.mjs")).href;
 
-// Each child waits for a shared start time, then claims its own key and one key every child shares.
+// Long-lived children (started once, so 10 trials do not pay 160 node startups): on each message a child
+// sleeps until the shared start time, then claims its own key and one key every child shares.
 const CLAIM_CHILD = `
 const { claimAutonomyTurnFlag } = await import(${JSON.stringify(HANDOFF_STORE_URL)});
-const [dataDir, key, startAt] = process.argv.slice(1);
-while (Date.now() < Number(startAt)) {}
-const own = claimAutonomyTurnFlag({ conversationId: "conv1", flagName: "autoHandoffTurns", turnKey: key, dataDir });
-const shared = claimAutonomyTurnFlag({ conversationId: "conv1", flagName: "autoHandoffTurns", turnKey: "shared", dataDir });
-process.stdout.write(JSON.stringify({ own, shared }));
+process.on("message", ({ dataDir, key, startAt }) => {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.max(0, startAt - Date.now()));
+  const own = claimAutonomyTurnFlag({ conversationId: "conv1", flagName: "autoHandoffTurns", turnKey: key, dataDir });
+  const shared = claimAutonomyTurnFlag({ conversationId: "conv1", flagName: "autoHandoffTurns", turnKey: "shared", dataDir });
+  process.send({ own, shared });
+});
+process.send("ready");
 `;
 
-function runClaimChild(dataDir, key, startAt) {
+function nextMessage(child) {
   return new Promise((resolvePromise, reject) => {
-    const child = spawn(process.execPath, ["--input-type=module", "-e", CLAIM_CHILD, dataDir, key, String(startAt)], {
-      stdio: ["ignore", "pipe", "pipe"],
+    const onExit = (code) => reject(new Error(`claim child exited with ${code}`));
+    child.once("exit", onExit);
+    child.once("message", (msg) => {
+      child.off("exit", onExit);
+      resolvePromise(msg);
     });
-    let out = "";
-    let err = "";
-    child.stdout.on("data", (chunk) => (out += chunk));
-    child.stderr.on("data", (chunk) => (err += chunk));
-    child.on("error", reject);
-    child.on("close", (code) => (code === 0 ? resolvePromise(JSON.parse(out)) : reject(new Error(err || `exit ${code}`))));
   });
+}
+
+function startClaimChild() {
+  return spawn(process.execPath, ["--input-type=module", "-e", CLAIM_CHILD], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
 }
 
 function sessionPath(dataDir) {
@@ -54,32 +58,44 @@ describe("#5 session lock is exclusive under contention and reclaims stale locks
   it("keeps 16/16 parallel claims and grants a shared key exactly once across 10 trials with a pre-aged stale lock", async () => {
     const CHILDREN = 16;
     const TRIALS = 10;
-    for (let trial = 0; trial < TRIALS; trial += 1) {
-      const dataDir = createTempDir("hstack-p1-lock-");
-      mkdirSync(join(dataDir, "sessions"));
-      const lockPath = `${sessionPath(dataDir)}.lock`;
-      writeFileSync(lockPath, "");
-      const aged = new Date(Date.now() - 60_000);
-      utimesSync(lockPath, aged, aged);
+    const children = Array.from({ length: CHILDREN }, startClaimChild);
+    try {
+      await Promise.all(children.map(nextMessage));
+      for (let trial = 0; trial < TRIALS; trial += 1) {
+        const dataDir = createTempDir("hstack-p1-lock-");
+        mkdirSync(join(dataDir, "sessions"));
+        const lockPath = `${sessionPath(dataDir)}.lock`;
+        writeFileSync(lockPath, "");
+        const aged = new Date(Date.now() - 60_000);
+        utimesSync(lockPath, aged, aged);
 
-      const startAt = Date.now() + 400;
-      const results = await Promise.all(
-        Array.from({ length: CHILDREN }, (_, i) => runClaimChild(dataDir, `k${i}`, startAt)),
-      );
-      const persisted = JSON.parse(readFileSync(sessionPath(dataDir), "utf8")).autoHandoffTurns;
-      const label = `trial ${trial + 1}`;
-      assert.deepEqual(
-        results.map((r) => r.own),
-        Array(CHILDREN).fill(true),
-        `${label}: every child acquires the lock`,
-      );
-      assert.equal(results.filter((r) => r.shared === true).length, 1, `${label}: shared key granted exactly once`);
-      assert.equal(results.filter((r) => r.shared === false).length, CHILDREN - 1, `${label}: others see it taken`);
-      for (let i = 0; i < CHILDREN; i += 1) {
-        assert.ok(persisted.includes(`k${i}`), `${label}: k${i} persisted`);
+        const startAt = Date.now() + 50;
+        const results = await Promise.all(
+          children.map((child, i) => {
+            const reply = nextMessage(child);
+            child.send({ dataDir, key: `k${i}`, startAt });
+            return reply;
+          }),
+        );
+        const persisted = JSON.parse(readFileSync(sessionPath(dataDir), "utf8")).autoHandoffTurns;
+        const label = `trial ${trial + 1}`;
+        assert.deepEqual(
+          results.map((r) => r.own),
+          Array(CHILDREN).fill(true),
+          `${label}: every child acquires the lock`,
+        );
+        assert.equal(results.filter((r) => r.shared === true).length, 1, `${label}: shared key granted exactly once`);
+        assert.equal(results.filter((r) => r.shared === false).length, CHILDREN - 1, `${label}: others see it taken`);
+        for (let i = 0; i < CHILDREN; i += 1) {
+          assert.ok(persisted.includes(`k${i}`), `${label}: k${i} persisted`);
       }
       assert.equal(persisted.filter((k) => k === "shared").length, 1, `${label}: shared persisted once`);
       assert.equal(persisted.length, CHILDREN + 1, `${label}: 0 lost, 0 duplicate records`);
+      }
+    } finally {
+      for (const child of children) {
+        child.kill();
+      }
     }
   });
 
