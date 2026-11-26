@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,12 +8,14 @@ import {
   isPreToolDenialStep,
   parseTranscriptJsonlWithStats,
 } from "./transcript.mjs";
-import { parseRawRecord, recordToStep } from "./transcript/steps.mjs";
+import { parseRawRecord, parseStepIndex, recordToStep } from "./transcript/steps.mjs";
 
 const CHUNK_SIZE = 256 * 1024;
 const PREFIX_SCAN_BYTES = 256;
 const NEWLINE_BYTE = 0x0a;
 const PROBE_MAX_BYTES = 1024 * 1024;
+const TAIL_SCAN_MIN_BYTES = 1024 * 1024;
+const TAIL_START_BYTES = 256 * 1024;
 
 function isAsciiWhitespace(byte) {
   return byte === 0x20 || byte === 0x09 || byte === 0x0d || byte === 0x0a;
@@ -107,12 +109,31 @@ function startJsonValue(state, b) {
   }
 }
 
+// Bytes that end a plain run inside a JSON string.
+const STRING_SPECIAL_RE = /["\\\x00-\x1f]/g;
+const NATIVE_SCAN_MIN_BYTES = 4096;
+
 function advanceJsonObjectValidator(state, buf, start, end) {
+  // Huge tool outputs are long plain string runs: a latin1 view of the segment lets the regex engine find
+  // each run's end natively, once per segment, instead of dispatching on every byte.
+  const latin1 = end - start >= NATIVE_SCAN_MIN_BYTES ? buf.toString("latin1", start, end) : null;
   for (let i = start; i < end && state.valid; i += 1) {
-    const b = buf[i];
     const mode = state.mode;
 
     if (mode === "string") {
+      if (latin1 !== null) {
+        STRING_SPECIAL_RE.lastIndex = i - start;
+        const special = STRING_SPECIAL_RE.exec(latin1);
+        i = special ? start + special.index : end;
+      } else {
+        while (i < end && buf[i] !== 0x22 && buf[i] !== 0x5c && buf[i] >= 0x20) {
+          i += 1;
+        }
+      }
+      if (i === end) {
+        break;
+      }
+      const b = buf[i];
       if (b === 0x22) {
         if (state.strForKey) {
           state.mode = "objColon";
@@ -127,6 +148,7 @@ function advanceJsonObjectValidator(state, buf, start, end) {
       continue;
     }
 
+    const b = buf[i];
     if (mode === "escape") {
       if (b === 0x75) {
         state.mode = "unicode";
@@ -406,8 +428,10 @@ function isValidSkippedShortLine(buf) {
  */
 export function streamTranscriptRecords(filePath, visitor, options = {}) {
   const onSkipped = typeof options?.onSkipped === "function" ? options.onSkipped : null;
+  // A positive startOffset streams from the first full line after that byte.
+  let filePos = Number.isSafeInteger(options?.startOffset) && options.startOffset > 0 ? options.startOffset : 0;
+  let discardPartialLine = filePos > 0;
   const fd = openSync(filePath, "r");
-  const chunk = Buffer.allocUnsafe(CHUNK_SIZE);
   const prefixBuf = Buffer.allocUnsafe(PREFIX_SCAN_BYTES);
 
   let validRecordCount = 0;
@@ -418,7 +442,9 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
   let lineChunks = [];
   let lineBytes = 0;
   let skipValidator = null;
-  let isFirstLine = true;
+  let isFirstLine = !discardPartialLine;
+  // Start of the current line in the current read buffer, or -1 once the line spans an earlier read.
+  let lineStartPos = 0;
 
   const startSkipValidator = (buffers) => {
     skipValidator = createJsonObjectValidator();
@@ -428,7 +454,7 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
     }
   };
 
-  const applyPeekDecision = (prefixSlice, decision) => {
+  const applyPeekDecision = (prefixSlice, decision, prefixView) => {
     if (decision === false) {
       lineState = "skip";
       startSkipValidator([prefixSlice]);
@@ -436,8 +462,18 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
     }
     lineState = "keep";
     lineByteLimit = typeof decision === "number" && Number.isFinite(decision) && decision > 0 ? decision : Infinity;
-    lineChunks = [Buffer.from(prefixSlice)];
+    lineChunks = [prefixView ?? Buffer.from(prefixSlice)];
     lineBytes = prefixSlice.length;
+  };
+
+  // Every read gets a fresh buffer, so kept lines hold views into it instead of copies.
+  const pushView = (view, start, end) => {
+    const last = lineChunks[lineChunks.length - 1];
+    if (last && last.buffer === view.buffer && last.byteOffset + last.length === view.byteOffset + start) {
+      lineChunks[lineChunks.length - 1] = Buffer.from(view.buffer, last.byteOffset, last.length + end - start);
+    } else {
+      lineChunks.push(view.subarray(start, end));
+    }
   };
 
   const appendSegment = (view, start, end) => {
@@ -454,7 +490,7 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
         return;
       }
     }
-    lineChunks.push(Buffer.from(view.subarray(start, end)));
+    pushView(view, start, end);
   };
 
   const deliverLine = (prefixType, buf) => {
@@ -507,12 +543,26 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
 
   try {
     for (;;) {
-      const bytesRead = readSync(fd, chunk, 0, CHUNK_SIZE, null);
+      const chunk = Buffer.allocUnsafe(CHUNK_SIZE);
+      const bytesRead = readSync(fd, chunk, 0, CHUNK_SIZE, filePos);
       if (bytesRead <= 0) {
         break;
       }
+      filePos += bytesRead;
       const view = chunk.subarray(0, bytesRead);
       let pos = 0;
+      if (discardPartialLine) {
+        const nlIdx = view.indexOf(NEWLINE_BYTE);
+        if (nlIdx === -1) {
+          continue;
+        }
+        discardPartialLine = false;
+        pos = nlIdx + 1;
+        lineStartPos = pos;
+      }
+      if (lineState !== "undecided" || prefixLen > 0) {
+        lineStartPos = -1;
+      }
       while (pos < bytesRead) {
         const nlIdx = view.indexOf(NEWLINE_BYTE, pos);
         const segEnd = nlIdx !== -1 ? nlIdx : bytesRead;
@@ -524,8 +574,9 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
           pos += copyLen;
           if (prefixLen === PREFIX_SCAN_BYTES && (pos < segEnd || nlIdx === -1)) {
             const prefixSlice = stripBomBytes(prefixBuf, isFirstLine);
+            const prefixView = lineStartPos >= 0 ? stripBomBytes(view.subarray(lineStartPos, pos), isFirstLine) : null;
             linePrefixType = extractLinePrefixType(prefixSlice);
-            applyPeekDecision(prefixSlice, visitor(linePrefixType, null));
+            applyPeekDecision(prefixSlice, visitor(linePrefixType, null), prefixView);
           }
         }
         if (lineState === "skip") {
@@ -537,6 +588,7 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
         if (nlIdx !== -1) {
           finalizeLine();
           pos = nlIdx + 1;
+          lineStartPos = pos;
         }
       }
     }
@@ -550,40 +602,102 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
   return { hasContent: validRecordCount > 0, validRecordCount };
 }
 
+// Collects hook steps from streamed records. With a `limit`, keeps only the last `limit` steps plus the
+// latest USER_INPUT, so drift checks on huge sessions replay a bounded tail.
+export function createStepCollector(limit = Infinity) {
+  let steps = [];
+  let latestUserStep = null;
+  let decision = true;
+  let count = 0;
+  return {
+    get count() {
+      return count;
+    },
+    peek(prefixType) {
+      if (prefixType === null || KEPT_STEP_TYPES.has(prefixType)) {
+        decision = true;
+      } else {
+        decision = prefixType === "GENERIC" ? PROBE_MAX_BYTES : false;
+      }
+      return decision;
+    },
+    visit(prefixType, lineBytes, rawLine, parsed, recordIndex) {
+      if (decision === false || (typeof decision === "number" && lineBytes > decision)) {
+        return;
+      }
+      if (prefixType === "GENERIC" && !(rawLine.toLowerCase().includes(PRE_TOOL_DENIAL_NEEDLE) && isPreToolDenialStep(parsed))) {
+        return;
+      }
+      const step = recordToStep(parsed, recordIndex);
+      if (!step) {
+        return;
+      }
+      steps.push(step);
+      count += 1;
+      if (step.type === "USER_INPUT") {
+        latestUserStep = step;
+      }
+      if (steps.length >= limit * 2) {
+        steps = steps.slice(-limit);
+      }
+    },
+    steps() {
+      const tail = steps.length > limit ? steps.slice(-limit) : steps;
+      return latestUserStep && !tail.includes(latestUserStep) ? [latestUserStep, ...tail] : tail;
+    },
+  };
+}
+
 function readTranscriptStepsFast(filePath) {
-  const steps = [];
+  const collector = createStepCollector();
   const { hasContent } = streamTranscriptRecords(filePath, (prefixType, lineBuf, recordIndex) => {
     if (lineBuf === null) {
-      if (prefixType === null || KEPT_STEP_TYPES.has(prefixType)) {
-        return true;
-      }
-      return prefixType === "GENERIC" ? PROBE_MAX_BYTES : false;
+      return collector.peek(prefixType);
     }
-
     const rawLine = lineBuf.toString("utf8");
     const parsed = parseRawRecord(rawLine);
     if (!parsed) {
       return false;
     }
-
-    if (prefixType === "GENERIC") {
-      if (rawLine.toLowerCase().includes(PRE_TOOL_DENIAL_NEEDLE) && isPreToolDenialStep(parsed)) {
-        const step = recordToStep(parsed, recordIndex);
-        if (step) {
-          steps.push(step);
-        }
-      }
-      return true;
-    }
-
-    const step = recordToStep(parsed, recordIndex);
-    if (step) {
-      steps.push(step);
-    }
+    collector.visit(prefixType, lineBuf.length, rawLine, parsed, recordIndex);
     return true;
   });
 
-  return { hasContent, steps };
+  return { hasContent, steps: collector.steps() };
+}
+
+// The last `limit` steps from a tail window that doubles until it holds them. Small files, and windows
+// with a record lacking a numeric step index (its fallback index needs the full count), read everything.
+export function readTailTranscriptSteps(filePath, limit) {
+  const size = statSync(filePath).size;
+  for (let window = TAIL_START_BYTES; size > TAIL_SCAN_MIN_BYTES && window < size; window *= 2) {
+    const collector = createStepCollector(limit);
+    let indexed = true;
+    streamTranscriptRecords(
+      filePath,
+      (prefixType, lineBuf, recordIndex) => {
+        if (lineBuf === null) {
+          return collector.peek(prefixType);
+        }
+        const rawLine = lineBuf.toString("utf8");
+        const parsed = parseRawRecord(rawLine);
+        if (!parsed) {
+          return false;
+        }
+        indexed &&= parseStepIndex(parsed.step_index !== undefined ? parsed.step_index : parsed.stepIndex, null) !== null;
+        collector.visit(prefixType, lineBuf.length, rawLine, parsed, recordIndex);
+        return true;
+      },
+      { startOffset: size - window },
+    );
+    if (!indexed) {
+      break;
+    }
+    if (collector.count >= limit) {
+      return collector.steps();
+    }
+  }
+  return readTranscriptStepsFast(filePath).steps;
 }
 
 export function resolveTranscriptCandidates(transcriptPath) {
@@ -672,11 +786,15 @@ export function isDirectExecution(moduleUrl) {
   }
 }
 
+export function payloadTranscriptPath(payload) {
+  const rawPath = payload.transcriptPath ?? payload.transcript_path;
+  return typeof rawPath === "string" ? rawPath.trim() : "";
+}
+
 export function loadHookContext(stdinText, eventName, readTextFile) {
   const payload = parseHookPayload(stdinText, eventName);
   if (!payload) return null;
-  const rawPath = payload.transcriptPath ?? payload.transcript_path;
-  const transcriptPath = typeof rawPath === "string" ? rawPath.trim() : "";
+  const transcriptPath = payloadTranscriptPath(payload);
   const { steps, available } =
     transcriptPath.length > 0 ? readTranscript(transcriptPath, readTextFile) : { steps: [], available: false };
   return { payload, transcriptPath, steps, transcriptAvailable: available };

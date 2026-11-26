@@ -2,9 +2,9 @@
 
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { PASSING_VERDICTS, isExemptDocOrAssetPath } from "./governance/constants.mjs";
-import { readFactLedger, readGitLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import { readFactLedgerAndSteps, readGitLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
 import { readTurnSnapshot, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
-import { isDirectExecution, loadHookContext, runHookCli } from "./hook-io.mjs";
+import { isDirectExecution, loadHookContext, parseHookPayload, payloadTranscriptPath, runHookCli } from "./hook-io.mjs";
 import { DRIFT_MARKER, GATE_STOP_MARKER, decideStopAction } from "./transcript.mjs";
 
 const GLOBAL_STOP_EXECUTION_CAP = 2;
@@ -64,12 +64,10 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
 }
 
 export function handleStop(stdinText, readTextFile) {
-  const context = loadHookContext(stdinText, "Stop", readTextFile);
-  if (!context || context.steps.length === 0) {
+  const payload = parseHookPayload(stdinText, "Stop");
+  if (!payload) {
     return {};
   }
-  const { payload, steps, transcriptPath } = context;
-
   const rawTerminationReason = payload.terminationReason ?? payload.termination_reason;
   const terminationReason = typeof rawTerminationReason === "string" ? rawTerminationReason.trim() : "";
   if (terminationReason !== "NO_TOOL_CALL") {
@@ -78,7 +76,7 @@ export function handleStop(stdinText, readTextFile) {
 
   const executionNum = Number(payload.executionNum ?? payload.execution_num ?? 0);
   if (Number.isFinite(executionNum) && executionNum >= GLOBAL_STOP_EXECUTION_CAP) {
-    if (typeof readTextFile !== "function") {
+    if (typeof readTextFile !== "function" && loadHookContext(stdinText, "Stop", readTextFile)?.steps.length > 0) {
       tryLogStopTelemetry(payload, {
         decision: "allow_cap",
         gateViolation: false,
@@ -91,13 +89,20 @@ export function handleStop(stdinText, readTextFile) {
   }
 
   const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const transcriptPath = payloadTranscriptPath(payload);
   let ledger = null;
+  let steps;
   if (typeof readTextFile !== "function" && transcriptPath.length > 0) {
     const gitLedger = cwd.length > 0 ? readGitLedger(cwd) : { gitRoot: "" };
-    ledger = readFactLedger(transcriptPath, cwd, gitLedger.gitRoot || "");
-    if (ledger.transcriptAvailable) {
-      mergeShellWrittenFiles(ledger, payload, cwd);
-    }
+    ({ ledger, steps } = readFactLedgerAndSteps(transcriptPath, cwd, gitLedger.gitRoot || ""));
+  } else {
+    steps = loadHookContext(stdinText, "Stop", readTextFile)?.steps ?? [];
+  }
+  if (steps.length === 0) {
+    return {};
+  }
+  if (ledger?.transcriptAvailable) {
+    mergeShellWrittenFiles(ledger, payload, cwd);
   }
 
   const isReadOnlyGovernanceRole = ledger?.sessionRole === "auditor" || ledger?.sessionRole === "challenger";

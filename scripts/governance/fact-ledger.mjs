@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
-import { resolveTranscriptCandidates, streamTranscriptRecords } from "../hook-io.mjs";
+import { readTailTranscriptSteps, readTranscriptSteps, resolveTranscriptCandidates, streamTranscriptRecords } from "../hook-io.mjs";
 import { GATE_STOP_MARKER } from "../transcript/markers.mjs";
-import { getToolCalls, isPreToolDenialStep, parseRawRecord, parseStepIndex } from "../transcript/steps.mjs";
+import { getToolCalls, isPreToolDenialStep, parseRawRecord, parseStepIndex, recordToStep } from "../transcript/steps.mjs";
 import {
   AUDITOR_AGENT_NAME,
   AUDITOR_SESSION_MARKER,
@@ -113,51 +113,75 @@ function isAbsolutePosix(p) {
   return p.startsWith("/") || /^[A-Za-z]:\//.test(p);
 }
 
-function relativizeAgainstBase(normPath, rawBase) {
-  if (typeof rawBase !== "string" || rawBase.trim().length === 0) {
-    return null;
+// Scoped to one readFactLedger call: a scan normalizes every tool path against the same bases.
+let fsMemo = null;
+
+function memoFs(kind, path, compute) {
+  if (!fsMemo) {
+    return compute();
   }
-  const normBase = stripTrailingSlashes(posix.normalize(toPosix(rawBase.trim())));
-  if (!normBase || !isAbsolutePosix(normBase)) {
-    return null;
+  let byPath = fsMemo.get(kind);
+  if (!byPath) {
+    byPath = new Map();
+    fsMemo.set(kind, byPath);
   }
-  const caseFold = /^[A-Za-z]:\//.test(normBase);
-  const cmpPath = caseFold ? normPath.toLowerCase() : normPath;
-  const cmpBase = caseFold ? normBase.toLowerCase() : normBase;
-  if (cmpPath === cmpBase) {
-    return ".";
+  if (!byPath.has(path)) {
+    byPath.set(path, compute());
   }
-  if (cmpPath.startsWith(`${cmpBase}/`)) {
-    return normPath.slice(normBase.length + 1);
-  }
-  return null;
+  return byPath.get(path);
+}
+
+function memoExists(path) {
+  return memoFs("exists", path, () => existsSync(path));
 }
 
 function tryRealpath(rawPath) {
   if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
     return null;
   }
-  try {
-    return realpathSync(rawPath.trim());
-  } catch {
-    return null;
-  }
+  return memoFs("realpath", rawPath.trim(), () => {
+    try {
+      return realpathSync(rawPath.trim());
+    } catch {
+      return null;
+    }
+  });
 }
 
 function collectBaseVariants(rawBase) {
   if (typeof rawBase !== "string" || rawBase.trim().length === 0) {
     return [];
   }
-  const trimmed = rawBase.trim();
-  const real = tryRealpath(trimmed);
-  return real && real !== trimmed ? [trimmed, real] : [trimmed];
+  return memoFs("bases", rawBase, () => {
+    const trimmed = rawBase.trim();
+    const real = tryRealpath(trimmed);
+    return real && real !== trimmed ? [trimmed, real] : [trimmed];
+  });
+}
+
+// Absolute variants of a base, normalized once per scan; drive-letter bases compare case-insensitively.
+function preparedBases(rawBase) {
+  return memoFs("prepared", rawBase, () =>
+    collectBaseVariants(rawBase).flatMap((variant) => {
+      const norm = stripTrailingSlashes(posix.normalize(toPosix(variant)));
+      if (!norm || !isAbsolutePosix(norm)) {
+        return [];
+      }
+      const caseFold = /^[A-Za-z]:\//.test(norm);
+      const cmp = caseFold ? norm.toLowerCase() : norm;
+      return [{ norm, cmp, prefix: `${cmp}/`, caseFold }];
+    }),
+  );
 }
 
 function relativizeAgainstAnyBase(normPath, bases) {
-  for (const base of bases) {
-    const rel = relativizeAgainstBase(normPath, base);
-    if (rel !== null) {
-      return rel;
+  for (const { cmp, prefix, caseFold } of bases) {
+    const cmpPath = caseFold ? normPath.toLowerCase() : normPath;
+    if (cmpPath === cmp) {
+      return ".";
+    }
+    if (cmpPath.startsWith(prefix)) {
+      return normPath.slice(prefix.length);
     }
   }
   return null;
@@ -172,8 +196,8 @@ export function normalizeWorkspacePath(rawPath, cwd = "", gitRoot = "") {
     return "";
   }
   let normalized = posix.normalize(toPosix(trimmed));
-  const gitBases = collectBaseVariants(gitRoot);
-  const cwdBases = collectBaseVariants(cwd);
+  const gitBases = preparedBases(gitRoot);
+  const cwdBases = preparedBases(cwd);
   if (isAbsolutePosix(normalized)) {
     const rel = relativizeAgainstAnyBase(normalized, gitBases) ?? relativizeAgainstAnyBase(normalized, cwdBases);
     if (rel !== null) {
@@ -182,7 +206,7 @@ export function normalizeWorkspacePath(rawPath, cwd = "", gitRoot = "") {
   } else if (cwdBases.length > 0 && gitBases.length > 0) {
     let cwdRel = null;
     for (const cwdCandidate of cwdBases) {
-      cwdRel = relativizeAgainstAnyBase(stripTrailingSlashes(posix.normalize(toPosix(cwdCandidate))), gitBases);
+      cwdRel = relativizeAgainstAnyBase(cwdCandidate.norm, gitBases);
       if (cwdRel !== null) {
         break;
       }
@@ -191,9 +215,9 @@ export function normalizeWorkspacePath(rawPath, cwd = "", gitRoot = "") {
       const alreadyGitRootRelative =
         !normalized.startsWith("../") &&
         gitRoot &&
-        existsSync(gitRoot) &&
-        !existsSync(join(cwd, normalized)) &&
-        existsSync(join(gitRoot, normalized));
+        memoExists(gitRoot) &&
+        !memoExists(join(cwd, normalized)) &&
+        memoExists(join(gitRoot, normalized));
       if (!alreadyGitRootRelative) {
         normalized = posix.normalize(`${cwdRel}/${normalized}`);
       }
@@ -1127,6 +1151,9 @@ function extractLatestTokens(parsed) {
 }
 
 const WRITE_PROBE_MAX_BYTES = 1024 * 1024;
+// shortcut: drift trackers replay only the last 500 steps of a session, so a cap streak older than that restarts; widen if long sessions nag past the cap.
+const DRIFT_STEP_WINDOW = 500;
+const PROSE_SKIP_MIN_BYTES = 1024 * 1024;
 const MANUAL_PREFLIGHT_CMD_RE = /\/(?:hstack:)?hstack-preflight\b/i;
 
 function createEmptyLedger(transcriptAvailable = false) {
@@ -1165,7 +1192,7 @@ function createEmptyLedger(transcriptAvailable = false) {
   };
 }
 
-function scanTranscriptToLedger(filePath, cwd, gitRoot) {
+function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null) {
   const ledger = createEmptyLedger(true);
   let pendingCalls = [];
   let seenGenericInCurrentPlanner = false;
@@ -1267,6 +1294,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
     );
   };
 
+  const skipProse = statSync(filePath).size > PROSE_SKIP_MIN_BYTES;
   const result = streamTranscriptRecords(
     filePath,
     (prefixType, lineBuf, recordIndex) => {
@@ -1280,7 +1308,12 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
         return false;
       }
 
-      const parsed = parseRawRecord(lineBuf.toString("utf8"));
+      const lean =
+        skipProse && (prefixType === "PLANNER_RESPONSE" || (prefixType === "GENERIC" && pendingCalls[0]?.kind === "write"));
+      let parsed = parseRawRecord(lean ? decodeWithoutLeadingContent(lineBuf) : lineBuf.toString("utf8"));
+      if (lean && parsed && (parsed.type !== prefixType || (parsed.type === "GENERIC" && mayBeDenialResult(parsed)))) {
+        parsed = parseRawRecord(lineBuf.toString("utf8"));
+      }
       if (!parsed) {
         return false;
       }
@@ -1294,6 +1327,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
           seenFirstUserInput = true;
           applyHeaderSessionRole(parsed);
         }
+        onUserInput?.(parsed, recordIndex);
         resetTurn(stepIndex, userContent);
         return true;
       }
@@ -1626,21 +1660,102 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot) {
   return ledger;
 }
 
+function scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput) {
+  fsMemo = new Map();
+  try {
+    for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
+      try {
+        const ledger = scanTranscriptToLedger(candidatePath, cwd, gitRoot, onUserInput);
+        if (ledger) {
+          return { ledger, candidatePath };
+        }
+      } catch {
+        continue;
+      }
+    }
+    return { ledger: createEmptyLedger(false), candidatePath: "" };
+  } finally {
+    fsMemo = null;
+  }
+}
+
 export function readFactLedger(transcriptPath, cwd = "", gitRoot = "") {
   if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
     return createEmptyLedger(false);
   }
-  for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
-    try {
-      const ledger = scanTranscriptToLedger(candidatePath, cwd, gitRoot);
-      if (ledger) {
-        return ledger;
-      }
-    } catch {
-      continue;
+  return scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot).ledger;
+}
+
+// Stop and PostInvocation: the ledger takes the one full pass; drift checks read the last steps from the tail.
+export function readFactLedgerAndSteps(transcriptPath, cwd = "", gitRoot = "") {
+  if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
+    return { ledger: createEmptyLedger(false), steps: [] };
+  }
+  let latestUser = null;
+  const { ledger, candidatePath } = scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, (parsed, recordIndex) => {
+    latestUser = { parsed, recordIndex };
+  });
+  let steps = [];
+  try {
+    steps = candidatePath ? readTailTranscriptSteps(candidatePath, DRIFT_STEP_WINDOW) : [];
+  } catch {
+    steps = [];
+  }
+  if (steps.length === 0) {
+    // The step reader moves on to the next candidate when this one holds records but no steps.
+    return { ledger, steps: readTranscriptSteps(transcriptPath) };
+  }
+  if (latestUser && !steps.some((step) => step.type === "USER_INPUT")) {
+    steps = [recordToStep(latestUser.parsed, latestUser.recordIndex), ...steps];
+  }
+  return { ledger, steps };
+}
+
+const CONTENT_MEMBER = Buffer.from('"content":"');
+const INVALID_JSON_STRING_RE = /[\x00-\x1f]|\\(?:[^"\\/bfnrtu]|u(?![0-9a-fA-F]{4}))/;
+
+function closingQuoteAt(buf, from) {
+  for (let i = from; ; ) {
+    const quote = buf.indexOf(0x22, i);
+    if (quote < 0) {
+      return -1;
+    }
+    let slashes = 0;
+    while (buf[quote - 1 - slashes] === 0x5c) {
+      slashes += 1;
+    }
+    if (slashes % 2 === 0) {
+      return quote;
+    }
+    i = quote + 1;
+  }
+}
+
+// A write result needs its content only to spot a denial, which carries an error or a non-DONE status.
+function mayBeDenialResult(parsed) {
+  return typeof parsed.status !== "string" || parsed.status === "" || parsed.status === "ERROR" || (typeof parsed.error === "string" && parsed.error !== "");
+}
+
+// The ledger never reads planner prose or a clean write result's output, so a large scan skips decoding
+// the leading top-level "content" string. Only scalar members may precede it, proving it is top-level.
+function decodeWithoutLeadingContent(buf) {
+  const keyAt = buf.indexOf(CONTENT_MEMBER);
+  const open = buf.indexOf(0x7b);
+  if (keyAt < 0 || open < 0 || open > keyAt) {
+    return buf.toString("utf8");
+  }
+  for (let i = open + 1; i < keyAt; i += 1) {
+    if (buf[i] === 0x7b || buf[i] === 0x5b) {
+      return buf.toString("utf8");
     }
   }
-  return createEmptyLedger(false);
+  const valueStart = keyAt + CONTENT_MEMBER.length;
+  const valueEnd = closingQuoteAt(buf, valueStart);
+  // A string JSON.parse would reject keeps the full decode, so the record stays invalid exactly as before.
+  if (valueEnd < 0 || INVALID_JSON_STRING_RE.test(buf.toString("latin1", valueStart, valueEnd))) {
+    return buf.toString("utf8");
+  }
+  return buf.toString("utf8", 0, valueStart) + buf.toString("utf8", valueEnd);
 }
 
 function countTextFileLinesLightweight(absPath) {

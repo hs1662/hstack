@@ -3,7 +3,7 @@
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode, resolveAutonomyThresholds } from "./governance/config.mjs";
 import { DEFAULT_POLLUTION_THRESHOLDS, buildAutoHandoffSystemMessage } from "./governance/constants.mjs";
-import { detectSessionRoleFromHeaderSteps, readFactLedger } from "./governance/fact-ledger.mjs";
+import { detectSessionRoleFromHeaderSteps, readFactLedger, readFactLedgerAndSteps } from "./governance/fact-ledger.mjs";
 import {
   claimAutonomyTurnFlag,
   markPreflightChallengeLogged,
@@ -14,6 +14,8 @@ import { evaluateThrashing } from "./governance/thrashing-detector.mjs";
 import {
   isDirectExecution,
   loadHookContext,
+  parseHookPayload,
+  payloadTranscriptPath,
   readTranscriptSteps,
   resolvePluginDataDir,
   runHookCli,
@@ -199,12 +201,26 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
   return autoHandoffMessage;
 }
 
+// One transcript pass yields both the drift steps and the ledger the audit stage needs.
+function loadContextWithLedger(stdinText) {
+  const payload = parseHookPayload(stdinText, "PostInvocation");
+  if (!payload) return null;
+  const transcriptPath = payloadTranscriptPath(payload);
+  if (!transcriptPath) return { payload, transcriptPath, steps: [] };
+  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  return { payload, transcriptPath, ...readFactLedgerAndSteps(transcriptPath, cwd, "") };
+}
+
 export function handlePostInvocation(stdinText, readTextFileOrOptions) {
   const isFn = typeof readTextFileOrOptions === "function";
   const readTextFile = isFn ? readTextFileOrOptions : readTextFileOrOptions?.readTextFile;
-  const options = isFn ? {} : (readTextFileOrOptions ?? {});
+  let options = isFn ? {} : (readTextFileOrOptions ?? {});
 
-  const context = loadHookContext(stdinText, "PostInvocation", readTextFile);
+  const shareLedger = !isFn && !readTextFile && !options.ledger;
+  const context = shareLedger ? loadContextWithLedger(stdinText) : loadHookContext(stdinText, "PostInvocation", readTextFile);
+  if (context?.ledger) {
+    options = { ...options, ledger: context.ledger };
+  }
   if (!context || context.steps.length === 0) {
     return {};
   }
