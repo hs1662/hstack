@@ -23,14 +23,60 @@ const CATCH_BLOCK_RE = /\}\s*catch\b/g;
 const ALT_ERROR_HANDLER_RE = /\.catch\s*\(|\btry\s*\{/;
 const PATH_ARG_KEYS = ["Path", "path", "TargetFile", "target_file", "AbsolutePath", "absolute_path", "file_path"];
 
+function countNewlines(text, from, to) {
+  let count = 0;
+  for (let i = text.indexOf("\n", from); i !== -1 && i < to; i = text.indexOf("\n", i + 1)) {
+    count += 1;
+  }
+  return count;
+}
+
+// Single O(N) pass: real comments (`//`, `/* */`, line-leading `#`) become one space plus their newlines;
+// '...', "..." and `...` are copied verbatim, so `//` inside a URL string stays code.
 function stripCommentsOnly(text) {
   if (typeof text !== "string" || text.length === 0) {
     return "";
   }
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/[^\n]*/g, "")
-    .replace(/^[ \t]*#[^\n]*/gm, "");
+  const parts = [];
+  let copyFrom = 0;
+  let quote = "";
+  let lineStart = true;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") {
+        i += 1;
+      } else if (ch === quote || (ch === "\n" && quote !== "`")) {
+        quote = "";
+        lineStart = ch === "\n";
+      }
+      continue;
+    }
+    const next = text[i + 1];
+    let commentEnd = -1;
+    if (ch === "/" && next === "*") {
+      const close = text.indexOf("*/", i + 2);
+      commentEnd = close === -1 ? text.length : close + 2;
+    } else if ((ch === "/" && next === "/") || (ch === "#" && lineStart)) {
+      const newline = text.indexOf("\n", i);
+      commentEnd = newline === -1 ? text.length : newline;
+    }
+    if (commentEnd !== -1) {
+      parts.push(text.slice(copyFrom, i), " ", "\n".repeat(countNewlines(text, i, commentEnd)));
+      copyFrom = commentEnd;
+      i = commentEnd - 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+    } else if (ch === "\n") {
+      lineStart = true;
+    } else if (ch !== " " && ch !== "\t") {
+      lineStart = false;
+    }
+  }
+  parts.push(text.slice(copyFrom));
+  return parts.join("");
 }
 
 function stripCommentsAndWhitespace(text) {
