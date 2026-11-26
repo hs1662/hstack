@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -428,6 +428,8 @@ function isValidSkippedShortLine(buf) {
  */
 export function streamTranscriptRecords(filePath, visitor, options = {}) {
   const onSkipped = typeof options?.onSkipped === "function" ? options.onSkipped : null;
+  // Checked after each line: a head scan stops once it has what it needs.
+  const shouldStop = typeof options?.shouldStop === "function" ? options.shouldStop : () => false;
   // A positive startOffset streams from the first full line after that byte.
   let filePos = Number.isSafeInteger(options?.startOffset) && options.startOffset > 0 ? options.startOffset : 0;
   let discardPartialLine = filePos > 0;
@@ -589,6 +591,9 @@ export function streamTranscriptRecords(filePath, visitor, options = {}) {
         pos = segEnd;
         if (nlIdx !== -1) {
           finalizeLine();
+          if (shouldStop()) {
+            return { hasContent: validRecordCount > 0, validRecordCount };
+          }
           pos = nlIdx + 1;
           lineStartPos = pos;
         }
@@ -710,6 +715,51 @@ export function readTailTranscriptSteps(filePath, limit) {
     }
   }
   return readTranscriptStepsFast(filePath).steps;
+}
+
+// Byte offset of the last line before `end` that contains `needle` and that `accept` takes (it returns a truthy
+// value, given back as `value`), reading backwards in chunks that double from 256KiB. Null when no line qualifies.
+export function findLastLine(filePath, needle, accept, end) {
+  const needleBuf = Buffer.from(needle);
+  const fd = openSync(filePath, "r");
+  try {
+    let hi = Math.min(end ?? Infinity, fstatSync(fd).size);
+    // Bytes past `hi` that belong to the first, possibly partial, line of the region already searched; they are
+    // read again with the next chunk rather than copied, since that line is usually short.
+    let carryLen = 0;
+    for (let chunk = TAIL_START_BYTES; hi > 0; chunk *= 2) {
+      const lo = Math.max(0, hi - chunk);
+      const buf = Buffer.allocUnsafe(hi - lo + carryLen);
+      for (let got = 0; got < buf.length; ) {
+        const n = readSync(fd, buf, got, buf.length - got, lo + got);
+        if (n <= 0) {
+          return null;
+        }
+        got += n;
+      }
+      const firstNl = lo === 0 ? -1 : buf.indexOf(NEWLINE_BYTE);
+      // Lines that start at or after `complete` lie wholly in `buf`.
+      const complete = lo === 0 ? 0 : firstNl === -1 ? buf.length : firstNl + 1;
+      for (let from = buf.length; from >= complete; ) {
+        const hit = buf.lastIndexOf(needleBuf, from);
+        if (hit < complete) {
+          break;
+        }
+        const lineStart = buf.lastIndexOf(NEWLINE_BYTE, hit) + 1;
+        const nl = buf.indexOf(NEWLINE_BYTE, hit);
+        const value = accept(buf.subarray(lineStart, nl === -1 ? buf.length : nl));
+        if (value) {
+          return { offset: lo + lineStart, value };
+        }
+        from = lineStart - 1;
+      }
+      carryLen = complete;
+      hi = lo;
+    }
+    return null;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function resolveTranscriptCandidates(transcriptPath) {

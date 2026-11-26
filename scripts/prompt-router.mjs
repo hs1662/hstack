@@ -3,7 +3,7 @@
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode } from "./governance/config.mjs";
 import { PROMPT_ROUTE_SYSTEM_MESSAGE } from "./governance/constants.mjs";
-import { detectSessionRoleFromUserInput, readFactLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import { detectSessionRoleFromUserInput, readTurnLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
 import { claimAutonomyTurnFlag, resolveEffectiveConversationKey, saveTurnSnapshot } from "./governance/handoff-store.mjs";
 import {
   isDirectExecution,
@@ -70,7 +70,7 @@ export function handlePreInvocation(stdinText, options = {}) {
 
   const ledger =
     options?.ledger ??
-    (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
+    (transcriptPath ? readTurnLedger(transcriptPath, cwd, "") : null);
   const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
 
   // Turn-start baseline so Stop can see files that shell commands change during this turn.

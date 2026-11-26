@@ -1,7 +1,14 @@
 import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
-import { readTailTranscriptSteps, readTranscriptSteps, resolveTranscriptCandidates, streamTranscriptRecords } from "../hook-io.mjs";
+import {
+  extractLinePrefixType,
+  findLastLine,
+  readTailTranscriptSteps,
+  readTranscriptSteps,
+  resolveTranscriptCandidates,
+  streamTranscriptRecords,
+} from "../hook-io.mjs";
 import { GATE_STOP_MARKER } from "../transcript/markers.mjs";
 import { getToolCalls, isPreToolDenialStep, parseRawRecord, parseStepIndex, recordToStep } from "../transcript/steps.mjs";
 import {
@@ -1253,12 +1260,18 @@ function createEmptyLedger(transcriptAvailable = false) {
   };
 }
 
-function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null) {
+// With `turnStart`, scans from that turn's USER_INPUT (a byte offset) with the role the header scan settled;
+// returns undefined when a record there has no numeric step index, since its fallback index needs the full count.
+function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turnStart = null) {
   const ledger = createEmptyLedger(true);
   let pendingCalls = [];
   let seenGenericInCurrentPlanner = false;
-  let seenFirstUserInput = false;
-  let seenFirstPlannerResponse = false;
+  let seenFirstUserInput = turnStart !== null;
+  let seenFirstPlannerResponse = turnStart !== null;
+  let indexed = true;
+  if (turnStart !== null) {
+    ledger.sessionRole = turnStart.sessionRole;
+  }
   const asyncAuditsByConversationId = new Map();
   const asyncChallengesByConversationId = new Map();
   const asyncWorkersByConversationId = new Map();
@@ -1381,6 +1394,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null) {
 
       const rawIndex = parsed.step_index !== undefined ? parsed.step_index : parsed.stepIndex;
       const stepIndex = parseStepIndex(rawIndex, recordIndex);
+      indexed &&= turnStart === null || parseStepIndex(rawIndex, null) !== null;
 
       if (parsed.type === "USER_INPUT") {
         const userContent = typeof parsed.content === "string" ? parsed.content : "";
@@ -1696,9 +1710,14 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null) {
           }
         }
       },
+      startOffset: turnStart === null ? 0 : turnStart.offset - 1,
+      shouldStop: () => !indexed,
     },
   );
 
+  if (!indexed) {
+    return undefined;
+  }
   if (!result.hasContent) {
     return null;
   }
@@ -1721,12 +1740,93 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null) {
   return ledger;
 }
 
-function scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput) {
+const PARTIAL_SCAN_MIN_BYTES = 1024 * 1024;
+// Prefix types the full scan always parses; a record of another prefix type may be skipped, so a tail scan
+// that finds one parsing as a USER_INPUT or a token-bearing planner cannot tell what the full scan did.
+const ALWAYS_PARSED_PREFIX_TYPES = new Set([null, "USER_INPUT", "PLANNER_RESPONSE", "SYSTEM_MESSAGE"]);
+const AMBIGUOUS_LINE = Symbol("ambiguous");
+// Every token key extractLatestTokens reads ends in `okens`.
+const TOKEN_KEY_NEEDLE = 'okens"';
+
+function lineRecordOfType(lineBuf, type) {
+  const parsed = parseRawRecord(lineBuf.toString("utf8"));
+  if (!parsed || parsed.type !== type) {
+    return null;
+  }
+  return ALWAYS_PARSED_PREFIX_TYPES.has(extractLinePrefixType(lineBuf.subarray(0, 256))) ? parsed : AMBIGUOUS_LINE;
+}
+
+// The session role from the header window (records before the first PLANNER_RESPONSE), exactly as the full scan
+// settles it, reading no further. Null when the file holds no valid record.
+function scanHeaderRole(filePath) {
+  let role = "main";
+  let seenUserInput = false;
+  let done = false;
+  const { hasContent } = streamTranscriptRecords(
+    filePath,
+    (prefixType, lineBuf) => {
+      if (lineBuf === null) {
+        return ALWAYS_PARSED_PREFIX_TYPES.has(prefixType);
+      }
+      const parsed = parseRawRecord(lineBuf.toString("utf8"));
+      if (!parsed) {
+        return false;
+      }
+      if (parsed.type === "PLANNER_RESPONSE") {
+        done = true;
+      } else if (parsed.type === "SYSTEM_MESSAGE" || (parsed.type === "USER_INPUT" && !seenUserInput)) {
+        role = pickHigherSessionRole(role, detectSessionRoleFromHeaderStep(parsed));
+        done = role === "auditor";
+      }
+      seenUserInput ||= parsed.type === "USER_INPUT";
+      return true;
+    },
+    { shouldStop: () => done },
+  );
+  return hasContent ? role : null;
+}
+
+// Header role plus a scan from the last USER_INPUT. Every ledger field but sessionReadFiles resets per turn, so
+// they match the full scan; latestTokens falls back to the last token-bearing planner before the turn.
+// sessionReadFiles holds this turn's reads only. Undefined means "use the full scan".
+function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
+  const sessionRole = scanHeaderRole(filePath);
+  if (sessionRole === null) {
+    return undefined;
+  }
+  const turn = findLastLine(filePath, '"USER_INPUT"', (lineBuf) => lineRecordOfType(lineBuf, "USER_INPUT"));
+  if (!turn || turn.value === AMBIGUOUS_LINE || turn.offset === 0) {
+    return undefined;
+  }
+  const ledger = scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput, { offset: turn.offset, sessionRole });
+  if (!ledger || Object.values(ledger.latestTokens).some((count) => count !== null)) {
+    return ledger ?? undefined;
+  }
+  const earlier = findLastLine(
+    filePath,
+    TOKEN_KEY_NEEDLE,
+    (lineBuf) => {
+      const parsed = lineRecordOfType(lineBuf, "PLANNER_RESPONSE");
+      return parsed === AMBIGUOUS_LINE ? parsed : parsed && extractLatestTokens(parsed);
+    },
+    turn.offset,
+  );
+  if (earlier?.value === AMBIGUOUS_LINE) {
+    return undefined;
+  }
+  if (earlier) {
+    ledger.latestTokens = earlier.value;
+  }
+  return ledger;
+}
+
+function scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput, partialMinBytes = Infinity) {
   fsMemo = new Map();
   try {
     for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
       try {
-        const ledger = scanTranscriptToLedger(candidatePath, cwd, gitRoot, onUserInput);
+        const partial = statSync(candidatePath).size > partialMinBytes ? scanTurnFromTail(candidatePath, cwd, gitRoot, onUserInput) : undefined;
+        const ledger = partial ?? scanTranscriptToLedger(candidatePath, cwd, gitRoot, onUserInput);
         if (ledger) {
           return { ledger, candidatePath };
         }
@@ -1747,15 +1847,44 @@ export function readFactLedger(transcriptPath, cwd = "", gitRoot = "") {
   return scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot).ledger;
 }
 
-// Stop and PostInvocation: the ledger takes the one full pass; drift checks read the last steps from the tail.
+// For hooks that read only the current turn and the session role (Stop, PostInvocation, PreInvocation): a file
+// over 1MB is read from its header and its last turn, so sessionReadFiles lists this turn's reads only.
+// Consumers of the session-wide read set (verify_completion's R1, handoff snapshots) use readFactLedger.
+export function readTurnLedger(transcriptPath, cwd = "", gitRoot = "", { partialMinBytes = PARTIAL_SCAN_MIN_BYTES } = {}) {
+  if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
+    return createEmptyLedger(false);
+  }
+  return scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, null, partialMinBytes).ledger;
+}
+
+// The session role alone, from the header window: O(header) on any transcript size.
+export function readSessionRole(transcriptPath) {
+  if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
+    return "main";
+  }
+  for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
+    try {
+      const role = scanHeaderRole(candidatePath);
+      if (role !== null) {
+        return role;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return "main";
+}
+
+// Stop and PostInvocation: the turn ledger and the drift steps both read from the tail.
 export function readFactLedgerAndSteps(transcriptPath, cwd = "", gitRoot = "") {
   if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
     return { ledger: createEmptyLedger(false), steps: [] };
   }
   let latestUser = null;
-  const { ledger, candidatePath } = scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, (parsed, recordIndex) => {
+  const onUserInput = (parsed, recordIndex) => {
     latestUser = { parsed, recordIndex };
-  });
+  };
+  const { ledger, candidatePath } = scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput, PARTIAL_SCAN_MIN_BYTES);
   let steps = [];
   try {
     steps = candidatePath ? readTailTranscriptSteps(candidatePath, DRIFT_STEP_WINDOW) : [];

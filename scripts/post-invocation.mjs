@@ -3,7 +3,7 @@
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode, resolveAutonomyThresholds } from "./governance/config.mjs";
 import { DEFAULT_POLLUTION_THRESHOLDS, buildAutoHandoffSystemMessage } from "./governance/constants.mjs";
-import { detectSessionRoleFromHeaderSteps, readFactLedger, readFactLedgerAndSteps } from "./governance/fact-ledger.mjs";
+import { detectSessionRoleFromHeaderSteps, readFactLedgerAndSteps, readTurnLedger } from "./governance/fact-ledger.mjs";
 import {
   claimAutonomyTurnFlag,
   markPreflightChallengeLogged,
@@ -94,7 +94,7 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
     const conversationId = typeof rawConversationId === "string" ? rawConversationId.trim() : "";
     const latestStep = steps[steps.length - 1];
     const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
-    const ledger = options.ledger ?? (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
+    const ledger = options.ledger ?? (transcriptPath ? readTurnLedger(transcriptPath, cwd, "") : null);
     const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : detectSessionRoleFromHeaderSteps(steps);
     const tokens = ledger?.latestTokens ?? { inputTokens: null, cacheReadTokens: null, outputTokens: null };
     const cfg = options.governanceConfig ?? readGovernanceConfig(dataDir);
