@@ -3,8 +3,8 @@
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode } from "./governance/config.mjs";
 import { PROMPT_ROUTE_SYSTEM_MESSAGE } from "./governance/constants.mjs";
-import { detectSessionRoleFromUserInput, readFactLedger } from "./governance/fact-ledger.mjs";
-import { claimAutonomyTurnFlag, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
+import { detectSessionRoleFromUserInput, readFactLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import { claimAutonomyTurnFlag, resolveEffectiveConversationKey, saveTurnSnapshot } from "./governance/handoff-store.mjs";
 import {
   isDirectExecution,
   parseHookPayload,
@@ -62,6 +62,22 @@ export function handlePreInvocation(stdinText, options = {}) {
   }
 
   const dataDir = options?.dataDir ?? resolvePluginDataDir();
+  const rawConversationId = payload.conversationId ?? payload.conversation_id;
+  const conversationId = typeof rawConversationId === "string" ? rawConversationId.trim() : "";
+  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const transcriptPath = pickPreferredTranscriptPath(payload.transcriptPath ?? payload.transcript_path);
+  const effectiveCid = resolveEffectiveConversationKey(conversationId, cwd);
+
+  const ledger =
+    options?.ledger ??
+    (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
+  const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
+
+  // Turn-start baseline so Stop can see files that shell commands change during this turn.
+  if (cwd && ledger?.transcriptAvailable) {
+    saveTurnSnapshot({ conversationId: effectiveCid, turnStartStepIndex, snapshot: snapshotWorkingTree(cwd), dataDir });
+  }
+
   const governanceConfig = options?.governanceConfig ?? readGovernanceConfig(dataDir);
   if (resolveAutonomyMode(dataDir, governanceConfig) !== "smart") {
     return {};
@@ -77,21 +93,11 @@ export function handlePreInvocation(stdinText, options = {}) {
     return {};
   }
 
-  const rawConversationId = payload.conversationId ?? payload.conversation_id;
-  const conversationId = typeof rawConversationId === "string" ? rawConversationId.trim() : "";
-  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
-  const transcriptPath = pickPreferredTranscriptPath(payload.transcriptPath ?? payload.transcript_path);
-
-  const ledger =
-    options?.ledger ??
-    (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
   const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
   if (sessionRole !== "main") {
     return {};
   }
 
-  const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
-  const effectiveCid = resolveEffectiveConversationKey(conversationId, cwd);
   const turnKey = `${effectiveCid}:${turnStartStepIndex}`;
   const claimed = claimAutonomyTurnFlag({
     conversationId: effectiveCid,

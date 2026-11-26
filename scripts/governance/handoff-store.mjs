@@ -323,6 +323,44 @@ export function claimAutonomyTurnFlag({
   }
 }
 
+// One working-tree snapshot per conversation, valid only for the turn that recorded it.
+export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot, dataDir = resolvePluginDataDir() } = {}) {
+  const filePath = resolveSessionStatePath(conversationId, dataDir);
+  if (!filePath || !snapshot || !Number.isFinite(turnStartStepIndex)) {
+    return false;
+  }
+  try {
+    return withSessionLock(filePath, () => {
+      const prev = readSessionState(conversationId, dataDir) ?? { conversationId };
+      atomicWriteJson(filePath, {
+        ...prev,
+        conversationId,
+        updatedAt: new Date().toISOString(),
+        turnSnapshot: { turnStartStepIndex, gitRoot: snapshot.gitRoot, files: snapshot.files },
+      });
+      return true;
+    });
+  } catch {
+    return false;
+  }
+}
+
+export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir = resolvePluginDataDir() } = {}) {
+  const snap = readSessionState(conversationId, dataDir)?.turnSnapshot;
+  if (
+    !snap ||
+    typeof snap !== "object" ||
+    snap.turnStartStepIndex !== turnStartStepIndex ||
+    typeof snap.gitRoot !== "string" ||
+    !snap.files ||
+    typeof snap.files !== "object" ||
+    Array.isArray(snap.files)
+  ) {
+    return null;
+  }
+  return { gitRoot: snap.gitRoot, files: snap.files };
+}
+
 export function markPreflightChallengeLogged({
   conversationId,
   dedupKey,

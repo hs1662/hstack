@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
-import { join, posix } from "node:path";
+import { closeSync, existsSync, fstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, posix, resolve } from "node:path";
 import { resolveTranscriptCandidates, streamTranscriptRecords } from "../hook-io.mjs";
 import { GATE_STOP_MARKER } from "../transcript/markers.mjs";
 import { getToolCalls, isPreToolDenialStep, parseRawRecord, parseStepIndex } from "../transcript/steps.mjs";
@@ -1735,6 +1735,77 @@ function parseNumstatOutput(output, gitRoot, diffNumstat, isNulDelimited = false
     const deleted = /^\d+$/.test(parts[1]) ? Number(parts[1]) : 0;
     addStat(parts.slice(2).join("\t"), added, deleted);
   }
+}
+
+export function resolveGitRootFast(startDir) {
+  if (typeof startDir !== "string" || startDir.trim().length === 0) {
+    return "";
+  }
+  let dir;
+  try {
+    dir = realpathSync(startDir.trim());
+  } catch {
+    dir = resolve(startDir.trim());
+  }
+  for (let i = 0; i < 20; i += 1) {
+    if (existsSync(resolve(dir, ".git"))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) {
+      break;
+    }
+    dir = parent;
+  }
+  return "";
+}
+
+// git status runs ~7ms median here; a 50ms cap timed out under parallel load and silently skipped the gate.
+const SNAPSHOT_GIT_TIMEOUT_MS = 250;
+const SNAPSHOT_MAX_FILES = 2000;
+
+// Cheap working-tree fingerprint: dirty/untracked paths from git status plus [mtimeMs, size] (null when missing).
+// Returns null for non-git dirs, git errors or timeouts, and trees too dirty to fingerprint cheaply.
+export function snapshotWorkingTree(cwd) {
+  const gitRoot = resolveGitRootFast(cwd);
+  if (!gitRoot) {
+    return null;
+  }
+  let out;
+  try {
+    out = execFileSync("git", ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-uall", "-z"], {
+      cwd: gitRoot,
+      timeout: SNAPSHOT_GIT_TIMEOUT_MS,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+  } catch {
+    return null;
+  }
+  const files = {};
+  let count = 0;
+  const tokens = out.split("\0");
+  for (let i = 0; i < tokens.length; i += 1) {
+    const entry = tokens[i];
+    if (entry.length < 4) {
+      continue;
+    }
+    if ("RC".includes(entry[0]) || "RC".includes(entry[1])) {
+      i += 1;
+    }
+    count += 1;
+    if (count > SNAPSHOT_MAX_FILES) {
+      return null;
+    }
+    const relPath = entry.slice(3);
+    try {
+      const st = statSync(join(gitRoot, relPath));
+      files[relPath] = [st.mtimeMs, st.size];
+    } catch {
+      files[relPath] = null;
+    }
+  }
+  return { gitRoot, files };
 }
 
 export function readGitLedger(cwd) {

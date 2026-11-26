@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { appendAuditRecord } from "./governance/audit-log.mjs";
-import { PASSING_VERDICTS } from "./governance/constants.mjs";
-import { readFactLedger, readGitLedger } from "./governance/fact-ledger.mjs";
+import { PASSING_VERDICTS, isExemptDocOrAssetPath } from "./governance/constants.mjs";
+import { readFactLedger, readGitLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import { readTurnSnapshot, resolveEffectiveConversationKey } from "./governance/handoff-store.mjs";
 import { isDirectExecution, loadHookContext, runHookCli } from "./hook-io.mjs";
 import { DRIFT_MARKER, GATE_STOP_MARKER, decideStopAction } from "./transcript.mjs";
 
@@ -27,6 +28,38 @@ function tryLogStopTelemetry(payload, info) {
       executionNum: info.executionNum,
     });
   } catch {
+  }
+}
+
+function sameFileSignature(a, b) {
+  return Array.isArray(a) && Array.isArray(b) ? a[0] === b[0] && a[1] === b[1] : a === b;
+}
+
+// Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
+function mergeShellWrittenFiles(ledger, payload, cwd) {
+  const shellExecs = ledger.turnExecutions.filter((exec) => !exec.toolName);
+  if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
+    return;
+  }
+  const rawConversationId = payload.conversationId ?? payload.conversation_id;
+  const baseline = readTurnSnapshot({
+    conversationId: resolveEffectiveConversationKey(typeof rawConversationId === "string" ? rawConversationId : "", cwd),
+    turnStartStepIndex: ledger.turnStartStepIndex,
+  });
+  const current = baseline ? snapshotWorkingTree(cwd) : null;
+  if (!current || current.gitRoot !== baseline.gitRoot) {
+    return;
+  }
+  const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
+  const writeStep = (writers.length > 0 ? writers : shellExecs).at(-1).stepIndex;
+  for (const [relPath, signature] of Object.entries(current.files)) {
+    if ((relPath in baseline.files && sameFileSignature(baseline.files[relPath], signature)) || isExemptDocOrAssetPath(relPath)) {
+      continue;
+    }
+    ledger.turnWrittenFiles.add(relPath);
+    ledger.turnCodeWrittenFiles.add(relPath);
+    ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, writeStep);
+    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, writeStep);
   }
 }
 
@@ -62,6 +95,9 @@ export function handleStop(stdinText, readTextFile) {
   if (typeof readTextFile !== "function" && transcriptPath.length > 0) {
     const gitLedger = cwd.length > 0 ? readGitLedger(cwd) : { gitRoot: "" };
     ledger = readFactLedger(transcriptPath, cwd, gitLedger.gitRoot || "");
+    if (ledger.transcriptAvailable) {
+      mergeShellWrittenFiles(ledger, payload, cwd);
+    }
   }
 
   const isReadOnlyGovernanceRole = ledger?.sessionRole === "auditor" || ledger?.sessionRole === "challenger";

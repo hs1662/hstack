@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { appendAuditRecord } from "./governance/audit-log.mjs";
 import { readGovernanceConfig, resolveAutonomyMode, resolveAutonomyThresholds } from "./governance/config.mjs";
 import {
@@ -23,7 +23,7 @@ import {
   buildCircuitBreakerDenyReason,
 } from "./governance/constants.mjs";
 import { detectDestructiveEdit, normalizeWriteOperations } from "./governance/destructive-edit.mjs";
-import { normalizeWorkspacePath, readFactLedger } from "./governance/fact-ledger.mjs";
+import { normalizeWorkspacePath, readFactLedger, resolveGitRootFast } from "./governance/fact-ledger.mjs";
 import {
   claimAutonomyTurnFlag,
   hasAutonomyTurnFlag,
@@ -45,29 +45,6 @@ const CHALLENGER_GUIDANCE_LINE =
   "위 작업 경로의 실제 파일과 호출 관계를 직접 읽고 사용자의 유도 전제에 동조하지 않은 채 근거(`파일:줄`) 기반 반론과 지정 판정 태그로만 보고하라.";
 const INJECTED_TAIL_LINE_RE =
   /^(?:작업 경로:|세션 기록 경로:|현재 턴 시작 스텝:|-\s*작업 디렉터리:|위 작업 경로의 실제 파일과 호출 관계를 직접 읽고)/;
-
-function resolveGitRootFast(startDir) {
-  if (typeof startDir !== "string" || startDir.trim().length === 0) {
-    return "";
-  }
-  let dir;
-  try {
-    dir = realpathSync(startDir.trim());
-  } catch {
-    dir = resolve(startDir.trim());
-  }
-  for (let i = 0; i < 20; i += 1) {
-    if (existsSync(resolve(dir, ".git"))) {
-      return dir;
-    }
-    const parent = dirname(dir);
-    if (parent === dir) {
-      break;
-    }
-    dir = parent;
-  }
-  return "";
-}
 
 function classifyManagedAgent(rawTypeName) {
   if (typeof rawTypeName !== "string") {
