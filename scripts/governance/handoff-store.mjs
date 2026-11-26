@@ -415,7 +415,7 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
   }
 }
 
-// The tree as verify_completion saw it, attached to the current turn snapshot so a new turn discards it.
+// The tree as the last passing verify_completion saw it, attached to the current turn snapshot so a new turn discards it.
 export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePluginDataDir() } = {}) {
   const filePath = resolveSessionStatePath(conversationId, dataDir);
   if (!filePath || !snapshot) {
