@@ -49,6 +49,9 @@ export function computeWorkspaceKey(cwd, gitRoot = "") {
 }
 
 const SESSION_LOCK_STALE_MS = 10_000;
+// Critical sections last milliseconds and hooks time out after 5s; past this age a lock is stale even if its
+// pid is alive (pid reuse).
+const SESSION_LOCK_MAX_AGE_MS = 120_000;
 const SESSION_LOCK_RETRIES = 25;
 const SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4));
 
@@ -56,7 +59,8 @@ function sleepMsSync(ms) {
   Atomics.wait(SLEEP_BUFFER, 0, 0, ms);
 }
 
-// A lock is stale only when its recorded holder is dead, or, with no readable pid, when it is old.
+// A lock is stale when its recorded holder is dead, when it has no readable pid and is old, or when it is
+// older than the hard cap whatever its pid.
 function isSessionLockStale(lockPath) {
   let st;
   let raw;
@@ -65,6 +69,9 @@ function isSessionLockStale(lockPath) {
     raw = readFileSync(lockPath, "utf8");
   } catch {
     return false;
+  }
+  if (Date.now() - st.mtimeMs > SESSION_LOCK_MAX_AGE_MS) {
+    return true;
   }
   let pid = null;
   try {
