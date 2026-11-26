@@ -49,10 +49,104 @@ function extractVerificationSegments(cmd) {
   return segments;
 }
 
-// Only the same runner with the same targets and flags clears a failure: whether a shorter
-// command covers more (`node --test`) or less (`go test` vs `go test ./...`) depends on the runner.
+// Runner prefixes whose form without file targets runs the whole suite. `go test` is absent on purpose:
+// without targets it tests only the current package, so go widens only to `./...`.
+const ALL_TESTS_WITHOUT_TARGETS = [
+  ["node", "--test"],
+  ["npm", "test"],
+  ["npm", "t"],
+  ["npm", "run", "test"],
+  ["pnpm", "test"],
+  ["pnpm", "run", "test"],
+  ["yarn", "test"],
+  ["yarn", "run", "test"],
+  ["bun", "test"],
+  ["bun", "run", "test"],
+  ["vitest"],
+  ["vitest", "run"],
+  ["npx", "vitest"],
+  ["npx", "vitest", "run"],
+  ["jest"],
+  ["npx", "jest"],
+  ["pytest"],
+  ["python", "-m", "pytest"],
+  ["python3", "-m", "pytest"],
+];
+const SHELL_OPERATOR_TOKEN_RE = /[|&;()<>`$]/;
+const ENV_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+function isPathTarget(token) {
+  return !token.startsWith("-") && !token.includes("=") && (/[/\\*]/.test(token) || /\.[A-Za-z0-9]+$/.test(token));
+}
+
+function runnerPrefixLength(tokens) {
+  let start = 0;
+  while (start < tokens.length && ENV_ASSIGNMENT_RE.test(tokens[start])) {
+    start += 1;
+  }
+  const matches = (prefix) => prefix.every((word, k) => tokens[start + k] === word);
+  if (tokens[start] === "go" && tokens[start + 1] === "test") {
+    return { kind: "go", end: start + 2 };
+  }
+  const prefix = ALL_TESTS_WITHOUT_TARGETS.filter(matches).sort((x, y) => y.length - x.length)[0];
+  return prefix ? { kind: "all", end: start + prefix.length } : null;
+}
+
+// Indexes of `failed` tokens that `passed` drops, when `passed` is `failed` minus some tokens; else null.
+function droppedTokenIndexes(failed, passed) {
+  const dropped = [];
+  let j = 0;
+  for (let i = 0; i < failed.length; i += 1) {
+    if (j < passed.length && failed[i] === passed[j]) {
+      j += 1;
+    } else {
+      dropped.push(i);
+    }
+  }
+  return j === passed.length ? dropped : null;
+}
+
+// A passing command clears a failing one when it is the same command, or the same runner and flags
+// with every file target removed on a runner whose target-less form runs every test. Dropping only
+// some targets narrows the run. Go widens only to `./...`, over relative package targets inside it.
 function segmentResolvedBy(failedSeg, passedSeg) {
-  return failedSeg.length > 0 && failedSeg === passedSeg;
+  if (failedSeg.length === 0 || passedSeg.length === 0) {
+    return false;
+  }
+  if (failedSeg === passedSeg) {
+    return true;
+  }
+  const failed = failedSeg.split(" ");
+  const passed = passedSeg.split(" ");
+  if ([...failed, ...passed].some((token) => SHELL_OPERATOR_TOKEN_RE.test(token))) {
+    return false;
+  }
+  const runner = runnerPrefixLength(failed);
+  if (!runner || failed.slice(0, runner.end).join(" ") !== passed.slice(0, runner.end).join(" ")) {
+    return false;
+  }
+  if (runner.kind === "go") {
+    const targets = (tokens) => tokens.slice(runner.end).filter(isPathTarget);
+    const flags = (tokens) => tokens.slice(runner.end).filter((token) => !isPathTarget(token));
+    return (
+      targets(passed).join(" ") === "./..." &&
+      flags(failed).join(" ") === flags(passed).join(" ") &&
+      targets(failed).every((target) => target === "." || (target.startsWith("./") && !target.split("/").includes("..")))
+    );
+  }
+  const dropped = droppedTokenIndexes(failed, passed);
+  if (!dropped || dropped.length === 0 || dropped.some((index) => index < runner.end)) {
+    return false;
+  }
+  // A value right after a bare flag belongs to that flag, not to the target list.
+  const isTarget = (tokens, index) =>
+    isPathTarget(tokens[index]) && !(index - 1 >= runner.end && /^-[^=]*$/.test(tokens[index - 1]) && tokens[index - 1] !== "--");
+  const droppedOnlyTargets = dropped.every((index) =>
+    failed[index] === "--"
+      ? failed.slice(index + 1).every((_, k) => dropped.includes(index + 1 + k))
+      : isTarget(failed, index),
+  );
+  return droppedOnlyTargets && !passed.some((_, index) => index >= runner.end && isTarget(passed, index));
 }
 
 function isCommandResolvedBy(failedCmd, passedCmd) {
