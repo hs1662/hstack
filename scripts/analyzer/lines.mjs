@@ -201,12 +201,49 @@ function isKeyValueLabel(trimmed) {
   );
 }
 
+const MAX_TECHNICAL_CELL_WORDS = 8;
+const MAX_ENUMERATION_BULLET_WORDS = 8;
+const ENUMERATION_SPLIT_RE = /[ \t]*(?:,|\/|&|\+|\band\b|\bor\b)[ \t]*/i;
+
+// A noun-phrase label such as "Unit tests for the session lock module": no sentence cue, no finite verb.
+function isShortTechnicalCell(cell) {
+  const words = englishWords(cell);
+  return (
+    words.length <= MAX_TECHNICAL_CELL_WORDS &&
+    !PROSE_OPENER_RE.test(cell) &&
+    !SENTENCE_BOUNDARY_RE.test(cell) &&
+    !hasEnglishSentenceFiniteWord(words)
+  );
+}
+
 function isShortCellTableRow(trimmed) {
   if (countMatches(trimmed, /\|/g) < 2) {
     return false;
   }
-  const cells = trimmed.replace(/^\|/, "").replace(/\|$/, "").split("|");
-  return cells.every((cell) => englishWords(cell).length <= 4 && !PROSE_OPENER_RE.test(cell.trim()));
+  const cells = trimmed.replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+  if (cells.every((cell) => englishWords(cell).length <= 4 && !PROSE_OPENER_RE.test(cell))) {
+    return true;
+  }
+  // Rows of a Korean table may carry longer English labels in their other cells.
+  return cells.some((cell) => HAS_HANGUL_RE.test(cell)) && cells.every((cell) => HAS_HANGUL_RE.test(cell) || isShortTechnicalCell(cell));
+}
+
+// "Markdown and HTML", "JSON or YAML": names joined by and/or/commas, none an imperative or a function word.
+function isTechNameEnumeration(body) {
+  const items = body.split(ENUMERATION_SPLIT_RE).filter((item) => item.trim().length > 0);
+  if (items.length < 2 || countEnglishWords(body) > MAX_ENUMERATION_BULLET_WORDS) {
+    return false;
+  }
+  return items.every((item) => {
+    const words = englishWords(item);
+    return (
+      words.length > 0 &&
+      words.length <= 3 &&
+      !hasWordFlag(words[0].toLowerCase(), IMPERATIVE) &&
+      !PROSE_OPENER_RE.test(item.trim()) &&
+      !hasEnglishProseFunctionWord(words)
+    );
+  });
 }
 
 function isShortTokenBullet(trimmed) {
@@ -214,7 +251,10 @@ function isShortTokenBullet(trimmed) {
     return false;
   }
   const body = trimmed.replace(BULLET_PREFIX_RE, "");
-  return !HAS_HANGUL_RE.test(body) && countEnglishWords(body) <= 3 && !isShortEnglishProseItem(body);
+  if (HAS_HANGUL_RE.test(body)) {
+    return false;
+  }
+  return (countEnglishWords(body) <= 3 && !isShortEnglishProseItem(body)) || isTechNameEnumeration(body);
 }
 
 function isShortTokenCommaList(trimmed) {

@@ -1,5 +1,14 @@
 import { MAX_ERROR_QUOTE_CHARS, MAX_SHORT_TOKEN_QUOTE_CHARS, MAX_SHORT_TOKEN_QUOTE_WORDS } from "./constants.mjs";
-import { HAS_HANGUL_RE, PROSE_OPENER_RE, englishWords, hasEnglishProseFunctionWord, isUpperStopword } from "./lexicon.mjs";
+import {
+  HAS_HANGUL_RE,
+  PROSE_OPENER_RE,
+  SENTENCE_BOUNDARY_RE,
+  countMatches,
+  englishWords,
+  hasEnglishProseFunctionWord,
+  hasEnglishSentenceFiniteWord,
+  isUpperStopword,
+} from "./lexicon.mjs";
 
 const CLI_UI_HINT_LINE_RE =
   /^[ \t]*(?:[-*][ \t]+)?(?:Run|Use|Type)\s+`?\/[a-z][a-z0-9_-]*(?:[ \t]+[a-z0-9_-]+){0,3}`?[ \t]*\([^)\n]{1,40}\)[ \t]*(?:to[ \t]+[^\n]{1,60})?$/gim;
@@ -47,24 +56,38 @@ export function isErrorQuote(text) {
   return text.length > 0 && text.length <= MAX_ERROR_QUOTE_CHARS && ERROR_QUOTE_RE.test(text);
 }
 
+// Code syntax a prose sentence does not have: a leading comment marker, a trailing code
+// delimiter, or an arrow/assignment. Prose and Hangul lines in an unclosed fence or indented block stay analyzed.
+const CODE_LIKE_LINE_RE = /^[ \t]*(?:\/\/|\/\*|#|--|<!--)|[;{}()[\],][ \t]*$|=>|[^=!<>]=[^=]/;
+const INDENTED_CODE_LINE_RE = /^(?: {4}|\t)/;
+
+function isCodeLikeLine(line) {
+  return CODE_LIKE_LINE_RE.test(line) && !HAS_HANGUL_RE.test(line);
+}
+
 export function stripFencedCodeBlocks(text) {
   const out = [];
   let inFence = false;
   let fenceChar = "";
   let fenceLen = 0;
   let fencedLines = [];
+  let inIndented = false;
 
   for (const line of text.split("\n")) {
     if (!inFence) {
       const openMatch = line.match(/^[ \t]*(`{3,}|~{3,})(.*)$/);
       if (openMatch && !openMatch[2].includes(openMatch[1][0])) {
         inFence = true;
+        inIndented = false;
         fenceChar = openMatch[1][0];
         fenceLen = openMatch[1].length;
         fencedLines = [line];
         continue;
       }
-      out.push(line);
+      const blank = line.trim().length === 0;
+      const previousBlank = out.length === 0 || out[out.length - 1].trim().length === 0;
+      inIndented = !blank && INDENTED_CODE_LINE_RE.test(line) && (inIndented || previousBlank);
+      out.push(inIndented && isCodeLikeLine(line) ? "" : line);
       continue;
     }
 
@@ -81,7 +104,7 @@ export function stripFencedCodeBlocks(text) {
   }
 
   if (inFence && fencedLines.length > 0) {
-    out.push(...fencedLines);
+    out.push("", ...fencedLines.slice(1).map((line) => (isCodeLikeLine(line) ? "" : line)));
   }
 
   return out.join("\n");
@@ -304,14 +327,49 @@ export function stripSummarizerBoilerplate(rawText) {
   return rawText.replace(/\r\n?/g, "\n").replace(SUMMARIZER_BOILERPLATE_LINE_RE, "");
 }
 
+// Linear scan; an unclosed `<!--` is left as text.
+function stripHtmlComments(text) {
+  let out = "";
+  let from = 0;
+  for (let open = text.indexOf("<!--"); open !== -1; open = text.indexOf("<!--", from)) {
+    const close = text.indexOf("-->", open + 4);
+    if (close === -1) {
+      break;
+    }
+    out += `${text.slice(from, open)} ${"\n".repeat(countMatches(text.slice(open, close), /\n/g))}`;
+    from = close + 3;
+  }
+  return from === 0 ? text : out + text.slice(from);
+}
+
+// `[title](target)` is a reference, not prose, unless the title is itself a long English sentence.
+const MARKDOWN_LINK_RE = /\[([^[\]\n]{1,200})\]\(([^()\s]{1,2000})\)/g;
+const MAX_LINK_TITLE_WORDS = 12;
+const MIN_LINK_SENTENCE_WORDS = 8;
+
+function isSentenceLinkTitle(title) {
+  const words = englishWords(title);
+  if (words.length > MAX_LINK_TITLE_WORDS) {
+    return true;
+  }
+  return (
+    words.length >= MIN_LINK_SENTENCE_WORDS &&
+    (PROSE_OPENER_RE.test(title.trim()) || SENTENCE_BOUNDARY_RE.test(title) || hasEnglishSentenceFiniteWord(words))
+  );
+}
+
+function stripMarkdownLinks(text) {
+  return text.replace(MARKDOWN_LINK_RE, (full, title) => (isSentenceLinkTitle(title) ? ` ${title} ` : " "));
+}
+
 export function extractNaturalText(rawText) {
   if (typeof rawText !== "string" || rawText.length === 0) {
     return "";
   }
 
   const normalized = rawText.replace(/\r\n?/g, "\n");
-  const withoutHints = stripFencedCodeBlocks(normalized).replace(CLI_UI_HINT_LINE_RE, "");
-  const withoutInline = stripInlineCode(stripBlockquotes(withoutHints));
+  const withoutHints = stripHtmlComments(stripFencedCodeBlocks(normalized)).replace(CLI_UI_HINT_LINE_RE, "");
+  const withoutInline = stripMarkdownLinks(stripInlineCode(stripBlockquotes(withoutHints)));
   const withoutXmlAndUrls = withoutInline.replace(URL_RE, " ").replace(XML_TAG_RE, " ");
   const withoutTechnical = stripPathsFlagsAndIdentifiers(stripDoubleQuotes(withoutXmlAndUrls));
 
