@@ -1,6 +1,7 @@
 // Shared fixtures for the domain test files (node --test runs each file in its own process).
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after } from "node:test";
@@ -28,6 +29,69 @@ export function createTempDir(prefix = "hstack-test-") {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   tempDirs.push(dir);
   return dir;
+}
+
+// node --test runs test files in parallel. Wall-clock perf tests and the 16-process lock stress test take
+// this cross-process lock, so a timing never overlaps the stress test's burst of node startups.
+const CPU_LOCK_DIR = join(tmpdir(), `hstack-test-cpu-${createHash("sha1").update(PLUGIN_ROOT).digest("hex").slice(0, 12)}.lock`);
+const CPU_LOCK_STALE_MS = 120_000;
+const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));
+
+function isLiveCpuLockHolder() {
+  let pid = Number.NaN;
+  try {
+    pid = Number(readFileSync(join(CPU_LOCK_DIR, "pid"), "utf8"));
+  } catch {
+    // A holder writes its pid right after mkdir; a missing pid is a holder still starting.
+  }
+  if (!(pid > 0)) {
+    return Date.now() - statSync(CPU_LOCK_DIR).mtimeMs < 1_000;
+  }
+  try {
+    process.kill(pid, 0);
+    return Date.now() - statSync(CPU_LOCK_DIR).mtimeMs < CPU_LOCK_STALE_MS;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+function tryTakeCpuLock() {
+  try {
+    mkdirSync(CPU_LOCK_DIR);
+    writeFileSync(join(CPU_LOCK_DIR, "pid"), String(process.pid));
+    return true;
+  } catch (err) {
+    if (err.code !== "EEXIST") {
+      throw err;
+    }
+  }
+  try {
+    if (!isLiveCpuLockHolder()) {
+      rmSync(CPU_LOCK_DIR, { recursive: true, force: true });
+    }
+  } catch {
+    // The holder released it between our checks.
+  }
+  return false;
+}
+
+export function withCpuLock(fn) {
+  while (!tryTakeCpuLock()) {
+    Atomics.wait(SLEEP_CELL, 0, 0, 20);
+  }
+  const release = () => rmSync(CPU_LOCK_DIR, { recursive: true, force: true });
+  let result;
+  try {
+    result = fn();
+  } catch (err) {
+    release();
+    throw err;
+  }
+  if (result && typeof result.then === "function") {
+    return result.finally(release);
+  }
+  release();
+  return result;
 }
 
 export function makeStep(stepIndex, type, { thinking = "", content = "", toolCalls = [] } = {}) {

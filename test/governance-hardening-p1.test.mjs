@@ -14,7 +14,7 @@ import { readFactLedger } from "../scripts/governance/fact-ledger.mjs";
 import { claimAutonomyTurnFlag } from "../scripts/governance/handoff-store.mjs";
 import { handlePostInvocation } from "../scripts/post-invocation.mjs";
 import { isExplicitEnglishOutputRequest } from "../scripts/transcript.mjs";
-import { PLUGIN_ROOT, createTempDir, toJsonl } from "./helpers.mjs";
+import { PLUGIN_ROOT, createTempDir, toJsonl, withCpuLock } from "./helpers.mjs";
 
 const HANDOFF_STORE_URL = pathToFileURL(join(PLUGIN_ROOT, "scripts", "governance", "handoff-store.mjs")).href;
 
@@ -55,49 +55,50 @@ function deadPid() {
 }
 
 describe("#5 session lock is exclusive under contention and reclaims stale locks atomically", () => {
-  it("keeps 16/16 parallel claims and grants a shared key exactly once across 10 trials with a pre-aged stale lock", async () => {
-    const CHILDREN = 16;
-    const TRIALS = 10;
-    const children = Array.from({ length: CHILDREN }, startClaimChild);
-    try {
-      await Promise.all(children.map(nextMessage));
-      for (let trial = 0; trial < TRIALS; trial += 1) {
-        const dataDir = createTempDir("hstack-p1-lock-");
-        mkdirSync(join(dataDir, "sessions"));
-        const lockPath = `${sessionPath(dataDir)}.lock`;
-        writeFileSync(lockPath, "");
-        const aged = new Date(Date.now() - 60_000);
-        utimesSync(lockPath, aged, aged);
+  it("keeps 16/16 parallel claims and grants a shared key exactly once across 10 trials with a pre-aged stale lock", () =>
+    withCpuLock(async () => {
+      const CHILDREN = 16;
+      const TRIALS = 10;
+      const children = Array.from({ length: CHILDREN }, startClaimChild);
+      try {
+        await Promise.all(children.map(nextMessage));
+        for (let trial = 0; trial < TRIALS; trial += 1) {
+          const dataDir = createTempDir("hstack-p1-lock-");
+          mkdirSync(join(dataDir, "sessions"));
+          const lockPath = `${sessionPath(dataDir)}.lock`;
+          writeFileSync(lockPath, "");
+          const aged = new Date(Date.now() - 60_000);
+          utimesSync(lockPath, aged, aged);
 
-        const startAt = Date.now() + 50;
-        const results = await Promise.all(
-          children.map((child, i) => {
-            const reply = nextMessage(child);
-            child.send({ dataDir, key: `k${i}`, startAt });
-            return reply;
-          }),
-        );
-        const persisted = JSON.parse(readFileSync(sessionPath(dataDir), "utf8")).autoHandoffTurns;
-        const label = `trial ${trial + 1}`;
-        assert.deepEqual(
-          results.map((r) => r.own),
-          Array(CHILDREN).fill(true),
-          `${label}: every child acquires the lock`,
-        );
-        assert.equal(results.filter((r) => r.shared === true).length, 1, `${label}: shared key granted exactly once`);
-        assert.equal(results.filter((r) => r.shared === false).length, CHILDREN - 1, `${label}: others see it taken`);
-        for (let i = 0; i < CHILDREN; i += 1) {
-          assert.ok(persisted.includes(`k${i}`), `${label}: k${i} persisted`);
+          const startAt = Date.now() + 50;
+          const results = await Promise.all(
+            children.map((child, i) => {
+              const reply = nextMessage(child);
+              child.send({ dataDir, key: `k${i}`, startAt });
+              return reply;
+            }),
+          );
+          const persisted = JSON.parse(readFileSync(sessionPath(dataDir), "utf8")).autoHandoffTurns;
+          const label = `trial ${trial + 1}`;
+          assert.deepEqual(
+            results.map((r) => r.own),
+            Array(CHILDREN).fill(true),
+            `${label}: every child acquires the lock`,
+          );
+          assert.equal(results.filter((r) => r.shared === true).length, 1, `${label}: shared key granted exactly once`);
+          assert.equal(results.filter((r) => r.shared === false).length, CHILDREN - 1, `${label}: others see it taken`);
+          for (let i = 0; i < CHILDREN; i += 1) {
+            assert.ok(persisted.includes(`k${i}`), `${label}: k${i} persisted`);
+        }
+        assert.equal(persisted.filter((k) => k === "shared").length, 1, `${label}: shared persisted once`);
+        assert.equal(persisted.length, CHILDREN + 1, `${label}: 0 lost, 0 duplicate records`);
+        }
+      } finally {
+        for (const child of children) {
+          child.kill();
+        }
       }
-      assert.equal(persisted.filter((k) => k === "shared").length, 1, `${label}: shared persisted once`);
-      assert.equal(persisted.length, CHILDREN + 1, `${label}: 0 lost, 0 duplicate records`);
-      }
-    } finally {
-      for (const child of children) {
-        child.kill();
-      }
-    }
-  });
+    }));
 
   it("reclaims a fresh lock left by a dead pid and never reclaims an old lock held by a live pid", () => {
     const deadDir = createTempDir("hstack-p1-lock-dead-");

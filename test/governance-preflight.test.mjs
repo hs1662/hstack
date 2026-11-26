@@ -26,7 +26,7 @@ import {
 } from "../scripts/governance/fact-ledger.mjs";
 import { readSessionState } from "../scripts/governance/handoff-store.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
-import { HOOK_SCRIPT, STOP_HOOK_SCRIPT, createTempDir, runHookSubprocess, toJsonl } from "./helpers.mjs";
+import { HOOK_SCRIPT, STOP_HOOK_SCRIPT, createTempDir, runHookSubprocess, toJsonl, withCpuLock } from "./helpers.mjs";
 
 function makeBaseInput(overrides = {}) {
   return {
@@ -761,13 +761,15 @@ describe("pre-tool-gate.mjs, stop.mjs, and post-invocation.mjs challenger integr
     writeFileSync(trPath, `${lines.join("\n")}\n`, "utf8");
 
     const samples = [];
-    for (let i = 0; i < 5; i += 1) {
-      const t0 = performance.now();
-      const ledger = readFactLedger(trPath, "/repo", "/repo");
-      samples.push(performance.now() - t0);
-      assert.equal(ledger.turnPreflightChallenges.length, 1);
-      assert.equal(ledger.turnPreflightChallenges[0].verdict, "PROCEED");
-    }
+    withCpuLock(() => {
+      for (let i = 0; i < 5; i += 1) {
+        const t0 = performance.now();
+        const ledger = readFactLedger(trPath, "/repo", "/repo");
+        samples.push(performance.now() - t0);
+        assert.equal(ledger.turnPreflightChallenges.length, 1);
+        assert.equal(ledger.turnPreflightChallenges[0].verdict, "PROCEED");
+      }
+    });
     samples.sort((a, b) => a - b);
     const medianMs = samples[2];
     assert.ok(medianMs <= 100, `expected 5MB readFactLedger median <= 100ms, got ${medianMs.toFixed(1)}ms`);

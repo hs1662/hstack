@@ -18,7 +18,7 @@ import {
 } from "../scripts/governance/fact-ledger.mjs";
 import { resolvePluginDataDir, streamTranscriptRecords } from "../scripts/hook-io.mjs";
 import { GATE_STOP_MARKER } from "../scripts/transcript/markers.mjs";
-import { createTempDir, toJsonl } from "./helpers.mjs";
+import { createTempDir, toJsonl, withCpuLock } from "./helpers.mjs";
 
 function runGit(cwd, args) {
   return execFileSync("git", args, {
@@ -218,9 +218,11 @@ describe("readFactLedger performance and turn semantics", () => {
     assert.ok(Buffer.byteLength(payload, "utf8") >= 5 * 1024 * 1024);
     writeFileSync(transcriptPath, payload, "utf8");
 
-    const start = performance.now();
-    const ledger = readFactLedger(transcriptPath, "/repo", "/repo");
-    const elapsedMs = performance.now() - start;
+    const { ledger, elapsedMs } = withCpuLock(() => {
+      const start = performance.now();
+      const scanned = readFactLedger(transcriptPath, "/repo", "/repo");
+      return { ledger: scanned, elapsedMs: performance.now() - start };
+    });
 
     assert.equal(ledger.transcriptAvailable, true);
     assert.equal(ledger.sessionReadFiles.size, 10);

@@ -29,7 +29,7 @@ import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePostInvocation } from "../scripts/post-invocation.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handleStop } from "../scripts/stop.mjs";
-import { createTempDir, toJsonl } from "./helpers.mjs";
+import { createTempDir, toJsonl, withCpuLock } from "./helpers.mjs";
 
 function runGit(cwd, args) {
   return execFileSync("git", args, {
@@ -725,12 +725,14 @@ describe("fact-ledger Phase 2 extensions, git numstat, and 5MB performance", () 
     writeFileSync(filePath, `${lines.join("\n")}\n`, "utf8");
 
     const samples = [];
-    for (let i = 0; i < 5; i += 1) {
-      const t0 = performance.now();
-      const ledger = readFactLedger(filePath, "/repo", "/repo");
-      samples.push(performance.now() - t0);
-      assert.equal(ledger.sessionReadFiles.size, 105);
-    }
+    withCpuLock(() => {
+      for (let i = 0; i < 5; i += 1) {
+        const t0 = performance.now();
+        const ledger = readFactLedger(filePath, "/repo", "/repo");
+        samples.push(performance.now() - t0);
+        assert.equal(ledger.sessionReadFiles.size, 105);
+      }
+    });
     samples.sort((a, b) => a - b);
     const medianMs = samples[2];
     assert.ok(medianMs <= 100, `Expected 5MB readFactLedger median <= 100ms, got ${medianMs.toFixed(2)}ms`);
