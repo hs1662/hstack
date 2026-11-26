@@ -523,6 +523,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       return false;
     }
     ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, otherStep);
+    ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, otherStep);
     // Without a diff any dirty code file may be the shell's, so each one needs reporting and a check after it.
     for (const relPath of dirtyFiles) {
       if (!isExemptDocOrAssetPath(relPath) && !keepsToolDate(relPath)) {
@@ -565,11 +566,14 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   );
   if (untrackedIncomplete && unclassifiedShellExecs.length > 0) {
     if (postGateWriter) {
-      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+      const postStep = datingStep(postGateShell);
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postStep);
+      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, postStep);
       return true;
     }
     if (lastGateStep === -1 || otherStep > lastGateStep) {
       ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, otherStep);
+      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, otherStep);
       return true;
     }
   }

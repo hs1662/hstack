@@ -141,6 +141,33 @@ describe("H1 untracked overflow and snapshot timeout precision in Stop gate", ()
     });
   });
 
+  it("blocks both verify_completion and Stop when an arbitrary shell command creates a new untracked code file under 2,100+ untracked files", () => {
+    withCpuLock(() => {
+      const repo = makeRepo();
+      mkdirSync(join(repo, "untracked"));
+      for (let i = 0; i < 2100; i += 1) {
+        writeFileSync(join(repo, "untracked", `u${i}.mjs`), `export const n = ${i};\n`);
+      }
+      const { out, verdicts } = runTurnOnRepo(repo, "p10-h1-untracked-create", [
+        {
+          cmd: `sh -c 'echo "export const n = 1;" > new_untracked.mjs'`,
+          effect: (r) => writeFileSync(join(r, "new_untracked.mjs"), "export const n = 1;\n"),
+        },
+        {
+          gate: {
+            modified_files: ["new_untracked.mjs"],
+            inspected_files: [],
+            verification_runs: [],
+            unverified_scope: ["없음"],
+            self_assessment: "확인했습니다.",
+          },
+        },
+      ]);
+      assert.equal(verdicts[0], VERDICT_HEADERS.REJECT_NEUTRAL, verdicts.join(" | "));
+      assertGateBlocked(out);
+    });
+  });
+
   it("excludes .gitignore targets and exempt doc/asset files from the 2,000-file code snapshot cap", () => {
     withCpuLock(() => {
       const repo = makeRepo();
@@ -227,6 +254,7 @@ describe("H2 strict verification whitelist for npx/pnpx/bunx, npm/pnpm/yarn/bun,
       "npx cowsay hi",
       "npx ts-node mutate.ts",
       "npx prettier --write .",
+      "npx eslint --fix .",
       "npx tsx mutate.ts",
       'npx -c "sed -i s/1/2/ app.mjs"',
       "npx -p evil vitest",
@@ -240,12 +268,17 @@ describe("H2 strict verification whitelist for npx/pnpx/bunx, npm/pnpm/yarn/bun,
       "npm version",
       "npm version patch",
       "npm help",
+      "npm run mutate",
+      "npm run start",
+      "npm run lint:fix",
       "pnpm ls",
       "pnpm list",
       "yarn info hstack",
       "yarn list",
       "go run mutate.go",
       "go run ./cmd/mutate",
+      "go test -exec sh ./...",
+      "go build -toolexec sh ./...",
       "go generate ./...",
       "go env",
     ]) {
@@ -349,6 +382,7 @@ describe("H3 sequential pipefail state tracking", () => {
       "set -o pipefail && set +o pipefail && npm test | head -3",
       "set -o pipefail +o pipefail && npm test | head -3",
       "bash -o pipefail +o pipefail -c 'npm test | head -3'",
+      "bash -co pipefail 'npm test | head -3'",
     ]) {
       assert.equal(classifyCommand(cmd), "other", cmd);
     }

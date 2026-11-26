@@ -97,6 +97,9 @@ const PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS = new Set([
   "verify",
 ]);
 const GO_VERIFICATION_SUBCOMMANDS = new Set(["test", "vet", "build"]);
+const GO_EXEC_FLAG_RE = /^--?(?:exec|toolexec|vettool)(?:=|$)/;
+const VERIFY_SCRIPT_NAME_RE = /(?:^|[:_-])(?:test|tests|check|verify|lint|typecheck|tsc|spec|build|e2e|unit|ci)(?:$|[:_-])/i;
+const WRITE_SCRIPT_NAME_RE = /(?:^|[:_-])(?:fix|format|fmt|write|mutate|clean|deploy|release|publish|start|dev)(?:$|[:_-])/i;
 const BARE_SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
 const ALLOWED_SUBAGENT_SYSTEM_SOURCES = new Set(["SYSTEM"]);
 const SESSION_ROLE_PRIORITY = { main: 0, worker: 1, challenger: 2, auditor: 3 };
@@ -449,7 +452,7 @@ function inlineInterpreterBody(bin, args) {
     let pipefail = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][A-Za-z]*o$/.test(arg)) {
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][euxv]*o$/.test(arg)) {
         if (args[i + 1] === "pipefail") {
           pipefail = arg[0] === "-";
         }
@@ -796,6 +799,14 @@ function isTsxVerification(args) {
   return headArgs.filter((tok) => !tok.startsWith("-")).some((tok) => NODE_TEST_FILE_RE.test(tok));
 }
 
+function isEslintSafeArgs(toolArgs) {
+  return !toolArgs.some((a) => a === "--fix" || a === "--fix-dry-run" || a.startsWith("--fix-type"));
+}
+
+function isVerificationScriptName(name) {
+  return Boolean(name) && !/[/\\.]/.test(name) && VERIFY_SCRIPT_NAME_RE.test(name) && !WRITE_SCRIPT_NAME_RE.test(name);
+}
+
 function isPackageExecVerification(args) {
   let toolIdx = 0;
   while (toolIdx < args.length) {
@@ -822,6 +833,9 @@ function isPackageExecVerification(args) {
     const hasWrite = toolArgs.some((a) => a === "--write" || a === "-w");
     return hasCheck && !hasWrite;
   }
+  if (tool === "eslint") {
+    return isEslintSafeArgs(toolArgs);
+  }
   if (tool === "tsx") {
     return isTsxVerification(toolArgs);
   }
@@ -836,22 +850,14 @@ function isScriptRunnerVerification(baseBin, args) {
   const headArgs = sepIdx === -1 ? args : args.slice(0, sepIdx);
   const positional = headArgs.filter((tok) => !tok.startsWith("-"));
   const sub = positional[0] ?? "";
+  const isNamedRun = (sub === "run" || sub === "run-script") && isVerificationScriptName(positional[1]);
   if (baseBin === "bun") {
-    return (
-      sub === "test" ||
-      ((sub === "run" || sub === "run-script") &&
-        Boolean(positional[1]) &&
-        !/[/\\.]/.test(positional[1]) &&
-        CHECK_SCRIPT_RE.test(positional[1]))
-    );
+    return sub === "test" || isNamedRun;
   }
   if (baseBin === "npm") {
-    return NPM_TEST_SUBCOMMANDS.has(sub) || ((sub === "run" || sub === "run-script") && Boolean(positional[1]));
+    return NPM_TEST_SUBCOMMANDS.has(sub) || isNamedRun;
   }
-  return (
-    PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS.has(sub) ||
-    ((sub === "run" || sub === "run-script") && Boolean(positional[1]))
-  );
+  return PNPM_YARN_DIRECT_CHECK_SUBCOMMANDS.has(sub) || isNamedRun;
 }
 
 function isChainPrepCommand({ words, redirects }) {
@@ -894,6 +900,9 @@ function isRunnerCommand({ words, redirects }) {
   if (baseBin === "tsx" && !isTsxVerification(args)) {
     return false;
   }
+  if (baseBin === "eslint" && !isEslintSafeArgs(args)) {
+    return false;
+  }
   if ((baseBin === "python" || baseBin === "python3") && !pythonRunsTests(args)) {
     return false;
   }
@@ -903,7 +912,7 @@ function isRunnerCommand({ words, redirects }) {
   if (BARE_SCRIPT_RUNNERS.has(baseBin) && !isScriptRunnerVerification(baseBin, args)) {
     return false;
   }
-  if (baseBin === "go" && !GO_VERIFICATION_SUBCOMMANDS.has(args[0] ?? "")) {
+  if (baseBin === "go" && (!GO_VERIFICATION_SUBCOMMANDS.has(args[0] ?? "") || args.slice(1).some((a) => GO_EXEC_FLAG_RE.test(a)))) {
     return false;
   }
   // A local script or one a shell reads from a file runs anything, so only a test or check script counts.
