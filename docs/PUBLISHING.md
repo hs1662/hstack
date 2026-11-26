@@ -6,10 +6,10 @@ Use this guide to verify the repository before a release, push tags to GitHub, a
 
 ## Bundled components
 
-Confirm that `plugin.json` and the repository layout expose these components at version `0.1.0`:
+Confirm that `plugin.json` and the repository layout expose these components at version `0.1.1`:
 
 - `rules` (`1`): `rules/AGENTS.md` (pure Korean, zero ASCII letters)
-- `hooks` (`1`): `hstack-guard` in `hooks.json` (`PreToolUse`, `PostInvocation`, and `Stop`)
+- `hooks` (`1`): `hstack-guard` in `hooks.json` (`PreInvocation`, `PreToolUse`, `PostInvocation`, and `Stop`)
 - `mcpServers` (`1`): `gate` in `mcp_config.json` (`scripts/mcp/server.mjs`, exposing eager tools `verify_completion` and `manage_handoff`)
 - `agents` (`3`): `agents/hstack-auditor.md`, `agents/hstack-worker.md`, and `agents/hstack-challenger.md`
 - `skills` (`2`): `skills/hstack-handoff/SKILL.md` (`hstack-handoff`) and `skills/hstack-preflight/SKILL.md` (`hstack-preflight`)
@@ -19,7 +19,7 @@ Confirm that `plugin.json` and the repository layout expose these components at 
 
 Run every required check from the repository root before you push `main` or a release tag.
 
-1. Run the unit and contract test suite and confirm zero failures (v0.1.0 baseline: 66 suites / 262 tests).
+1. Run the unit and contract test suite and confirm zero failures (v0.1.1 baseline: 74 suites / 277 tests).
 
    ```sh
    node --test test/*.test.mjs
@@ -31,7 +31,7 @@ Run every required check from the repository root before you push `main` or a re
    agy plugin validate --strict --json .
    ```
 
-3. Verify that all executable scripts have mode `100755` in the git index.
+3. Verify that all standalone executable scripts have mode `100755` in the git index (`scripts/prompt-router.mjs` stays `100644` and is invoked via `node ./scripts/prompt-router.mjs` in `hooks.json`).
 
    ```sh
    git ls-files -s scripts/pre-tool-use.mjs scripts/pre-tool-gate.mjs scripts/post-invocation.mjs scripts/stop.mjs scripts/mcp/server.mjs scripts/audit-report.mjs test/verify-live.mjs
@@ -45,7 +45,7 @@ Run every required check from the repository root before you push `main` or a re
    ```
 
 4. Confirm that `assets/logo.svg` uses `viewBox="0 0 256 256"` and outer padding (`x="26" y="26" width="204" height="204"`).
-5. Confirm that `"version"` in `plugin.json`, `SERVER_INFO.version` in `scripts/mcp/server.mjs`, `README.md`, and `README.ko.md` match the target semantic version (`0.1.0`).
+5. Confirm that `"version"` in `plugin.json`, `SERVER_INFO.version` in `scripts/mcp/server.mjs`, `README.md`, and `README.ko.md` match the target semantic version (`0.1.1`).
 6. Confirm that no untracked or temporary files are staged, and that all modules under `rules/`, `agents/`, `skills/`, and `scripts/` are tracked.
 
    ```sh
@@ -53,13 +53,13 @@ Run every required check from the repository root before you push `main` or a re
    git ls-files rules/ agents/ skills/ scripts/
    ```
 
-7. When you change `rules/AGENTS.md`, `scripts/analyzer/`, `scripts/transcript/`, or governance hooks, run the isolated live verification script (`L1`–`L11`) as needed.
+7. When you change `rules/AGENTS.md`, `scripts/analyzer/`, `scripts/transcript/`, or governance hooks, run the isolated live verification script (`L1`–`L15`) as needed.
 
    ```sh
    node ./test/verify-live.mjs
    ```
 
-8. Review local audit telemetry (sections `[1]`–`[7]`, including `[3]` `R1~R9`, `[6]` scan latency, and `[7]` preflight summary) with the zero-dependency report CLI when inspecting operational metrics.
+8. Review local audit telemetry (sections `[1]`–`[8]`, including `[3]` `R1~R9`, `[6]` scan latency, `[7]` preflight mode summary, and `[8]` autonomy events) with the zero-dependency report CLI when inspecting operational metrics.
 
    ```sh
    node ./scripts/audit-report.mjs
@@ -74,7 +74,7 @@ Verify that `plugin.json` contains every required Antigravity Marketplace field 
 | `name` | `"hstack"` | Lowercase plugin slug. |
 | `displayName` | `"hstack"` | Human-readable title shown in the Marketplace listing. |
 | `description` | One-sentence summary | Clear statement of what the plugin does. |
-| `version` | `"0.1.0"` | Semantic version matching the GitHub release tag. |
+| `version` | `"0.1.1"` | Semantic version matching the GitHub release tag. |
 | `logo` | `"assets/logo.svg"` | Relative path to a 1:1 square icon with padding. |
 | `license` | `"MIT"` | License identifier matching `LICENSE`. |
 | `homepage` | `"https://github.com/hs1662/hstack"` | Public repository URL. |
@@ -87,13 +87,13 @@ Verify that `plugin.json` contains every required Antigravity Marketplace field 
 1. Create an annotated tag that matches `"version"` in `plugin.json`.
 
    ```sh
-   git tag -a v0.1.0 -m "Release hstack v0.1.0"
+   git tag -a v0.1.1 -m "Release hstack v0.1.1"
    ```
 
 2. Push `main` and the release tag with a standard fast-forward push.
 
    ```sh
-   git push origin main v0.1.0
+   git push origin main v0.1.1
    ```
 
 3. Validate the published GitHub repository directly with Antigravity CLI and confirm exit code `0` with `"findings": []`.
@@ -105,12 +105,12 @@ Verify that `plugin.json` contains every required Antigravity Marketplace field 
 4. Optional: create a GitHub Release for the tag.
 
    ```sh
-   gh release create v0.1.0 --title "hstack v0.1.0" --generate-notes
+   gh release create v0.1.1 --title "hstack v0.1.1" --generate-notes
    ```
 
 ## Submit to the Antigravity Marketplace
 
 1. Open the [Antigravity Marketplace intake form](https://forms.gle/2EX5RFYPoJe1UgxR9).
-2. Enter `https://github.com/hs1662/hstack` as the repository URL and match the submitted version to `"version"` in `plugin.json` (`0.1.0`).
+2. Enter `https://github.com/hs1662/hstack` as the repository URL and match the submitted version to `"version"` in `plugin.json` (`0.1.1`).
 3. Confirm that `plugin.json`, `hooks.json`, `mcp_config.json`, `rules/AGENTS.md`, `agents/`, `skills/`, `scripts/`, `assets/logo.svg`, `README.md`, and `README.ko.md` are committed on `main` and pass `agy plugin validate --strict --json https://github.com/hs1662/hstack`.
 4. Rerun `node --test test/*.test.mjs` and `agy plugin validate --strict --json .` before you push any follow-up commits.
