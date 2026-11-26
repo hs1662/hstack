@@ -30,9 +30,9 @@ const KOREAN_PROSE = "작업 중입니다 ".repeat(20);
 
 // Same shape as the audit's 60,000-step transcript: one USER_INPUT, then edit_file planners with Korean prose
 // and their GENERIC results, ending with an English answer so both drift checks run on the bounded tail.
-function writeLongSession(path, repo, pairs) {
+function writeLongSession(path, repo, pairs, userContent = "수정해 줘") {
   const fd = openSync(path, "w");
-  let buf = `${JSON.stringify({ step_index: 0, type: "USER_INPUT", content: "수정해 줘" })}\n`;
+  let buf = `${JSON.stringify({ step_index: 0, type: "USER_INPUT", content: userContent })}\n`;
   let step = 1;
   for (let i = 0; i < pairs; i += 1) {
     const planner = {
@@ -450,6 +450,10 @@ function generateSession(rand, prompts, { unindexed = false } = {}) {
         if (rand() < 0.3) {
           records.push({ content: "x", type: "USER_INPUT_NOTE", note: '"type":"USER_INPUT"' });
         }
+        if (rand() < 0.3) {
+          // Duplicate keys: the prefix says GENERIC (skipped without a pending call), JSON.parse says USER_INPUT.
+          records.push(`{"step_index":${step++},"type":"GENERIC","type":"USER_INPUT","content":"중복"}`);
+        }
       }
     }
     if (rand() < 0.5) {
@@ -469,7 +473,8 @@ describe("#7 head and tail scans read only the header and the current turn of a 
     let partialRoles = 0;
     for (let i = 0; i < 300; i += 1) {
       const path = join(dir, `s${i}.jsonl`);
-      writeFileSync(path, toJsonl(generateSession(rand, prompts, { unindexed: i % 10 === 9 })), "utf8");
+      const lines = generateSession(rand, prompts, { unindexed: i % 10 === 9 }).map((r) => (typeof r === "string" ? r : JSON.stringify(r)));
+      writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
       const full = readFactLedger(path, "/repo", "/repo");
       const partial = factLedger.readTurnLedger(path, "/repo", "/repo", { partialMinBytes: 0 });
       assert.deepEqual(withoutReadFiles(partial), withoutReadFiles(full), `session ${i}`);
@@ -519,9 +524,7 @@ describe("#7 head and tail scans read only the header and the current turn of a 
     const dir = createTempDir("hstack-p2-rc-");
     const [auditorPrompt] = rolePrompts();
     const path = join(dir, "transcript_full.jsonl");
-    writeLongSession(path, join(dir, "repo"), 20_000);
-    const body = readFileSync(path, "utf8").split("\n").slice(1).join("\n");
-    writeFileSync(path, `${JSON.stringify({ step_index: 0, type: "USER_INPUT", content: auditorPrompt })}\n${body}`, "utf8");
+    writeLongSession(path, join(dir, "repo"), 20_000, auditorPrompt);
     const call = (CommandLine) =>
       handlePreToolGate(
         JSON.stringify({ hookEventName: "PreToolUse", conversationId: "p2-rc", cwd: "/repo", transcriptPath: path, toolCall: { name: "run_command", args: { CommandLine } } }),
