@@ -88,9 +88,9 @@ const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--n
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const SYSTEM_PATH_ENTRY_RE = /^(?:\$PATH|\$\{PATH\}|\/usr(?:\/local)?\/s?bin|\/s?bin)$/;
 
-// Assignments that change which binary runs (PATH with a non-system dir) or make git run a command (GIT_*).
+// Assignments that change which binary or code runs: PATH with a non-system dir, preload and startup hooks, GIT_*.
 function isExecHijackAssign(tok) {
-  if (/^GIT_[A-Za-z0-9_]*=/.test(tok)) {
+  if (/^(?:GIT_[A-Za-z0-9_]*|LD_[A-Za-z0-9_]*|DYLD_[A-Za-z0-9_]*|NODE_OPTIONS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/.test(tok)) {
     return true;
   }
   return tok.startsWith("PATH=") && tok.slice(5).split(":").some((entry) => !SYSTEM_PATH_ENTRY_RE.test(entry));
@@ -341,11 +341,10 @@ function tokenizeSegment(segment) {
   return tokens;
 }
 
-const DEV_NULL_TARGET_RE = /^\/dev\/null$/;
 // A check may keep its log; any other redirect target is a write the check only disguises.
 const CHECK_LOG_TARGET_RE = /^(?:\/dev\/null|[\w./-]+\.(?:log|out|txt))$/;
 
-function hasUnquotedFileRedirection(segment, allowedTarget = DEV_NULL_TARGET_RE) {
+function hasUnquotedFileRedirection(segment) {
   let quote = null;
   for (let i = 0; i < segment.length; i += 1) {
     const ch = segment[i];
@@ -384,7 +383,7 @@ function hasUnquotedFileRedirection(segment, allowedTarget = DEV_NULL_TARGET_RE)
         j += 1;
       }
       const target = /^[^\s;&|<>]*/.exec(segment.slice(j))[0];
-      if (allowedTarget.test(target)) {
+      if (target === "/dev/null") {
         i = j + target.length - 1;
         continue;
       }
@@ -417,11 +416,13 @@ function inlineInterpreterBody(bin, args) {
       } else if (/^[-+][A-Za-z]+$/.test(arg)) {
         inline ||= arg[0] === "-" && arg.includes("c");
       } else if (/^-[A-Za-z]*c/.test(arg)) {
-        const body = arg.slice(arg.indexOf("c") + 1);
-        return pipefail ? `set -o pipefail && ${body}` : body;
+        // Words after the body become $0, $1…, which the body may run; only a body with nothing after it counts.
+        const body = i === args.length - 1 ? arg.slice(arg.indexOf("c") + 1) : "";
+        return pipefail && body ? `set -o pipefail && ${body}` : body;
       } else if (!arg.startsWith("--") || arg === "--") {
-        const body = arg === "--" ? (args[i + 1] ?? "") : arg;
-        return inline ? (pipefail ? `set -o pipefail && ${body}` : body) : null;
+        const bodyIdx = arg === "--" ? i + 1 : i;
+        const body = bodyIdx === args.length - 1 ? args[bodyIdx] : "";
+        return inline ? (pipefail && body ? `set -o pipefail && ${body}` : body) : null;
       }
     }
     return inline ? "" : null;
@@ -454,18 +455,14 @@ function inlineInterpreterBody(bin, args) {
   return flagRe && (end === -1 ? args : args.slice(0, end)).some((arg) => flagRe.test(arg)) ? "" : null;
 }
 
-function classifySingleSegment(segment) {
-  const cleaned = segment.trim().replace(/^[(!\s]+/, "");
-  if (cleaned.length === 0) {
-    return "empty";
-  }
-  const hasFileRedirect = hasUnquotedFileRedirection(cleaned);
-  const tokens = tokenizeSegment(cleaned);
+// The index of the binary after leading assignments and wrappers (sudo, env, time…), or -1 when one of them
+// can swap the binary or rewrite the command line.
+function skipCommandPrefix(tokens) {
   let idx = 0;
   while (idx < tokens.length) {
     const tok = tokens[idx];
     if (isExecHijackAssign(tok)) {
-      return "other";
+      return -1;
     }
     if (tok === "!" || tok === "(" || ENV_ASSIGN_RE.test(tok)) {
       idx += 1;
@@ -478,7 +475,7 @@ function classifySingleSegment(segment) {
         const arg = tokens[idx];
         // `env -S` splits its argument into a whole new command line.
         if (tok === "env" && (/^-[A-Za-z]*S/.test(arg) || arg.startsWith("--split-string") || isExecHijackAssign(arg))) {
-          return "other";
+          return -1;
         }
         if (arg === "--") {
           idx += 1;
@@ -502,6 +499,21 @@ function classifySingleSegment(segment) {
     }
     break;
   }
+  return idx;
+}
+
+// read_only, empty or other; runners are other here, since only matchesVerificationGrammar grants verification.
+function classifySingleSegment(segment) {
+  const cleaned = segment.trim().replace(/^[(!\s]+/, "");
+  if (cleaned.length === 0) {
+    return "empty";
+  }
+  const hasFileRedirect = hasUnquotedFileRedirection(cleaned);
+  const tokens = tokenizeSegment(cleaned);
+  const idx = skipCommandPrefix(tokens);
+  if (idx === -1) {
+    return "other";
+  }
   if (idx >= tokens.length) {
     return "empty";
   }
@@ -511,11 +523,6 @@ function classifySingleSegment(segment) {
   const writerFlagRe = READ_ONLY_BINARY_WRITER_FLAG_RE[baseBin];
   if (writerFlagRe && tokens.slice(idx + 1).some((tok) => writerFlagRe.test(tok))) {
     return "other";
-  }
-
-  const inlineBody = inlineInterpreterBody(baseBin, tokens.slice(idx + 1));
-  if (inlineBody !== null) {
-    return classifyCommand(inlineBody) === "verification" ? "verification" : "other";
   }
 
   if (baseBin === "git") {
@@ -555,16 +562,145 @@ function classifySingleSegment(segment) {
       return "read_only";
     }
   }
-  if (VERIFICATION_BINARIES.has(baseBin) || rawBin.startsWith("./") || rawBin.startsWith("../")) {
-    return hasUnquotedFileRedirection(cleaned, CHECK_LOG_TARGET_RE) ? "other" : "verification";
-  }
   return "other";
 }
 
-// `set -o pipefail` (or `-euo pipefail`): a later pipe keeps the runner's failing exit status.
-function setsPipefail(segment) {
-  const tokens = tokenizeSegment(segment.trim());
-  return tokens[0] === "set" && tokens.some((tok, i) => tok === "pipefail" && /^-[A-Za-z]*o$/.test(tokens[i - 1] ?? ""));
+// Unquoted, these start syntax the grammar does not accept: subshells, groups, negation, expansion, `;`, `||`, `&`,
+// input redirects, escapes. `$`, backticks and backslashes inside double quotes still expand, so they fail too.
+const GRAMMAR_METACHARS = new Set(["(", ")", "{", "}", "!", "$", "`", "|", "&", "<", ">", "\\", ";"]);
+const PIPE_FILTERS = new Set(["tail", "head", "grep"]);
+const SET_FLAG_RE = /^[-+](?:[euxv]*o|[euxv]+)$/;
+const SET_OPTIONS = new Set(["pipefail", "errexit", "nounset", "xtrace"]);
+
+// Lexes `cmd [&& cmd]… [| cmd]` into { words, redirects, raw, op } commands, or null on any other syntax. A
+// redirect is kept only as `2>&1`/`1>&2` or `[12]>[>] /dev/null|x.log|x.out|x.txt`; a trailing `;` or newline ends the line.
+function lexVerificationChain(line) {
+  const cmds = [];
+  let cur = { words: [], redirects: 0, start: 0 };
+  let word = null;
+  const flush = () => {
+    if (word !== null) {
+      cur.words.push(word);
+      word = null;
+    }
+  };
+  const close = (op, end) => {
+    flush();
+    if (cur.words.length === 0) {
+      return false;
+    }
+    cmds.push({ words: cur.words, redirects: cur.redirects, raw: line.slice(cur.start, end), op });
+    return true;
+  };
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (ch === "'" || ch === '"') {
+      const endQuote = line.indexOf(ch, i + 1);
+      const inner = endQuote === -1 ? null : line.slice(i + 1, endQuote);
+      if (inner === null || (ch === '"' && /[$`\\]/.test(inner))) {
+        return null;
+      }
+      word = (word ?? "") + inner;
+      i = endQuote;
+    } else if (ch === " " || ch === "\t") {
+      flush();
+    } else if (ch === ">" || (word === null && /[12]/.test(ch) && line[i + 1] === ">")) {
+      flush();
+      const m = /^[12]?>(?:&[12](?![^\s&|;])|>?[ \t]*([^\s()<>&|;'"`$\\]+))/.exec(line.slice(i));
+      if (!m || (m[1] !== undefined && !CHECK_LOG_TARGET_RE.test(m[1]))) {
+        return null;
+      }
+      cur.redirects += 1;
+      i += m[0].length - 1;
+    } else if (ch === "&" && line[i + 1] === "&") {
+      if (!close("&&", i)) {
+        return null;
+      }
+      i += 1;
+      cur = { words: [], redirects: 0, start: i + 1 };
+    } else if (ch === "|" && line[i + 1] !== "|") {
+      if (!close("|", i)) {
+        return null;
+      }
+      cur = { words: [], redirects: 0, start: i + 1 };
+    } else if (ch === ";" || ch === "\n") {
+      return /^[\s;]*$/.test(line.slice(i)) && close("", i) ? cmds : null;
+    } else if (GRAMMAR_METACHARS.has(ch) || (ch === "#" && word === null)) {
+      return null;
+    } else {
+      word = (word ?? "") + ch;
+    }
+  }
+  return close("", line.length) ? cmds : null;
+}
+
+function isSafeAssign(tok) {
+  return ENV_ASSIGN_RE.test(tok) && !isExecHijackAssign(tok);
+}
+
+// cd/pushd/popd, `set` with errexit/nounset/xtrace/pipefail only, safe assignments or exports, or a read-only command.
+function isPrefixCommand({ words, raw }) {
+  const [bin, ...args] = words;
+  if (words.every(isSafeAssign) || (bin === "export" && args.length > 0 && args.every(isSafeAssign))) {
+    return true;
+  }
+  if (bin === "cd" || bin === "pushd" || bin === "popd") {
+    return args.length <= 1;
+  }
+  if (bin === "set") {
+    // `set -n` (noexec) would skip the runner and exit 0, so only these flags pass.
+    return args.length > 0 && args.every((arg, i) => SET_FLAG_RE.test(arg) || (SET_OPTIONS.has(arg) && /o$/.test(args[i - 1] ?? "")));
+  }
+  return bin !== "export" && classifySingleSegment(raw) === "read_only";
+}
+
+function setsPipefail({ words }) {
+  return words[0] === "set" && words.some((tok, i) => tok === "pipefail" && /o$/.test(words[i - 1] ?? ""));
+}
+
+// A known test runner, optionally behind safe assignments and wrappers. A shell `-c` body must itself match the
+// grammar with nothing after it on the outer command line.
+function isRunnerCommand({ words, redirects }) {
+  const idx = skipCommandPrefix(words);
+  if (idx === -1 || idx >= words.length || words.slice(0, idx).some((tok) => tok === "!" || tok === "(")) {
+    return false;
+  }
+  const rawBin = words[idx];
+  const baseBin = posix.basename(toPosix(rawBin));
+  const args = words.slice(idx + 1);
+  if (!VERIFICATION_BINARIES.has(baseBin) && !rawBin.startsWith("./") && !rawBin.startsWith("../")) {
+    return false;
+  }
+  const scriptArgs = args.filter((tok) => !tok.startsWith("-"));
+  if (BARE_SCRIPT_RUNNERS.has(baseBin) && scriptArgs.length === 1 && (scriptArgs[0] === "run" || scriptArgs[0] === "run-script")) {
+    return false;
+  }
+  const body = inlineInterpreterBody(baseBin, args);
+  return body === null || (body !== "" && redirects === 0 && matchesVerificationGrammar(body));
+}
+
+// [prefix &&]… [VAR=value]… RUNNER ARGS [REDIRECT]…, plus one `| tail/head/grep` when pipefail is on.
+function matchesVerificationGrammar(commandLine) {
+  const cmds = lexVerificationChain(commandLine);
+  if (!cmds) {
+    return false;
+  }
+  let pipefail = false;
+  for (let i = 0; i < cmds.length; i += 1) {
+    const cmd = cmds[i];
+    if (cmd.op === "|") {
+      const filter = cmds[i + 1];
+      return pipefail && i + 2 === cmds.length && isRunnerCommand(cmd) && PIPE_FILTERS.has(filter.words[0]) && filter.redirects === 0;
+    }
+    if (cmd.op === "") {
+      return isRunnerCommand(cmd);
+    }
+    pipefail ||= setsPipefail(cmd);
+    if (!isPrefixCommand(cmd) && !isRunnerCommand(cmd)) {
+      return false;
+    }
+  }
+  return false;
 }
 
 // `$(…)` and backticks run even inside double quotes; `<(…)`/`>(…)` only unquoted. Single quotes stay literal.
@@ -594,8 +730,8 @@ function hasCommandSubstitution(commandLine) {
   return false;
 }
 
-// verification only when the last pipeline runs a check and every other segment is read-only, neutral setup
-// (cd, pushd, set, export of non-PATH vars) or another check such as `npm ci`; any writer makes it other.
+// verification only when the whole line matches the runner grammar; read_only when every segment is read-only;
+// anything else is other.
 export function classifyCommand(commandLine) {
   if (typeof commandLine !== "string" || commandLine.trim().length === 0) {
     return "read_only";
@@ -603,36 +739,10 @@ export function classifyCommand(commandLine) {
   if (hasCommandSubstitution(commandLine)) {
     return "other";
   }
-  const chain = splitShellChain(commandLine);
-  while (chain.length > 1 && chain.at(-1).text.trim().length === 0) {
-    chain.pop();
+  if (matchesVerificationGrammar(commandLine)) {
+    return "verification";
   }
-  let pipefail = false;
-  let intact = true;
-  let sawVerification = false;
-  let pipelineVerifies = false;
-  let lastPipelineVerifies = false;
-  for (let i = 0; i < chain.length; i += 1) {
-    const { text, op } = chain[i];
-    const kind = classifySingleSegment(text);
-    if (kind === "other") {
-      return "other";
-    }
-    pipefail ||= setsPipefail(text);
-    // Only `&&` (or a pipe under pipefail) keeps a failing exit status; `;`, `||`, `&` and `!` let it exit 0.
-    const last = i === chain.length - 1;
-    intact &&= !text.trim().startsWith("!") && (last ? op === "" || op === ";" || op === "\n" : op === "&&" || (op === "|" && pipefail));
-    sawVerification ||= kind === "verification";
-    pipelineVerifies ||= kind === "verification";
-    if (op !== "|") {
-      lastPipelineVerifies = pipelineVerifies;
-      pipelineVerifies = false;
-    }
-  }
-  if (!sawVerification) {
-    return "read_only";
-  }
-  return intact && lastPipelineVerifies ? "verification" : "other";
+  return splitShellChain(commandLine).every(({ text }) => classifySingleSegment(text) !== "other") ? "read_only" : "other";
 }
 
 export function inferExecutionFailure(result) {
