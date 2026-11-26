@@ -1426,6 +1426,7 @@ function createEmptyLedger(transcriptAvailable = false) {
     turnStartStepIndex: 0,
     turnWrittenFiles: new Set(),
     turnCodeWrittenFiles: new Set(),
+    turnToolWriteSteps: new Map(),
     lastWriteStepIndex: -1,
     lastCodeWriteStepIndex: -1,
     turnExecutions: [],
@@ -1484,6 +1485,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     }
     for (const p of pendingWrite.writePaths) {
       ledger.turnWrittenFiles.add(p);
+      ledger.turnToolWriteSteps.set(p, pendingWrite.stepIndex);
       const nextCount = (ledger.fileEditCounts.get(p) ?? 0) + 1;
       ledger.fileEditCounts.set(p, nextCount);
       if (nextCount > ledger.maxSingleFileEdits) {
@@ -1515,6 +1517,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     ledger.turnStartStepIndex = stepIndex;
     ledger.turnWrittenFiles = new Set();
     ledger.turnCodeWrittenFiles = new Set();
+    ledger.turnToolWriteSteps = new Map();
     ledger.lastWriteStepIndex = -1;
     ledger.lastCodeWriteStepIndex = -1;
     ledger.turnExecutions = [];

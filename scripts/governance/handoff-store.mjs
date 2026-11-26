@@ -488,9 +488,10 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   }
   const writers = shellExecs.filter((exec) => exec.kind !== "read_only");
   // Date a change at the last command that could have made it: a writer, else a read-only-looking command, else a check.
-  const byKind = (kind) => shellExecs.filter((exec) => exec.kind === kind).at(-1);
-  const writeStep = (byKind("other") ?? byKind("read_only") ?? shellExecs.at(-1)).stepIndex;
-  const otherStep = byKind("other")?.stepIndex ?? -1;
+  const datingStep = (execs) =>
+    (execs.findLast((exec) => exec.kind === "other") ?? execs.findLast((exec) => exec.kind === "read_only") ?? execs.at(-1)).stepIndex;
+  const writeStep = datingStep(shellExecs);
+  const otherStep = shellExecs.findLast((exec) => exec.kind === "other")?.stepIndex ?? -1;
   const record = (relPath, step) => {
     ledger.turnWrittenFiles.add(relPath);
     ledger.turnCodeWrittenFiles.add(relPath);
@@ -526,15 +527,20 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     return relPath in files ? !sameFileSignature(files[relPath], now) : now !== undefined;
   };
   // A change the snapshot of the last passing verify_completion did not see happened after it, whatever the
-  // command looked like.
+  // command looked like, so it is dated among the shell calls after that gate. A write tool's own later date
+  // stands when no writer command ran after the gate.
   const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
+  const postGateWriter = postGateShell.some((exec) => exec.kind === "other");
+  const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
   for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
     if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {
       continue;
     }
     if (postGateShell.length > 0 && changedSince(baseline.gate.files, sinceGate, relPath)) {
-      record(relPath, postGateShell.at(-1).stepIndex);
+      if (postGateWriter || !toolWroteAfterGate(relPath)) {
+        record(relPath, datingStep(postGateShell));
+      }
     } else if (!keepsToolDate(relPath)) {
       record(relPath, writeStep);
     }
