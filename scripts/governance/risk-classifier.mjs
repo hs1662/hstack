@@ -43,6 +43,28 @@ function quantifierAt(source, i) {
   return (source[end] === "?" ? end + 1 : end) - i;
 }
 
+// Unbounded quantifiers (`*`, `+`, `{n,}`) each add a factor of the input length to the worst-case run time,
+// plus one more when the pattern is not anchored at `^`; optional repeats (`?`, `{n,m}`) multiply paths.
+// Paths reach 4096 chars, so the input-length degree is capped at 2 (n^2) and optional repeats at 10.
+const MAX_POLYNOMIAL_DEGREE = 2;
+const MAX_OPTIONAL_REPEATS = 10;
+
+function quantifierCost(source, i, length) {
+  const lazy = length > 1 && source[i + length - 1] === "?";
+  const base = source.slice(i, i + length - (lazy ? 1 : 0));
+  if (base === "*" || base === "+") {
+    return { unbounded: 1, optional: 0 };
+  }
+  if (base === "?") {
+    return { unbounded: 0, optional: 1 };
+  }
+  const [, min, comma, max] = /^\{(\d+)(,?)(\d*)\}$/.exec(base);
+  if (!comma) {
+    return { unbounded: 0, optional: 0 };
+  }
+  return max === "" ? { unbounded: 1, optional: 0 } : { unbounded: 0, optional: Math.max(0, Number(max) - Number(min)) };
+}
+
 // Linear scan of a pattern's groups: a quantified group whose body already holds a quantifier or an
 // alternation (star height 2, as in `(a+)+`, `((a+))+`, `(a|a)+`, `([a-z]+){2,}`) can backtrack
 // exponentially, and so can a backreference. Character classes and escapes are opaque atoms.
@@ -56,8 +78,13 @@ function isSafeCustomRegex(source) {
   }
   const groups = [{ quantified: false, alternation: false }];
   let i = 0;
-  const markQuantified = () => {
+  let unbounded = 0;
+  let optional = 0;
+  const markQuantified = (at, length) => {
     groups[groups.length - 1].quantified = true;
+    const cost = quantifierCost(trimmed, at, length);
+    unbounded += cost.unbounded;
+    optional += cost.optional;
   };
   while (i < trimmed.length) {
     const ch = trimmed[i];
@@ -89,7 +116,7 @@ function isSafeCustomRegex(source) {
         if (inner.quantified || inner.alternation) {
           return false;
         }
-        markQuantified();
+        markQuantified(i, length);
         i += length;
       }
       const outer = groups[groups.length - 1];
@@ -105,11 +132,12 @@ function isSafeCustomRegex(source) {
     }
     const length = quantifierAt(trimmed, i);
     if (length > 0) {
-      markQuantified();
+      markQuantified(i, length);
       i += length;
     }
   }
-  return groups.length === 1;
+  const degree = unbounded + (trimmed.startsWith("^") ? 0 : 1);
+  return groups.length === 1 && degree <= MAX_POLYNOMIAL_DEGREE && optional <= MAX_OPTIONAL_REPEATS;
 }
 
 function compileSensitivePatterns(rawPatterns) {
