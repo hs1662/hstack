@@ -14,8 +14,8 @@ import {
 } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
 import { detectDestructiveEdit } from "../scripts/governance/destructive-edit.mjs";
-import { classifyCommand, readFactLedger } from "../scripts/governance/fact-ledger.mjs";
-import { readTurnSnapshot, saveTurnSnapshot } from "../scripts/governance/handoff-store.mjs";
+import { classifyCommand, readFactLedger, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
+import { readTurnSnapshot, saveGateSnapshot, saveTurnSnapshot } from "../scripts/governance/handoff-store.mjs";
 import { isSensitiveFilePath } from "../scripts/governance/risk-classifier.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
@@ -61,10 +61,8 @@ function runTurn(repo, conversationId, steps) {
     let result = "ok";
     if (step.gate) {
       call = { name: GATE_TOOL_NAME, args: {} };
-      handlePreToolGate(JSON.stringify({ hookEventName: "PreToolUse", conversationId, cwd: repo, transcriptPath, toolCall: call }), {
-        dataDir: DATA_DIR,
-        skipAuditLog: true,
-      });
+      // What the MCP server records on a passing verdict.
+      saveGateSnapshot({ conversationId, snapshot: snapshotWorkingTree(repo), dataDir: DATA_DIR });
       result = `${VERDICT_HEADERS.PASS}\n`;
     } else if (step.write) {
       writeFileSync(join(repo, step.write), step.content);

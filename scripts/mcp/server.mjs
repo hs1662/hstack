@@ -3,13 +3,15 @@
 import { performance } from "node:perf_hooks";
 import { createInterface } from "node:readline";
 import { appendAuditRecord, readGovernanceConfig, resolveSchemaRegister } from "../governance/audit-log.mjs";
-import { HANDOFF_COPY, REGISTER_COPY } from "../governance/constants.mjs";
+import { HANDOFF_COPY, PASSING_VERDICTS, REGISTER_COPY } from "../governance/constants.mjs";
 import { decideGate } from "../governance/decide-gate.mjs";
-import { detectTestInfrastructure, readFactLedger, readGitLedger } from "../governance/fact-ledger.mjs";
+import { detectTestInfrastructure, readFactLedger, readGitLedger, snapshotWorkingTree } from "../governance/fact-ledger.mjs";
 import {
   listHandoffSnapshots,
   loadHandoffSnapshot,
   readSessionState,
+  resolveEffectiveConversationKey,
+  saveGateSnapshot,
   saveHandoffSnapshot,
 } from "../governance/handoff-store.mjs";
 import { resolveAuditEscalationMode } from "../governance/risk-classifier.mjs";
@@ -352,6 +354,11 @@ export function createMcpServerHandler(options = {}) {
       auditEscalation,
       pollutionAlert,
     });
+
+    // Stop dates later shell-made tree changes against the tree the last passing verify_completion saw.
+    if (cwd && PASSING_VERDICTS.has(decision.verdict)) {
+      saveGateSnapshot({ conversationId: resolveEffectiveConversationKey(conversationId, cwd), snapshot: snapshotWorkingTree(cwd), dataDir });
+    }
 
     const completedPriorAttempts = ledger.turnGateAttempts.filter((attempt) => attempt.verdict !== "UNKNOWN").length;
     const attemptInTurn = completedPriorAttempts + 1;

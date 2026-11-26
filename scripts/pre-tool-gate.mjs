@@ -12,7 +12,6 @@ import {
   CHALLENGER_ROLE_LABEL,
   CHALLENGER_SESSION_MARKER,
   EXEC_TOOL_NAMES,
-  GATE_TOOL_NAME,
   HANDOFF_TOOL_NAME,
   PENDING_CHALLENGER_DENY_REASON,
   READ_ONLY_ROLE_WRITE_DENY_REASON,
@@ -30,13 +29,11 @@ import {
   readSessionRole,
   readTurnLedger,
   resolveGitRootFast,
-  snapshotWorkingTree,
 } from "./governance/fact-ledger.mjs";
 import {
   claimAutonomyTurnFlag,
   hasAutonomyTurnFlag,
   resolveEffectiveConversationKey,
-  saveGateSnapshot,
 } from "./governance/handoff-store.mjs";
 import {
   isDirectExecution,
@@ -462,15 +459,6 @@ export function handlePreToolGate(stdinText, options = {}) {
 
   if (!HSTACK_MCP_TOOL_RE.test(toolName)) {
     return { decision: "allow" };
-  }
-
-  // Stop dates later shell-made tree changes against what verify_completion saw.
-  if (toolName === GATE_TOOL_NAME && cwd) {
-    saveGateSnapshot({
-      conversationId: resolveEffectiveConversationKey(conversationId, cwd),
-      snapshot: snapshotWorkingTree(cwd),
-      dataDir: options?.dataDir ?? resolvePluginDataDir(),
-    });
   }
 
   const toolSummary = toolName === HANDOFF_TOOL_NAME ? HANDOFF_TOOL_SUMMARY : GATE_TOOL_SUMMARY;

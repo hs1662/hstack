@@ -87,8 +87,9 @@ function mergeShellWrittenFiles(ledger, payload, cwd) {
     const now = relPath in current.files ? current.files[relPath] : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
     return relPath in files ? !sameFileSignature(files[relPath], now) : now !== undefined;
   };
-  // A change the verify_completion snapshot did not see happened after it, whatever the command looked like.
-  const lastGateStep = ledger.turnGateAttempts.at(-1)?.stepIndex ?? -1;
+  // A change the snapshot of the last passing verify_completion did not see happened after it, whatever the
+  // command looked like.
+  const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
   for (const relPath of new Set([...Object.keys(current.files), ...Object.keys(baseline.files), ...sinceTurn])) {
     if (!changedSince(baseline.files, sinceTurn, relPath) || isExemptDocOrAssetPath(relPath)) {

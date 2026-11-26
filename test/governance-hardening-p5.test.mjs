@@ -9,7 +9,8 @@ import { describe, it } from "node:test";
 import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, GATE_TOOL_NAME, REGISTER_COPY, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
-import { classifyCommand, readFactLedger, readTurnLedger } from "../scripts/governance/fact-ledger.mjs";
+import { classifyCommand, readFactLedger, readTurnLedger, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
+import { saveGateSnapshot } from "../scripts/governance/handoff-store.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
 import { handleStop } from "../scripts/stop.mjs";
@@ -224,10 +225,8 @@ describe("MED4 Stop ignores committed files that were already dirty at turn star
       let result = "ok";
       if (step.gate) {
         call = { name: GATE_TOOL_NAME, args: {} };
-        handlePreToolGate(JSON.stringify({ hookEventName: "PreToolUse", conversationId, cwd: repo, transcriptPath, toolCall: call }), {
-          dataDir: DATA_DIR,
-          skipAuditLog: true,
-        });
+        // What the MCP server records on a passing verdict.
+        saveGateSnapshot({ conversationId, snapshot: snapshotWorkingTree(repo), dataDir: DATA_DIR });
         result = `${VERDICT_HEADERS.PASS}\n`;
       } else if (step.write) {
         writeFileSync(join(repo, step.write), step.content);
