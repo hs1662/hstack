@@ -30,7 +30,8 @@ import {
   classifyCommand,
   normalizeWorkspacePath,
   pickString,
-  readFactLedger,
+  readSessionRole,
+  readTurnLedger,
   resolveGitRootFast,
   snapshotWorkingTree,
 } from "./governance/fact-ledger.mjs";
@@ -126,7 +127,7 @@ function resolveTurnStartStepIndex(transcriptPath, cwd) {
     return 0;
   }
   try {
-    const ledger = readFactLedger(transcriptPath, cwd, "");
+    const ledger = readTurnLedger(transcriptPath, cwd, "");
     return ledger.transcriptAvailable ? ledger.turnStartStepIndex : 0;
   } catch {
     return 0;
@@ -308,13 +309,17 @@ function analyzeChallengerState(ledger) {
   return { completed, unvotedRethink, hasValidVerdict, pendingAsync };
 }
 
+// The role alone needs only the transcript header, so a run_command or an off-mode write stays O(header).
+function resolveSessionRole(transcriptPath, options) {
+  if (options?.ledger) {
+    return options.ledger.transcriptAvailable ? options.ledger.sessionRole : "main";
+  }
+  return transcriptPath ? readSessionRole(transcriptPath) : "main";
+}
+
 function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversationId, options }) {
   const dataDir = options?.dataDir ?? resolvePluginDataDir();
-  const gitRoot = options?.gitRoot ?? resolveGitRootFast(cwd);
-  const ledger =
-    options?.ledger ??
-    (transcriptPath ? readFactLedger(transcriptPath, cwd, gitRoot) : null);
-  const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
+  const sessionRole = resolveSessionRole(transcriptPath, options);
   if (sessionRole === "auditor" || sessionRole === "challenger") {
     return { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON };
   }
@@ -328,6 +333,8 @@ function handleWriteToolCircuitBreaker(toolCall, { cwd, transcriptPath, conversa
     return { decision: "allow" };
   }
 
+  const gitRoot = options?.gitRoot ?? resolveGitRootFast(cwd);
+  const ledger = options?.ledger ?? (transcriptPath ? readTurnLedger(transcriptPath, cwd, gitRoot) : null);
   const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
   const { hasValidVerdict, unvotedRethink, pendingAsync } = analyzeChallengerState(ledger);
 
@@ -450,8 +457,7 @@ export function handlePreToolGate(stdinText, options = {}) {
 
   // Read-only roles may still read and run checks, but never a shell command that can write.
   if (EXEC_TOOL_NAMES.has(toolName)) {
-    const ledger = options?.ledger ?? (transcriptPath ? readFactLedger(transcriptPath, cwd, "") : null);
-    const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : "main";
+    const sessionRole = resolveSessionRole(transcriptPath, options);
     const kind = classifyCommand(pickString(asObject(toolCall.args) ?? {}, ["CommandLine", "commandLine", "command"]));
     const readOnlyRole = sessionRole === "auditor" || sessionRole === "challenger";
     return readOnlyRole && kind === "other" ? { decision: "deny", reason: READ_ONLY_ROLE_WRITE_DENY_REASON } : { decision: "allow" };
