@@ -87,8 +87,11 @@ const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--n
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const SYSTEM_PATH_ENTRY_RE = /^(?:\$PATH|\$\{PATH\}|\/usr(?:\/local)?\/s?bin|\/s?bin)$/;
 
-// Assignments that change which binary runs: PATH with a directory outside the system bin dirs.
+// Assignments that change which binary runs (PATH with a non-system dir) or make git run a command (GIT_*).
 function isExecHijackAssign(tok) {
+  if (/^GIT_[A-Za-z0-9_]*=/.test(tok)) {
+    return true;
+  }
   return tok.startsWith("PATH=") && tok.slice(5).split(":").some((entry) => !SYSTEM_PATH_ENTRY_RE.test(entry));
 }
 
@@ -455,7 +458,8 @@ function classifySingleSegment(segment) {
       idx += 1;
       while (idx < tokens.length) {
         const arg = tokens[idx];
-        if (tok === "env" && isExecHijackAssign(arg)) {
+        // `env -S` splits its argument into a whole new command line.
+        if (tok === "env" && (/^-[A-Za-z]*S/.test(arg) || arg.startsWith("--split-string") || isExecHijackAssign(arg))) {
           return "other";
         }
         if (arg === "--") {
@@ -500,6 +504,10 @@ function classifySingleSegment(segment) {
     let subIdx = idx + 1;
     while (subIdx < tokens.length) {
       const arg = tokens[subIdx];
+      // `-c core.fsmonitor=…` and `--config-env` make even `git status` run a command.
+      if (arg === "-c" || arg.startsWith("--config-env")) {
+        return "other";
+      }
       if (GIT_FLAGS_WITH_ARG.has(arg)) {
         subIdx += 2;
         continue;
@@ -535,11 +543,41 @@ function classifySingleSegment(segment) {
   return "other";
 }
 
+// `$(…)` and backticks run even inside double quotes; `<(…)`/`>(…)` only unquoted. Single quotes stay literal.
+function hasCommandSubstitution(commandLine) {
+  let quote = null;
+  for (let i = 0; i < commandLine.length; i += 1) {
+    const ch = commandLine[i];
+    if (quote === "'") {
+      quote = ch === "'" ? null : quote;
+      continue;
+    }
+    if (ch === "\\") {
+      i += 1;
+      continue;
+    }
+    if (ch === "`" || (ch === "$" && commandLine[i + 1] === "(")) {
+      return true;
+    }
+    if (ch === '"') {
+      quote = quote ? null : '"';
+    } else if (!quote && ch === "'") {
+      quote = "'";
+    } else if (!quote && (ch === "<" || ch === ">") && commandLine[i + 1] === "(") {
+      return true;
+    }
+  }
+  return false;
+}
+
 // verification only when the last pipeline runs a check and every other segment is read-only, neutral setup
 // (cd, pushd, set, export of non-PATH vars) or another check such as `npm ci`; any writer makes it other.
 export function classifyCommand(commandLine) {
   if (typeof commandLine !== "string" || commandLine.trim().length === 0) {
     return "read_only";
+  }
+  if (hasCommandSubstitution(commandLine)) {
+    return "other";
   }
   const chain = splitShellChain(commandLine);
   while (chain.length > 1 && chain.at(-1).text.trim().length === 0) {
