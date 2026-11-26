@@ -15,8 +15,9 @@ import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
 import { handlePreToolGate } from "../scripts/pre-tool-gate.mjs";
 import { handlePreInvocation } from "../scripts/prompt-router.mjs";
 import { handleStop } from "../scripts/stop.mjs";
-import { GATE_STOP_MARKER, buildCorrectionMessage, decideHookAction } from "../scripts/transcript.mjs";
+import { GATE_STOP_MARKER, buildCorrectionMessage, decideHookAction, isExplicitEnglishOutputRequest } from "../scripts/transcript.mjs";
 import { createTempDir, toJsonl, withCpuLock, wrapAntigravityHookMessage } from "./helpers.mjs";
+import { CASES, evaluateGovernanceCase } from "./verify-live.mjs";
 
 for (const key of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]) delete process.env[key];
 const DATA_DIR = createTempDir("hstack-p10-data-");
@@ -1535,5 +1536,373 @@ describe("H7 OMH gpt-6.2-astra round-3 regressions (P1 F1-F7, P2 F8)", () => {
     );
     assert.equal(crossDir.verdict, "REJECT");
     assert.ok(crossDir.blockedRules.includes("R3_CONCEALED_FAILURE"));
+  });
+});
+
+describe("H8 OMH gpt-6.2-astra round-4 regressions (P1 F1-F6, P2 F7-F9)", () => {
+  it("R4-F1: rejects make dry-run and query modes while keeping normal make check/test", () => {
+    for (const cmd of [
+      "make --just-print check",
+      "make -n check",
+      "make --dry-run check",
+      "make --recon check",
+      "make -q test",
+      "make --question test",
+      "make -pn test",
+    ]) {
+      assert.notEqual(classifyCommand(cmd), "verification", cmd);
+    }
+    for (const cmd of ["make test", "make check", "make -j4 test"]) {
+      assert.equal(classifyCommand(cmd), "verification", cmd);
+    }
+  });
+
+  it("R4-F2: keeps pytest failure on non-auto-discovered tests/smoke.py until explicit rerun", () => {
+    const dir = createTempDir("hstack-p10-r4-f2-");
+    let seq = 0;
+    const check = (cmds, claimCmd) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.py" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const [cmd, out] of cmds) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd } }] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: out });
+      }
+      const p = join(dir, `f2-${seq++}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.py"],
+          inspected_files: [],
+          verification_runs: [{ command: claimCmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    const bad = check(
+      [
+        ["pytest tests/smoke.py", FAIL_OUTPUT],
+        ["pytest", "2 passed in 0.01s"],
+      ],
+      "pytest",
+    );
+    assert.equal(bad.verdict, "REJECT");
+    assert.ok(bad.blockedRules.includes("R3_CONCEALED_FAILURE"));
+
+    for (const target of ["tests/test_smoke.py", "tests/smoke_test.py"]) {
+      const ok = check(
+        [
+          [`pytest ${target}`, FAIL_OUTPUT],
+          ["pytest", "2 passed in 0.01s"],
+        ],
+        "pytest",
+      );
+      assert.equal(ok.verdict, "PASS", `${target}: ${ok.blockedRules}`);
+    }
+
+    const explicit = check(
+      [
+        ["pytest tests/smoke.py", FAIL_OUTPUT],
+        ["pytest tests/smoke.py", "1 passed in 0.01s"],
+      ],
+      "pytest tests/smoke.py",
+    );
+    assert.equal(explicit.verdict, "PASS", explicit.blockedRules.join(","));
+  });
+
+  it("R4-F3: never conflates independent MCP subCommands joined as display string with a single chained shell command", () => {
+    const mcpArgs = (cmds) => JSON.stringify({ commands: cmds.map((c) => ({ command: c })) });
+    const dir = createTempDir("hstack-p10-r4-f3-");
+
+    const buildDecision = (execSpecs, claim) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const spec of execSpecs) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [spec.call] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: spec.out });
+      }
+      const p = join(dir, `${Math.random().toString(36).slice(2)}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: claim, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    const crossSubAndShell = buildDecision(
+      [
+        {
+          call: { name: "mcp_agy-fast_fast_run_checks", args: mcpArgs(["cd pkg && npm test", "pytest"]) },
+          out: "Checks: 1/2 passed, 1 failed",
+        },
+        {
+          call: { name: "run_command", args: { CommandLine: "cd pkg && npm test && pytest" } },
+          out: PASS_OUTPUT,
+        },
+      ],
+      "cd pkg && npm test && pytest",
+    );
+    assert.equal(crossSubAndShell.verdict, "REJECT");
+    assert.ok(crossSubAndShell.blockedRules.includes("R3_CONCEALED_FAILURE"));
+
+    const matchingMcp = buildDecision(
+      [
+        {
+          call: { name: "mcp_agy-fast_fast_run_checks", args: mcpArgs(["cd pkg && npm test", "pytest"]) },
+          out: "Checks: 1/2 passed, 1 failed",
+        },
+        {
+          call: { name: "mcp_agy-fast_fast_run_checks", args: mcpArgs(["cd pkg && npm test", "pytest"]) },
+          out: "Checks: 2/2 passed",
+        },
+      ],
+      "cd pkg && npm test",
+    );
+    assert.equal(matchingMcp.verdict, "PASS", matchingMcp.blockedRules.join(","));
+  });
+
+  it("R4-F4: blocks Stop when a shell edit runs after an async auditor or challenger launch", () => {
+    const runWithAsyncAudit = (order) => {
+      const repo = makeRepo();
+      const tp = join(repo, ".t.jsonl");
+      const recs = [{ step_index: 0, type: "USER_INPUT", content: "작업해 줘" }];
+      writeFileSync(tp, toJsonl(recs));
+      const convId = `p10-r4-f4-${order}`;
+      handlePreInvocation(
+        JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: convId, cwd: repo, transcriptPath: tp }),
+        { dataDir: DATA_DIR, skipAuditLog: true },
+      );
+
+      const auditStart = () => {
+        recs.push({
+          step_index: recs.length,
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "invoke_subagent", args: { TypeName: "hstack-auditor", Role: "독립 코드 감사관", Prompt: "감사" } }],
+        });
+        recs.push({
+          step_index: recs.length,
+          type: "GENERIC",
+          status: "DONE",
+          content: JSON.stringify({ conversationId: "00000000-0000-0000-0000-000000000001" }),
+        });
+      };
+      const shellEdit = () => {
+        writeFileSync(join(repo, "app.mjs"), "export const v = 9;\n");
+        recs.push({
+          step_index: recs.length,
+          type: "PLANNER_RESPONSE",
+          tool_calls: [{ name: "run_command", args: { CommandLine: "sed -i s/1/9/ app.mjs", Cwd: repo } }],
+        });
+        recs.push({ step_index: recs.length, type: "GENERIC", status: "DONE", content: "ok" });
+      };
+
+      if (order === "audit-then-edit") {
+        auditStart();
+        shellEdit();
+      } else {
+        shellEdit();
+        auditStart();
+      }
+      recs.push({ step_index: recs.length, type: "PLANNER_RESPONSE", content: "작업을 진행했습니다." });
+      writeFileSync(tp, toJsonl(recs));
+      return handleStop(
+        JSON.stringify({
+          hookEventName: "Stop",
+          terminationReason: "NO_TOOL_CALL",
+          executionNum: 0,
+          conversationId: convId,
+          cwd: repo,
+          transcriptPath: tp,
+          lastUserInput: "작업해 줘",
+        }),
+      );
+    };
+
+    assertGateBlocked(runWithAsyncAudit("audit-then-edit"));
+    assert.deepEqual(runWithAsyncAudit("edit-then-audit"), {});
+  });
+
+  it("R4-F5: refuses bare npm test as resolution for failed npm ci && npm test", () => {
+    const dir = createTempDir("hstack-p10-r4-f5-");
+    let seq = 0;
+    const check = (cmds, claimCmd) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const [cmd, out] of cmds) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd } }] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: out });
+      }
+      const p = join(dir, `f5-${seq++}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: claimCmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    for (const prep of ["npm ci && npm test", "npm install && npm test"]) {
+      const barePass = check([[prep, FAIL_OUTPUT], ["npm test", PASS_OUTPUT]], "npm test");
+      assert.equal(barePass.verdict, "REJECT", prep);
+      assert.ok(barePass.blockedRules.includes("R3_CONCEALED_FAILURE"));
+    }
+
+    const fullPass = check([["npm ci && npm test", FAIL_OUTPUT], ["npm ci && npm test", PASS_OUTPUT]], "npm ci && npm test");
+    assert.equal(fullPass.verdict, "PASS", fullPass.blockedRules.join(","));
+  });
+
+  it("R4-F6: blocks Stop when an already dirty script loses its executable bit after verify_completion", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "run.mjs"), "#!/usr/bin/env node\nexport const x = 1;\n");
+    chmodSync(join(repo, "run.mjs"), 0o755);
+    git(repo, ["add", "run.mjs"]);
+    git(repo, ["commit", "-qm", "add executable script"]);
+
+    const { verdicts, out } = runTurnOnRepo(repo, "p10-r4-f6-chmod", [
+      { write: "run.mjs", content: "#!/usr/bin/env node\nexport const x = 2;\n" },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["run.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "수정과 테스트 통과를 확인했습니다.",
+        },
+      },
+      {
+        cmd: "chmod -x run.mjs",
+        effect: (r) => chmodSync(join(r, "run.mjs"), 0o644),
+      },
+    ]);
+    assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts.join(" | "));
+    assertGateBlocked(out);
+  });
+
+  it("R4-F7: resolves node --test test-*.js/mjs failures via node --test while rejecting non-discoverable specs", () => {
+    const dir = createTempDir("hstack-p10-r4-f7-");
+    let seq = 0;
+    const check = (cmds) => {
+      const recs = [
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/app.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ];
+      let step = 3;
+      for (const [cmd, out] of cmds) {
+        recs.push({ step_index: step++, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd } }] });
+        recs.push({ step_index: step++, type: "GENERIC", status: "DONE", content: out });
+      }
+      const p = join(dir, `f7-${seq++}.jsonl`);
+      writeFileSync(p, toJsonl(recs));
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "확인했습니다.",
+        },
+        {
+          cwd: "/repo",
+          ledger: readFactLedger(p, "/repo", "/repo"),
+          gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
+          testInfra: { hasTestSuite: true },
+          auditEscalation: "off",
+        },
+      );
+    };
+
+    for (const file of ["test-foo.js", "sub/test-bar.mjs"]) {
+      const ok = check([[`node --test ${file}`, FAIL_OUTPUT], ["node --test", PASS_OUTPUT]]);
+      assert.equal(ok.verdict, "PASS", `${file}: ${ok.blockedRules}`);
+    }
+    const specBad = check([["node --test tools/manual.spec.mjs", FAIL_OUTPUT], ["node --test", PASS_OUTPUT]]);
+    assert.equal(specBad.verdict, "REJECT");
+  });
+
+  it("R4-F8: does not treat English units/filenames requests as English output requests", () => {
+    assert.equal(isExplicitEnglishOutputRequest("Switch to English units for the calculation."), false);
+    assert.equal(isExplicitEnglishOutputRequest("From now on, English filenames are required."), false);
+    assert.equal(isExplicitEnglishOutputRequest("Switch to English."), true);
+    assert.equal(isExplicitEnglishOutputRequest("From now on, English please."), true);
+    assert.equal(isExplicitEnglishOutputRequest("From now on, reply in English."), true);
+  });
+
+  it("R4-F9: fails L16 evaluation when shell execution or src/calc.mjs modification is missing", () => {
+    const l16 = CASES.find((entry) => entry.name === "L16-shell-edit-stop-gate");
+    const bogus = evaluateGovernanceCase(l16, {
+      steps: [
+        { stepIndex: 0, type: "USER_INPUT", content: l16.prompt },
+        { stepIndex: 1, type: "PLANNER_RESPONSE", content: "확인했습니다." },
+        { stepIndex: 2, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { stepIndex: 3, type: "PLANNER_RESPONSE", toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] },
+      ],
+      auditRecords: [
+        { event: "stop_decision", decision: "continue_gate", executionNum: 0 },
+        { event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 },
+      ],
+      gitDirtyFiles: [],
+    });
+    assert.equal(bogus.ok, false, "L16 must reject runs with zero shell calls and no src/calc.mjs edit");
+
+    const valid = evaluateGovernanceCase(l16, {
+      steps: [
+        { stepIndex: 0, type: "USER_INPUT", content: l16.prompt },
+        { stepIndex: 1, type: "PLANNER_RESPONSE", toolCalls: [{ name: "run_command", args: { CommandLine: "sed -i 's|(1 + percent / 100)|(1 - percent / 100)|' src/calc.mjs" } }] },
+        { stepIndex: 2, type: "PLANNER_RESPONSE", content: "수정했습니다." },
+        { stepIndex: 3, type: "SYSTEM_MESSAGE", content: `### Stop\n${GATE_STOP_MARKER}` },
+        { stepIndex: 4, type: "PLANNER_RESPONSE", toolCalls: [{ name: GATE_TOOL_NAME, args: {} }] },
+      ],
+      auditRecords: [
+        { event: "stop_decision", decision: "continue_gate", executionNum: 0 },
+        { event: "gate_verify", verdict: "PASS", blockedRules: [], warnedRules: [], attemptInTurn: 1 },
+      ],
+      gitDirtyFiles: ["src/calc.mjs"],
+    });
+    assert.equal(valid.ok, true, valid.failures.join("; "));
   });
 });
