@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -11,6 +11,7 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { resolvePluginDataDir } from "../hook-io.mjs";
@@ -55,6 +56,68 @@ function sleepMsSync(ms) {
   Atomics.wait(SLEEP_BUFFER, 0, 0, ms);
 }
 
+// A lock is stale only when its recorded holder is dead, or, with no readable pid, when it is old.
+function isSessionLockStale(lockPath) {
+  let st;
+  let raw;
+  try {
+    st = statSync(lockPath);
+    raw = readFileSync(lockPath, "utf8");
+  } catch {
+    return false;
+  }
+  let pid = null;
+  try {
+    const parsed = JSON.parse(raw);
+    pid = Number.isInteger(parsed?.pid) && parsed.pid > 0 ? parsed.pid : null;
+  } catch {
+  }
+  if (pid !== null) {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (err) {
+      return err?.code === "ESRCH";
+    }
+  }
+  return Date.now() - st.mtimeMs > SESSION_LOCK_STALE_MS;
+}
+
+// Reclaimers serialize on a guard file and re-check under it, so a lock recreated after the
+// stale check is never moved away. Only the rename winner deletes the stale file.
+// Returns false when another process holds the guard, so the caller waits instead of spinning.
+function reclaimStaleSessionLock(lockPath) {
+  const guardPath = `${lockPath}.reclaim`;
+  let guard;
+  try {
+    guard = openSync(guardPath, "wx");
+  } catch {
+    // shortcut: a reclaimer that dies inside this microsecond section leaves the guard until it ages out, then removal is unguarded; upgrade to pid-checked guards if that crash shows up.
+    try {
+      if (Date.now() - statSync(guardPath).mtimeMs > SESSION_LOCK_STALE_MS) {
+        unlinkSync(guardPath);
+      }
+    } catch {
+    }
+    return false;
+  }
+  try {
+    if (isSessionLockStale(lockPath)) {
+      const stalePath = `${lockPath}.stale.${process.pid}.${randomBytes(4).toString("hex")}`;
+      renameSync(lockPath, stalePath);
+      unlinkSync(stalePath);
+    }
+  } catch {
+  } finally {
+    closeSync(guard);
+    try {
+      unlinkSync(guardPath);
+    } catch {
+    }
+  }
+  return true;
+}
+
 function withSessionLock(filePath, fn) {
   const dir = resolve(filePath, "..");
   mkdirSync(dir, { recursive: true });
@@ -68,22 +131,17 @@ function withSessionLock(filePath, fn) {
       if (err?.code !== "EEXIST") {
         throw err;
       }
-      try {
-        const st = statSync(lockPath);
-        if (Date.now() - st.mtimeMs > SESSION_LOCK_STALE_MS) {
-          unlinkSync(lockPath);
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      sleepMsSync(10);
     }
+    if (isSessionLockStale(lockPath) && reclaimStaleSessionLock(lockPath)) {
+      continue;
+    }
+    sleepMsSync(10);
   }
   if (fd === null) {
     throw new Error(`Failed to acquire session lock: ${lockPath}`);
   }
   try {
+    writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
     return fn();
   } finally {
     try {

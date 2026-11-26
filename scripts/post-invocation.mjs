@@ -49,13 +49,19 @@ function tryLogCompletedPreflightChallenges(conversationId, ledger, dataDir) {
       typeof challenge.launchedStepIndex === "number" ? challenge.launchedStepIndex : challenge.completedStepIndex;
     const slotIdx = typeof challenge.slotIndex === "number" ? challenge.slotIndex : 0;
     const votePhase = voted ? "voted" : "unvoted";
-    const shouldLog =
-      !conversationId ||
-      markPreflightChallengeLogged({
-        conversationId,
-        dedupKey: `${conversationId}:${ledger.turnStartStepIndex}:${launchIdx}:${slotIdx}:${votePhase}`,
-        dataDir,
-      });
+    let shouldLog = !conversationId;
+    if (!shouldLog) {
+      // A session lock timeout skips this dedup write only, never the later hook stages.
+      try {
+        shouldLog = markPreflightChallengeLogged({
+          conversationId,
+          dedupKey: `${conversationId}:${ledger.turnStartStepIndex}:${launchIdx}:${slotIdx}:${votePhase}`,
+          dataDir,
+        });
+      } catch {
+        shouldLog = false;
+      }
+    }
     if (!shouldLog) {
       continue;
     }
@@ -98,15 +104,19 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
         ...DEFAULT_POLLUTION_THRESHOLDS,
         ...(cfg?.pollutionThresholds && typeof cfg.pollutionThresholds === "object" ? cfg.pollutionThresholds : {}),
       };
-      pollutionState = updateSessionPollutionState({
-        conversationId,
-        turnStartStepIndex: ledger?.turnStartStepIndex ?? 0,
-        inputTokens: tokens.inputTokens,
-        failedExecutionsInTurn: ledger?.turnFailedExecutionCount ?? 0,
-        maxSingleFileEdits: ledger?.maxSingleFileEdits ?? 0,
-        thresholds,
-        dataDir,
-      });
+      try {
+        pollutionState = updateSessionPollutionState({
+          conversationId,
+          turnStartStepIndex: ledger?.turnStartStepIndex ?? 0,
+          inputTokens: tokens.inputTokens,
+          failedExecutionsInTurn: ledger?.turnFailedExecutionCount ?? 0,
+          maxSingleFileEdits: ledger?.maxSingleFileEdits ?? 0,
+          thresholds,
+          dataDir,
+        });
+      } catch {
+        // Lock timeout: keep going so preflight logging, autonomy and the audit record still run.
+      }
     }
 
     if (sessionRole === "main" && ledger) {
