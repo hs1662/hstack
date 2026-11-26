@@ -74,7 +74,7 @@ const WRAPPER_FLAGS_WITH_ARG = {
   env: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
   sudo: new Set(["-u", "--user", "-g", "--group", "-C", "--close-from", "-h", "--host", "-p", "--prompt", "-r", "--role", "-t", "--type", "-D", "--chdir"]),
 };
-const SHELL_NEUTRAL_BUILTINS = new Set(["cd", "export", "set", "unset", "true", "false", "sleep", "umask"]);
+const SHELL_NEUTRAL_BUILTINS = new Set(["cd", "pushd", "popd", "export", "set", "unset", "true", "false", "sleep", "umask"]);
 // Flags that make an otherwise read-only binary run commands or write files.
 const READ_ONLY_BINARY_WRITER_FLAG_RE = {
   find: /^-(?:exec|execdir|ok|okdir|delete|fprint|fprint0|fprintf|fls)$/,
@@ -85,6 +85,12 @@ const READ_ONLY_BINARY_WRITER_FLAG_RE = {
 };
 const GIT_FLAGS_WITH_ARG = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"]);
 const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const SYSTEM_PATH_ENTRY_RE = /^(?:\$PATH|\$\{PATH\}|\/usr(?:\/local)?\/s?bin|\/s?bin)$/;
+
+// Assignments that change which binary runs: PATH with a directory outside the system bin dirs.
+function isExecHijackAssign(tok) {
+  return tok.startsWith("PATH=") && tok.slice(5).split(":").some((entry) => !SYSTEM_PATH_ENTRY_RE.test(entry));
+}
 
 const EXIT_CODE_FAIL_RE = /exit\s+code[:\s]+[1-9]\d*/i;
 const TAP_FAIL_ZERO_RE = /(?:^|\n)[ \t]*(?:#|ℹ)[ \t]*fail[ \t]+0\b/m;
@@ -295,18 +301,6 @@ export function splitShellSegments(commandLine) {
   return splitShellChain(commandLine).map((seg) => seg.text);
 }
 
-// Only an `&&` chain keeps a runner's failing exit status: `|`, `;`, `||`, `&` and `!` all let a failure exit 0.
-function isExitStatusPreservingChain(commandLine) {
-  const chain = splitShellChain(commandLine);
-  while (chain.length > 1 && chain.at(-1).text.trim().length === 0) {
-    chain.pop();
-  }
-  return chain.every(
-    (seg, i) =>
-      !seg.text.trim().startsWith("!") && (i < chain.length - 1 ? seg.op === "&&" : seg.op === "" || seg.op === ";" || seg.op === "\n"),
-  );
-}
-
 function tokenizeSegment(segment) {
   const tokens = [];
   let current = "";
@@ -449,6 +443,9 @@ function classifySingleSegment(segment) {
   let idx = 0;
   while (idx < tokens.length) {
     const tok = tokens[idx];
+    if (isExecHijackAssign(tok)) {
+      return "other";
+    }
     if (tok === "!" || tok === "(" || ENV_ASSIGN_RE.test(tok)) {
       idx += 1;
       continue;
@@ -458,6 +455,9 @@ function classifySingleSegment(segment) {
       idx += 1;
       while (idx < tokens.length) {
         const arg = tokens[idx];
+        if (tok === "env" && isExecHijackAssign(arg)) {
+          return "other";
+        }
         if (arg === "--") {
           idx += 1;
           break;
@@ -517,6 +517,9 @@ function classifySingleSegment(segment) {
     return "other";
   }
 
+  if (baseBin === "export" && tokens.slice(idx + 1).some((tok) => isExecHijackAssign(tok))) {
+    return "other";
+  }
   if (READ_ONLY_BINARIES.has(baseBin) || SHELL_NEUTRAL_BUILTINS.has(baseBin)) {
     return hasFileRedirect ? "other" : "read_only";
   }
@@ -532,25 +535,40 @@ function classifySingleSegment(segment) {
   return "other";
 }
 
+// verification only when the last pipeline runs a check and every other segment is read-only, neutral setup
+// (cd, pushd, set, export of non-PATH vars) or another check such as `npm ci`; any writer makes it other.
 export function classifyCommand(commandLine) {
   if (typeof commandLine !== "string" || commandLine.trim().length === 0) {
     return "read_only";
   }
-  const segments = splitShellSegments(commandLine);
+  const chain = splitShellChain(commandLine);
+  while (chain.length > 1 && chain.at(-1).text.trim().length === 0) {
+    chain.pop();
+  }
+  let intact = true;
   let sawVerification = false;
-  let sawOther = false;
-  for (const seg of segments) {
-    const kind = classifySingleSegment(seg);
-    if (kind === "verification") {
-      sawVerification = true;
-    } else if (kind === "other") {
-      sawOther = true;
+  let pipelineVerifies = false;
+  let lastPipelineVerifies = false;
+  for (let i = 0; i < chain.length; i += 1) {
+    const { text, op } = chain[i];
+    const kind = classifySingleSegment(text);
+    if (kind === "other") {
+      return "other";
+    }
+    // Only `&&` keeps a failing exit status; `|`, `;`, `||`, `&` and `!` let it exit 0.
+    const last = i === chain.length - 1;
+    intact &&= !text.trim().startsWith("!") && (last ? op === "" || op === ";" || op === "\n" : op === "&&");
+    sawVerification ||= kind === "verification";
+    pipelineVerifies ||= kind === "verification";
+    if (op !== "|") {
+      lastPipelineVerifies = pipelineVerifies;
+      pipelineVerifies = false;
     }
   }
-  if (sawVerification) {
-    return isExitStatusPreservingChain(commandLine) ? "verification" : "other";
+  if (!sawVerification) {
+    return "read_only";
   }
-  return sawOther ? "other" : "read_only";
+  return intact && lastPipelineVerifies ? "verification" : "other";
 }
 
 export function inferExecutionFailure(result) {
