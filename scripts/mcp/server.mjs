@@ -23,10 +23,12 @@ import {
 } from "../governance/handoff-store.mjs";
 import { resolveAuditEscalationMode } from "../governance/risk-classifier.mjs";
 import { isDirectExecution } from "../hook-io.mjs";
+import { consumeMcpContext } from "../host/mcp-session.mjs";
+import { detectHost } from "../host/host-adapter.mjs";
 
 // Latest first. 2025-03-26 is what the Antigravity client sends; none of these needs batch requests from us.
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INFO = { name: "hstack-gate", version: "0.1.2" };
+const SERVER_INFO = { name: "hstack-gate", version: "0.2.0" };
 const PUBLIC_ARG_KEYS = new Set([
   "modified_files",
   "inspected_files",
@@ -289,6 +291,13 @@ export function createMcpServerHandler(options = {}) {
   const schemaRegister = options.register ?? resolveSchemaRegister(dataDir);
   const verifyTool = buildVerifyCompletionTool(schemaRegister);
   const handoffTool = buildManageHandoffTool();
+  const claude = detectHost() === "claude-code";
+  const tools = [verifyTool, handoffTool];
+  if (claude) {
+    for (const tool of tools) {
+      tool.inputSchema.properties._hstackContext = { type: "string", description: "호스트 전용 필드입니다. 생략하세요." };
+    }
+  }
 
   function extractSession(safeArgs) {
     const { _session, toolSummary: _ignoredToolSummary, ...publicArgs } = safeArgs;
@@ -641,14 +650,25 @@ export function createMcpServerHandler(options = {}) {
     }
 
     if (method === "tools/list") {
-      return makeRpcResult(id, { tools: [verifyTool, handoffTool] });
+      return makeRpcResult(id, { tools });
     }
 
     if (method === "tools/call") {
       const toolName = typeof params?.name === "string" ? params.name : "";
+      let args = params?.arguments;
+      if (claude && tools.some(tool => tool.name === toolName)) {
+        const { _hstackContext, ...publicArgs } = args ?? {};
+        const session = consumeMcpContext(toolName, _hstackContext, dataDir);
+        if (!session) {
+          return makeRpcResult(id, { isError: true, content: [{ type: "text",
+            text: "Claude 세션을 확인할 수 없습니다. 전처리 훅 설정을 확인한 뒤 다시 호출해 주세요." }] });
+        }
+        // Only the redeemed session reaches the legacy handlers, never a caller-supplied _session.
+        args = { ...publicArgs, _session: session };
+      }
       if (toolName === "verify_completion") {
         try {
-          return makeRpcResult(id, handleVerifyCompletion(params?.arguments));
+          return makeRpcResult(id, handleVerifyCompletion(args));
         } catch (err) {
           const errorMessage = err?.message ?? String(err);
           process.stderr.write(`[hstack-gate] verify_completion error: ${errorMessage}\n`);
@@ -678,7 +698,7 @@ export function createMcpServerHandler(options = {}) {
 
       if (toolName === "manage_handoff") {
         try {
-          return makeRpcResult(id, handleManageHandoff(params?.arguments));
+          return makeRpcResult(id, handleManageHandoff(args));
         } catch (err) {
           const errorMessage = err?.message ?? String(err);
           process.stderr.write(`[hstack-gate] manage_handoff error: ${errorMessage}\n`);

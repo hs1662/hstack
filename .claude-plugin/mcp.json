@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "gate": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/mcp/server.mjs"],
+      "env": { "HSTACK_HOST": "claude", "CLAUDE_PLUGIN_DATA": "${CLAUDE_PLUGIN_DATA}" }
+    }
+  }
+}

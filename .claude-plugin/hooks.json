@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/claude.mjs\" SessionStart", "timeout": 5 }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/claude.mjs\" UserPromptSubmit", "timeout": 5 }] }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "^(Bash|PowerShell|Edit|Write|NotebookEdit|Agent|Task|TodoWrite|TaskCreate|TaskUpdate|AskUserQuestion|mcp__plugin_hstack_gate__(verify_completion|manage_handoff))$",
+        "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/claude.mjs\" PreToolUse", "timeout": 5 }]
+      }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/hooks/claude.mjs\" Stop", "timeout": 5 }] }
+    ]
+  }
+}

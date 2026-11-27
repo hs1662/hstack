@@ -1,5 +1,6 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { closeSync, existsSync, fstatSync, openSync, readSync, realpathSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { detectHost, normalizeHookEvent, resolveHostPaths } from "./host/host-adapter.mjs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -8,7 +9,8 @@ import {
   isPreToolDenialStep,
   parseTranscriptJsonlWithStats,
 } from "./transcript.mjs";
-import { createResultOrdinalCounter, parseRawRecord, parseStepIndex, recordToStep } from "./transcript/steps.mjs";
+import { claudeEventsToSteps, createResultOrdinalCounter, parseRawRecord, parseStepIndex, recordToStep } from "./transcript/steps.mjs";
+import { readClaudeTranscript } from "./host/claude-transcript.mjs";
 
 const CHUNK_SIZE = 256 * 1024;
 const PREFIX_SCAN_BYTES = 256;
@@ -316,13 +318,7 @@ function scanJsonStringEnd(buf, openQuoteIdx) {
 }
 
 export function resolvePluginDataDir() {
-  for (const key of ["PLUGIN_DATA", "HSTACK_DATA_DIR"]) {
-    const raw = process.env[key];
-    if (typeof raw === "string" && raw.trim().length > 0) {
-      return raw.trim();
-    }
-  }
-  return join(tmpdir(), "hstack-data");
+  return resolveHostPaths(transcriptHost.getStore() ?? detectHost()).dataDir;
 }
 
 export function extractLinePrefixType(prefixBuf) {
@@ -664,6 +660,8 @@ export function createStepCollector(limit = Infinity) {
 }
 
 function readTranscriptStepsFast(filePath) {
+  const claude = readClaudeTranscript(filePath);
+  if (claude) return { hasContent: claude.available, steps: claudeEventsToSteps(claude.events) };
   const collector = createStepCollector();
   const { hasContent } = streamTranscriptRecords(filePath, (prefixType, lineBuf, recordIndex) => {
     if (lineBuf === null) {
@@ -684,6 +682,8 @@ function readTranscriptStepsFast(filePath) {
 // The last `limit` steps from a tail window that doubles until it holds them. Small files, and windows
 // with a record lacking a numeric step index (its fallback index needs the full count), read everything.
 export function readTailTranscriptSteps(filePath, limit) {
+  const claude = readClaudeTranscript(filePath);
+  if (claude) return claudeEventsToSteps(claude.events, limit);
   const size = statSync(filePath).size;
   for (let window = TAIL_START_BYTES; size > TAIL_SCAN_MIN_BYTES && window < size; window *= 2) {
     const collector = createStepCollector(limit);
@@ -766,9 +766,23 @@ export function findLastLine(filePath, needle, accept, { start = 0, end = Infini
   }
 }
 
+// Every ledger reader, including nested calls, must use the host-supplied path on Claude.
+const transcriptHost = new AsyncLocalStorage();
+export function withTranscriptHost(host, callback) {
+  return transcriptHost.run(host, callback);
+}
+
 export function resolveTranscriptCandidates(transcriptPath) {
-  if (basename(transcriptPath) === "transcript.jsonl") {
-    return [join(dirname(transcriptPath), "transcript_full.jsonl"), transcriptPath];
+  if ((transcriptHost.getStore() ?? detectHost()) !== "claude-code" && basename(transcriptPath) === "transcript.jsonl") {
+    const full = join(dirname(transcriptPath), "transcript_full.jsonl");
+    if (existsSync(full)) {
+      try {
+        if (readClaudeTranscript(transcriptPath, { headerOnly: true }) !== null) return [transcriptPath];
+      } catch (error) {
+        if (error.code !== "ENOENT" && error.code !== "ENOTDIR") return [transcriptPath];
+      }
+    }
+    return [full, transcriptPath];
   }
   return [transcriptPath];
 }
@@ -840,7 +854,9 @@ export function parseHookPayload(stdinText, expectedEventName) {
   if (expectedEventName && name !== undefined && name !== null && name !== "" && name !== expectedEventName) {
     return null;
   }
-  return payload;
+  // Claude's ingress calls this without an expectedName for its untouched wire
+  // record. Legacy handlers take the same canonical view for both Agy spellings.
+  return expectedEventName && payload.host !== "claude-code" ? normalizeHookEvent("antigravity", payload) : payload;
 }
 
 export function isDirectExecution(moduleUrl) {

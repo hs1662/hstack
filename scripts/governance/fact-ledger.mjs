@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
+import { readClaudeTranscript } from "../host/claude-transcript.mjs";
 import {
   extractLinePrefixType,
   findLastLine,
@@ -12,7 +13,7 @@ import {
   streamTranscriptRecords,
 } from "../hook-io.mjs";
 import { GATE_STOP_MARKER } from "../transcript/markers.mjs";
-import { getToolCalls, isPreToolDenialStep, parseRawRecord, parseStepIndex, recordToStep } from "../transcript/steps.mjs";
+import { claudeEventsToSteps, getToolCalls, isPreToolDenialStep, parseRawRecord, parseStepIndex, recordToStep } from "../transcript/steps.mjs";
 import {
   AUDITOR_AGENT_NAME,
   AUDITOR_SESSION_MARKER,
@@ -2842,9 +2843,15 @@ function createEmptyLedger(transcriptAvailable = false) {
 
 // With `turnStart`, scans from that turn's USER_INPUT (a byte offset) with the role the header scan settled;
 // returns undefined when a record there has no numeric step index, since its fallback index needs the full count.
-function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turnStart = null) {
+function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turnStart = null, claude = null) {
+  if (claude && getClaudeSessionRole(claude) === "unknown") return createEmptyLedger(false);
   const ledger = createEmptyLedger(true);
   let pendingCalls = [];
+  const pendingById = claude ? new Map() : null;
+  const queue = (call, pending) => {
+    if (pendingById) pendingById.set(call.id, pending);
+    else pendingCalls.push(pending);
+  };
   let seenGenericInCurrentPlanner = false;
   let seenFirstUserInput = turnStart !== null;
   let seenFirstPlannerResponse = turnStart !== null;
@@ -2930,6 +2937,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     ledger.commitNumstatUnavailable = false;
     ledger.turnCommittedFiles = new Set();
     pendingCalls = [];
+    pendingById?.clear();
     seenGenericInCurrentPlanner = false;
     asyncAuditsByConversationId.clear();
     asyncChallengesByConversationId.clear();
@@ -2952,30 +2960,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     );
   };
 
-  const skipProse = statSync(filePath).size > PROSE_SKIP_MIN_BYTES;
-  const result = streamTranscriptRecords(
-    filePath,
-    (prefixType, lineBuf, recordIndex) => {
-      if (lineBuf === null) {
-        if (prefixType === "USER_INPUT" || prefixType === "PLANNER_RESPONSE" || prefixType === "SYSTEM_MESSAGE" || prefixType === null) {
-          return true;
-        }
-        if (prefixType === "GENERIC") {
-          return peekNeedsGeneric();
-        }
-        return false;
-      }
-
-      const lean =
-        skipProse && (prefixType === "PLANNER_RESPONSE" || (prefixType === "GENERIC" && pendingCalls[0]?.kind === "write"));
-      let parsed = parseRawRecord(lean ? decodeWithoutLeadingContent(lineBuf) : lineBuf.toString("utf8"));
-      if (lean && parsed && (parsed.type !== prefixType || (parsed.type === "GENERIC" && mayBeDenialResult(parsed)))) {
-        parsed = parseRawRecord(lineBuf.toString("utf8"));
-      }
-      if (!parsed) {
-        return false;
-      }
-
+  const visit = (parsed, recordIndex) => {
       const rawIndex = parsed.step_index !== undefined ? parsed.step_index : parsed.stepIndex;
       const stepIndex = parseStepIndex(rawIndex, recordIndex);
       indexed &&= turnStart === null || parseStepIndex(rawIndex, null) !== null;
@@ -3035,7 +3020,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
       }
 
       if (parsed.type === "PLANNER_RESPONSE") {
-        flushSyntheticWritesWithoutGenerics();
+        if (!claude) flushSyntheticWritesWithoutGenerics();
         seenFirstPlannerResponse = true;
         seenGenericInCurrentPlanner = false;
         pendingCalls = [];
@@ -3050,18 +3035,18 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
 
           if (writePaths.length > 0 || WRITE_TOOL_NAMES.has(name)) {
             if (writePaths.length > 0) {
-              pendingCalls.push({ kind: "write", writePaths, readPaths, stepIndex });
+              queue(call, { kind: "write", writePaths, readPaths, stepIndex });
             } else {
               for (const p of readPaths) {
                 ledger.sessionReadFiles.add(p);
               }
-              pendingCalls.push({ kind: "other" });
+              queue(call, { kind: "other" });
             }
             continue;
           }
 
-          for (const p of readPaths) {
-            ledger.sessionReadFiles.add(p);
+          if (!claude) {
+            for (const p of readPaths) ledger.sessionReadFiles.add(p);
           }
 
           if (EXEC_TOOL_NAMES.has(name)) {
@@ -3073,14 +3058,14 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               execCwd,
               kind: classifyCommand(command),
               hasPrepSideEffect: commandHasPrepSideEffect(command),
-              passed: true,
+              passed: !claude,
               hasResult: false,
               status: "",
               error: "",
               tail: "",
             };
             ledger.turnExecutions.push(entry);
-            pendingCalls.push({ kind: "exec", entry });
+            queue(call, { kind: "exec", entry });
           } else if (MCP_VERIFICATION_TOOL_NAMES.has(name)) {
             const { commands, labels } = extractMcpCheckCommands(call);
             const execCwd = extractCommandCwd(call, cwd);
@@ -3093,14 +3078,14 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               checkLabels: labels,
               kind: classifyMcpCheckCommands(commands),
               hasPrepSideEffect: commands.some((cmd) => commandHasPrepSideEffect(cmd)),
-              passed: true,
+              passed: !claude,
               hasResult: false,
               status: "",
               error: "",
               tail: "",
             };
             ledger.turnExecutions.push(entry);
-            pendingCalls.push({ kind: "exec", entry });
+            queue(call, { kind: "exec", entry });
           } else if (name === GATE_TOOL_NAME) {
             const entry = {
               stepIndex,
@@ -3108,7 +3093,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               passed: false,
             };
             ledger.turnGateAttempts.push(entry);
-            pendingCalls.push({ kind: "gate", entry });
+            queue(call, { kind: "gate", entry });
           } else if (USER_VOTE_TOOL_NAMES.has(name)) {
             const entry = {
               toolName: name,
@@ -3118,7 +3103,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               errored: false,
             };
             ledger.turnUserVotes.push(entry);
-            pendingCalls.push({ kind: "user_vote", entry });
+            queue(call, { kind: "user_vote", entry });
           } else if (name === SUBAGENT_TOOL_NAME) {
             const typeNames = extractSubagentTypeNames(call);
             const subPrompts = extractSubagentPrompts(call);
@@ -3168,14 +3153,14 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
               }
             }
             if (auditEntries.length > 0 || challengeEntries.length > 0 || workerEntries.length > 0) {
-              pendingCalls.push({ kind: "managed_subagent", auditEntries, challengeEntries, workerEntries });
+              queue(call, { kind: "managed_subagent", auditEntries, challengeEntries, workerEntries });
             } else {
-              pendingCalls.push({ kind: "other" });
+              queue(call, { kind: "other" });
             }
           } else if (READ_TOOL_NAMES.has(name)) {
-            pendingCalls.push({ kind: "read" });
+            queue(call, { kind: "read", readPaths });
           } else {
-            pendingCalls.push({ kind: "other" });
+            queue(call, { kind: "other" });
           }
         }
         return true;
@@ -3183,7 +3168,8 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
 
       if (parsed.type === "GENERIC") {
         seenGenericInCurrentPlanner = true;
-        const pending = pendingCalls.shift();
+        const pending = pendingById ? pendingById.get(parsed.toolUseId) : pendingCalls.shift();
+        pendingById?.delete(parsed.toolUseId);
         if (!pending) {
           return true;
         }
@@ -3198,12 +3184,14 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
           }
           const errored = normStatus === "ERROR" || normStatus === "FAILED" || error.trim().length > 0;
           if (!denied && !errored) {
-            commitWriteToolResult(pending);
+            commitWriteToolResult(claude ? { ...pending, stepIndex } : pending);
           }
           return true;
         }
 
-        if (pending.kind === "exec") {
+        if (pending.kind === "read" && claude && normStatus === "DONE") {
+          for (const p of pending.readPaths) ledger.sessionReadFiles.add(p);
+        } else if (pending.kind === "exec") {
           const tail = extractTail(parsed.content);
           const head = pending.entry.toolName ? extractHead(parsed.content) : "";
           const hasFailBlock =
@@ -3228,7 +3216,9 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
             ledger.turnConsecutiveVerifyFailures = 0;
           }
         } else if (pending.kind === "gate") {
+          if (claude && normStatus !== "DONE") return true;
           const verdict = parseGateVerdictFromText(typeof parsed.content === "string" ? parsed.content : "");
+          if (claude && verdict === "SKIPPED_NO_SESSION") return true;
           pending.entry.verdict = verdict;
           pending.entry.passed = PASSING_VERDICTS.has(verdict);
         } else if (pending.kind === "user_vote") {
@@ -3293,6 +3283,26 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
       }
 
       return true;
+  };
+
+  const skipProse = !claude && statSync(filePath).size > PROSE_SKIP_MIN_BYTES;
+  const result = claude ? { hasContent: true } : streamTranscriptRecords(
+    filePath,
+    (prefixType, lineBuf, recordIndex) => {
+      if (lineBuf === null) {
+        if (prefixType === "USER_INPUT" || prefixType === "PLANNER_RESPONSE" || prefixType === "SYSTEM_MESSAGE" || prefixType === null) {
+          return true;
+        }
+        if (prefixType === "GENERIC") return peekNeedsGeneric();
+        return false;
+      }
+      const lean =
+        skipProse && (prefixType === "PLANNER_RESPONSE" || (prefixType === "GENERIC" && pendingCalls[0]?.kind === "write"));
+      let parsed = parseRawRecord(lean ? decodeWithoutLeadingContent(lineBuf) : lineBuf.toString("utf8"));
+      if (lean && parsed && (parsed.type !== prefixType || (parsed.type === "GENERIC" && mayBeDenialResult(parsed)))) {
+        parsed = parseRawRecord(lineBuf.toString("utf8"));
+      }
+      return parsed ? visit(parsed, recordIndex) : false;
     },
     {
       onSkipped(prefixType, isValid) {
@@ -3307,6 +3317,9 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
       shouldStop: () => !indexed,
     },
   );
+  if (claude) {
+    for (const event of claude.events) visit(event, event.stepIndex);
+  }
 
   if (!indexed) {
     return undefined;
@@ -3422,11 +3435,27 @@ function scanTurnFromTail(filePath, cwd, gitRoot, onUserInput) {
   return ledger;
 }
 
+function ledgerTranscriptCandidates(filePath) {
+  const candidates = resolveTranscriptCandidates(filePath);
+  if (candidates[0] === filePath) return candidates;
+  try {
+    if (readClaudeTranscript(filePath, { headerOnly: true })) return [filePath];
+  } catch (error) {
+    if (error?.code !== "ENOENT" && error?.code !== "ENOTDIR") return [filePath];
+  }
+  return candidates;
+}
+
 function scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput, partialMinBytes = Infinity) {
   fsMemo = new Map();
   try {
-    for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
+    for (const candidatePath of ledgerTranscriptCandidates(transcriptPath.trim())) {
       try {
+        const claude = readClaudeTranscript(candidatePath);
+        if (claude) {
+          const ledger = scanTranscriptToLedger(candidatePath, cwd, gitRoot, onUserInput, null, claude);
+          return { ledger, candidatePath, claude };
+        }
         const partial = statSync(candidatePath).size > partialMinBytes ? scanTurnFromTail(candidatePath, cwd, gitRoot, onUserInput) : undefined;
         const ledger = partial ?? scanTranscriptToLedger(candidatePath, cwd, gitRoot, onUserInput);
         if (ledger) {
@@ -3459,13 +3488,23 @@ export function readTurnLedger(transcriptPath, cwd = "", gitRoot = "", { partial
   return scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, null, partialMinBytes).ledger;
 }
 
+function getClaudeSessionRole(claude) {
+  if (!claude.available) return "unknown";
+  const role = detectSessionRoleFromHeaderSteps(claude.events);
+  return claude.sidechain && role === "main" ? "unknown" : role;
+}
+
 // The session role alone, from the header window: O(header) on any transcript size.
 export function readSessionRole(transcriptPath) {
   if (typeof transcriptPath !== "string" || transcriptPath.trim().length === 0) {
     return "unknown";
   }
-  for (const candidatePath of resolveTranscriptCandidates(transcriptPath.trim())) {
+  for (const candidatePath of ledgerTranscriptCandidates(transcriptPath.trim())) {
     try {
+      const claude = readClaudeTranscript(candidatePath, { headerOnly: true });
+      if (claude) {
+        return getClaudeSessionRole(claude);
+      }
       const role = scanHeaderRole(candidatePath);
       if (role !== null) {
         return role;
@@ -3486,14 +3525,16 @@ export function readFactLedgerAndSteps(transcriptPath, cwd = "", gitRoot = "") {
   const onUserInput = (parsed, recordIndex) => {
     latestUser = { parsed, recordIndex };
   };
-  const { ledger, candidatePath } = scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput, PARTIAL_SCAN_MIN_BYTES);
+  const { ledger, candidatePath, claude } = scanFirstLedgerCandidate(transcriptPath, cwd, gitRoot, onUserInput, PARTIAL_SCAN_MIN_BYTES);
   let steps = [];
   try {
-    steps = candidatePath ? readTailTranscriptSteps(candidatePath, DRIFT_STEP_WINDOW) : [];
+    steps = claude ? ledger.transcriptAvailable ? claudeEventsToSteps(claude.events, DRIFT_STEP_WINDOW) : [] :
+      candidatePath ? readTailTranscriptSteps(candidatePath, DRIFT_STEP_WINDOW) : [];
   } catch {
     steps = [];
   }
   if (steps.length === 0) {
+    if (claude) return { ledger, steps };
     // The step reader moves on to the next candidate when this one holds records but no steps.
     return { ledger, steps: readTranscriptSteps(transcriptPath) };
   }

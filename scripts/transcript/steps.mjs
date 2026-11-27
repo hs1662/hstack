@@ -1,3 +1,5 @@
+import { parseClaudeTranscript } from "../host/claude-transcript.mjs";
+
 export const KEPT_STEP_TYPES = new Set(["PLANNER_RESPONSE", "SYSTEM_MESSAGE", "USER_INPUT", "ERROR_MESSAGE"]);
 export const PRE_TOOL_DENIAL_NEEDLE = "tool call denied by pre-tool hook";
 
@@ -55,6 +57,14 @@ export function isPreToolDenialStep(step) {
 export function deniedToolCallIndexes(steps, plannerPos) {
   const denied = new Set();
   const planner = steps[plannerPos];
+  if (planner?.toolCalls?.some((call) => typeof call.id === "string")) {
+    const positions = new Map(planner.toolCalls.map((call, index) => [call.id, index]));
+    for (let j = plannerPos + 1; j < steps.length && steps[j]?.type !== "USER_INPUT"; j += 1) {
+      const index = positions.get(steps[j]?.toolUseId);
+      if (index !== undefined && isPreToolDenialStep(steps[j])) denied.add(index);
+    }
+    return denied;
+  }
   const base = planner && Number.isFinite(planner.stepIndex) ? planner.stepIndex : null;
   let ordinal = 0;
   let skipped = 0;
@@ -123,6 +133,7 @@ export function recordToStep(parsed, fallbackStepIndex) {
     error: typeof parsed.error === "string" ? parsed.error : "",
     status: typeof parsed.status === "string" ? parsed.status : "",
     toolCalls: getToolCalls(parsed),
+    ...(typeof parsed.toolUseId === "string" ? { toolUseId: parsed.toolUseId } : {}),
   };
 }
 
@@ -145,9 +156,18 @@ export function parseTranscriptLine(line, fallbackStepIndex = 0) {
   return parsed ? recordToStep(parsed, fallbackStepIndex) : null;
 }
 
+export function claudeEventsToSteps(events, limit = Infinity) {
+  return events.map((event) => recordToStep(event, event.stepIndex)).filter(Boolean).slice(-limit);
+}
+
 export function parseTranscriptJsonlWithStats(rawText) {
   if (typeof rawText !== "string" || rawText.length === 0) {
     return { steps: [], validRecordCount: 0 };
+  }
+
+  const claude = parseClaudeTranscript(rawText);
+  if (claude) {
+    return { steps: claudeEventsToSteps(claude.events), validRecordCount: claude.available ? claude.events.length : 0 };
   }
 
   const steps = [];
