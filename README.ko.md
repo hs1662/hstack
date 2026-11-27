@@ -89,7 +89,7 @@ claude --plugin-dir /path/to/hstack
 
 ### 네임스페이스 MCP와 `_hstackContext`
 
-`./.claude-plugin/mcp.json`은 `gate`를 `HSTACK_HOST=claude`, `CLAUDE_PLUGIN_DATA`와 함께 실행합니다. Claude Code는 플러그인 서버를 `plugin:<plugin>:<server>`로 묶기 때문에 도구는 `mcp__plugin_hstack_gate__verify_completion`, `mcp__plugin_hstack_gate__manage_handoff`로 보입니다. 즉시 로드(eager)되지는 않습니다.
+`./.claude-plugin/mcp.json`은 `HSTACK_HOST=claude`만 설정하며, Claude Code가 자동 주입하는 `CLAUDE_PLUGIN_DATA` 경로를 덮어쓰지 않고 그대로 상속합니다. Claude Code는 플러그인 서버를 `plugin:<plugin>:<server>`로 묶기 때문에 도구는 `mcp__plugin_hstack_gate__verify_completion`, `mcp__plugin_hstack_gate__manage_handoff`로 보입니다. 즉시 로드(eager)되지는 않습니다.
 
 Claude Code에서는 `_session`이 도구 호출에 실리지 않습니다. `PreToolUse`는 호출자가 넣은 `_session`이나 `_hstackContext`를 버리고, 새로 만든 일회용 무작위 참조 `_hstackContext`를 붙입니다. 서버는 이 참조를 딱 한 번만 교환합니다. 발급받은 도구와 일치해야 하고, 120초 이내여야 하며, 플러그인 데이터 디렉터리 아래 소유자 전용 디렉터리에 있어야 합니다. 참조가 없거나 재사용됐거나 만료됐거나 위조됐으면 세션 없이 실행하지 않고 한국어 오류로 호출을 실패시킵니다. 훅이 호출을 자동 승인하지 않으므로 Claude의 기본 권한 규칙은 그대로 적용됩니다.
 
@@ -306,23 +306,29 @@ node ./scripts/audit-report.mjs --file /path/to/audit.jsonl
 
 ## 검증 및 테스트
 
-저장소 루트에서 단위·통합 테스트, 엄격 플러그인 검증, 격리된 실전 모델 검증을 실행합니다.
+저장소 루트에서 단위·통합 테스트, 양 호스트 엄격 플러그인 검증, 격리된 실전 모델 검증을 실행합니다.
 
 ```sh
-node --test test/*.test.mjs
+env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs
 agy plugin validate --strict --json .
+claude plugin validate --strict --json .
+claude --plugin-dir /path/to/hstack
 node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 ```
 
 `test/verify-live.mjs`는 전역 플러그인 간섭을 차단하기 위해 격리된 임시 `HOME`과 앱 데이터 디렉터리에서 실행되며 종료 시 임시 로그를 자동 정리합니다.
 
-### 실측 기준선 및 릴리즈 노트 (과거 기록, v0.1.2, Agy 전용)
+### 실측 기준선 및 릴리즈 노트 (v0.2.0)
 
-아래 수치는 v0.1.2 시점에 Agy에서 측정한 값이며 v0.2.0 결과가 아닙니다.
+아래 수치는 `v0.2.0` `main` 기준선에서 실측한 결과입니다(기존 `v0.1.2` Agy 전용 기준선은 149 스위트 / 760 테스트였습니다).
 
-- 단위·통합 테스트: `node --test test/*.test.mjs` — **149 스위트 / 760 테스트 통과 (`fail 0`)** (`v0.1.2` 거버넌스 상태 머신 하드닝, 셸 검증 문법·래퍼·환경 동등성, 추적/미추적 스냅샷 fail-closed 정밀화, 세션 락 회수 하드닝, 분석기, 영어 요청 면제, 트랜스크립트 훅, 팩트 원장, 완료 게이트 `R1`~`R9`·`E1`~`E11`, 자율 프롬프트 라우터·서킷브레이커·삽질 감지기, 위험 분류 및 독립 감사, 핸드오프 저장소 및 MCP stdio 왕복, `audit-report.mjs` `[1]`~`[8]` 전수 검증).
-- 엄격 플러그인 검증: `agy plugin validate --strict --json .` 종료 코드 `0`, `"findings": []`, `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.
-- 격리 거버넌스 실전 검증(`test/verify-live.mjs`, `L1`–`L16`, `gemini-4-neon-xhigh`, `v0.1.2` `L1`·`L3`·`L5`·`L16` 재실측): `4/4 pass`, `drifted: 0`, `hookcaller` 패닉 `0`건(셸 전용 편집 Stop 게이트 `L16` 포함).
-- **알려진 제약(Known Limitation):** 외부 npm 의존성이 없는 Node.js 18+ 환경에서 OS `flock` 바이너리가 없는 플랫폼(Windows 또는 `flock` 미설치 환경)은 커널 `flock` 대신 inode 검증 `.reclaim` 가드 파일 기반 대체 회수 경로로 폴백합니다.
+- 단위·통합 테스트: `env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs` 실행 시 **153 스위트 / 817 테스트 통과(`fail 0`)**. 듀얼 호스트 어댑터와 Claude Code 트랜스크립트·훅·MCP 세션 참조 계약, 워크스페이스 오너 핀 기반 스냅샷 보호(`pin`/`unpin`/`list_pinned`/`clear`), 1턴 `load_failure`를 분리한 `k=2`/`k=3` 언어 카나리아, Claude `UserPromptSubmit` 턴 스냅샷 바인딩, UI·`PowerShell` 트랜스크립트 추적 및 기존 거버넌스·분석기·하드닝 스위트 전체를 검증합니다.
+- 양 호스트 엄격 플러그인 검증: `agy plugin validate --strict --json .` 종료 코드 `0`, `"findings": []`, `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`. `claude plugin validate --strict --json .` 종료 코드 `0`, `"success": true`, 오류·경고 각 `0`건.
+- Antigravity CLI 격리 실전 검증(`test/verify-live.mjs`, `gemini-4-neon-xhigh`): `L1-golden-path`, `L3-bypass-stop-recovery`, `L5-high-risk-audit-pass`, `L16-shell-edit-stop-gate` `4/4 pass`, `drifted: 0`, `hookcaller` 패닉 `0`건.
+- Claude Code 격리 실전 검증(`claude --plugin-dir`, v2.1.332): C1(`SessionStart` 규칙 주입, 네임스페이스 MCP 도구 로드, 일회용 `_hstackContext` 소비 및 재사용 차단), C2(미검증 `Stop` 차단 후 복구, `--resume` 연속 호출별 별도 토큰 발급), C3(읽기 전용 `hstack:hstack-auditor`의 `Read`/`Glob`/`Grep` 격리, 기본 권한 확인 비우회, 파일 미수정·거부 셸 호출 시 정상 `Stop`), C4(`claude.mjs` + `server.mjs` 연동 기반 `load_failure`, `drift`, `suspect`, `handoff_required` 핀 생명주기 및 게이트 비왜곡) 실측 완료.
+- 알려진 제약:
+	1. Claude Code 헤드리스 모드(`claude -p`)에서는 대화형 `AskUserQuestion` 선택 UI와 권한 확인 프롬프트를 직접 조작할 수 없습니다. Claude `AskUserQuestion` 응답 정규화(`toolUseResult.answers`, `"User has answered your questions: ..."`)는 단위 테스트(`test/claude-transcript.test.mjs`)로 검증했습니다.
+	2. Claude Code는 `PreToolUse`의 `updatedInput`(일회용 `_hstackContext` 문자열 포함)을 자체 세션 트랜스크립트(`hook_success.stdout`)에 기록합니다. 다만 MCP 서버가 교환 즉시 토큰 파일을 삭제하므로 기록된 토큰 재사용은 항상 실패(`isError: true`)하며 `audit.jsonl`에는 토큰 평문이 남지 않습니다.
+	3. 외부 npm 의존성이 없는 Node.js 18+ 환경에서 OS `flock` 바이너리가 없는 플랫폼(Windows 또는 최소 컨테이너)은 커널 `flock` 대신 inode 검증 `.reclaim` 가드 파일 기반 대체 회수 경로로 폴백합니다.
 
 릴리스 절차는 [배포 가이드](docs/PUBLISHING.md)에서 확인할 수 있으며 라이선스는 [MIT 라이선스](LICENSE)를 따릅니다.

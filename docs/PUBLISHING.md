@@ -2,7 +2,7 @@
 
 Return to the [English README](../README.md) or [Korean README](../README.ko.md) for plugin architecture and usage details.
 
-Use this guide to verify the repository before a release, push tags to GitHub, and submit updates to the Antigravity Marketplace. Release `0.2.0` adds the Claude Code manifest. Don't run the push, tag, or release steps until the pre-merge checklist in the README has been run by hand.
+Use this guide to verify the repository before a release, push tags to GitHub, and submit updates to the Antigravity Marketplace. Release `0.2.0` adds the Claude Code manifest alongside Antigravity CLI, workspace-scoped snapshot pins, and `k=2`/`k=3` language canary transitions. Run every check in the pre-publish checklist before tagging or pushing.
 
 ## Bundled components
 
@@ -19,7 +19,7 @@ Claude Code components (new in `0.2.0`):
 
 - `.claude-plugin/plugin.json` (`version: "0.2.0"`) references every Claude path explicitly, so Agy doesn't flag Claude's default `.mcp.json` or `hooks/hooks.json` locations:
   - `"hooks": "./.claude-plugin/hooks.json"`: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, and `Stop`, all through `scripts/hooks/claude.mjs`
-  - `"mcpServers": "./.claude-plugin/mcp.json"`: `gate` with `HSTACK_HOST=claude` and `CLAUDE_PLUGIN_DATA`, exposed as `mcp__plugin_hstack_gate__verify_completion` and `mcp__plugin_hstack_gate__manage_handoff`
+  - `"mcpServers": "./.claude-plugin/mcp.json"`: `gate` sets `HSTACK_HOST=claude` and inherits the host-injected `CLAUDE_PLUGIN_DATA` directory without overriding it, exposed as `mcp__plugin_hstack_gate__verify_completion` and `mcp__plugin_hstack_gate__manage_handoff`
   - `"agents"`: `./.claude-plugin/agents/hstack-auditor.md` and `hstack-challenger.md` (`tools: Read, Glob, Grep`), and `hstack-worker.md` (adds `Edit, Write, Bash`)
 - `scripts/host/host-adapter.mjs` (public capability module for host IDs `antigravity`, `claude-code`, and `unknown`, with keys `host`, `spawn`, `readOnlySubagent`, `isolatedWrite`, `cancel`, `resume`, and `usageTelemetry`), `scripts/host/mcp-session.mjs` (one-use `_hstackContext` references), `scripts/host/tools.mjs`, `scripts/host/claude-transcript.mjs`, and `scripts/governance/language-canary.mjs`
 
@@ -27,10 +27,10 @@ Claude Code components (new in `0.2.0`):
 
 Run every required check from the repository root before you push `main` or a release tag.
 
-1. Run the unit and contract test suite and confirm zero failures. The v0.1.2 baseline was 149 suites / 760 tests; record the new v0.2.0 count when you run it.
+1. Run the unit and contract test suite and confirm zero failures (`v0.2.0` baseline: 153 suites / 817 tests, `fail 0`; previous `v0.1.2` baseline: 149 suites / 760 tests).
 
    ```sh
-   node --test test/*.test.mjs
+   env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs
    ```
 
 2. Run strict Antigravity plugin validation and confirm exit code `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.
@@ -74,7 +74,7 @@ Run every required check from the repository root before you push `main` or a re
    node ./test/verify-live.mjs
    ```
 
-   `verify-live.mjs` covers Agy only. For Claude Code, run the interactive checklist in the README by hand and record the results in the release notes.
+   `verify-live.mjs` covers Agy only (`v0.2.0` verified `L1`, `L3`, `L5`, `L16` `4/4 pass` on `gemini-4-neon-xhigh`). For Claude Code (`claude --plugin-dir .`), `v0.2.0` verified C1 through C4 in isolated runs; headless runs (`claude -p`) cannot drive interactive `AskUserQuestion` clicks, and Claude logs `updatedInput._hstackContext` in its session transcript while immediate token deletion keeps replay blocked.
 
 8. Review local audit telemetry (sections `[1]`–`[8]`, including `[3]` `R1~R9`, `[6]` scan latency, `[7]` preflight mode summary, and `[8]` autonomy events) with the zero-dependency report CLI when inspecting operational metrics.
 

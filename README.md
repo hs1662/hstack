@@ -89,7 +89,7 @@ Native tools map to the Agy names the gate already knows. `Edit`, `Write`, and `
 
 ### Namespaced MCP and `_hstackContext`
 
-`./.claude-plugin/mcp.json` starts `gate` with `HSTACK_HOST=claude` and `CLAUDE_PLUGIN_DATA`. Claude Code scopes plugin servers as `plugin:<plugin>:<server>`, so the tools appear as `mcp__plugin_hstack_gate__verify_completion` and `mcp__plugin_hstack_gate__manage_handoff`. They aren't loaded eagerly.
+`./.claude-plugin/mcp.json` sets `HSTACK_HOST=claude` and inherits the host-injected `CLAUDE_PLUGIN_DATA` directory without overriding it. Claude Code scopes plugin servers as `plugin:<plugin>:<server>`, so the tools appear as `mcp__plugin_hstack_gate__verify_completion` and `mcp__plugin_hstack_gate__manage_handoff`. They aren't loaded eagerly.
 
 On Claude Code, `_session` never travels through the tool call. `PreToolUse` drops any caller-supplied `_session` or `_hstackContext` and attaches a fresh `_hstackContext`, a random one-use reference. The server redeems it exactly once. It has to match the tool it was issued for, be less than 120 seconds old, and sit in an owner-only directory under the plugin data directory. A missing, reused, expired, or forged reference fails the call with a Korean error instead of running it without a session. The hook doesn't auto-approve the call, so Claude's normal permission rules still apply.
 
@@ -306,23 +306,29 @@ Default file resolution checks `--file`, `$PLUGIN_DATA/audit.jsonl`, `$HSTACK_DA
 
 ## Verification and tests
 
-Run the unit test suite, strict plugin manifest validation, and isolated live checks from the repository root.
+Run the unit test suite, strict plugin manifest validation on both hosts, and isolated live checks from the repository root.
 
 ```sh
-node --test test/*.test.mjs
+env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs
 agy plugin validate --strict --json .
+claude plugin validate --strict --json .
+claude --plugin-dir /path/to/hstack
 node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 ```
 
 `test/verify-live.mjs` executes each scenario in an isolated temporary `HOME` and app-data directory so global plugins cannot interfere and cleans up temporary logs on exit.
 
-### Measured baseline and release notes (historical, v0.1.2, Agy only)
+### Measured baseline and release notes (v0.2.0)
 
-These numbers were measured at v0.1.2 on Agy. They aren't v0.2.0 results.
+These numbers were measured at `v0.2.0` on `main` (upgraded from the `v0.1.2` baseline of 149 suites / 760 tests on Agy only).
 
-- Unit and integration suite: `node --test test/*.test.mjs` — **149 suites / 760 tests pass (`fail 0`)**, covering `v0.1.2` governance state-machine hardening, shell verification grammar/wrapper/env parity, tracked vs. untracked snapshot fail-closed accuracy, session lock stale-reclaim hardening, analyzer, English-request exemptions, transcript hooks, fact ledger, completion gate (`R1` through `R9`, `E1` through `E11`), autonomous prompt routing, destructive-edit circuit breaker, thrashing detector, risk classification and independent audit, handoff store and MCP stdio roundtrip, and `audit-report.mjs` (`[1]`–`[8]`).
-- Strict manifest validation: `agy plugin validate --strict --json .` exits `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.
-- Isolated live governance suite (`test/verify-live.mjs`, `L1`–`L16` on `gemini-4-neon-xhigh`, re-verified `L1`, `L3`, `L5`, `L16` at `v0.1.2`): `4/4 pass`, `drifted: 0`, `hookcaller` panics `0` (covering shell-only edit Stop gate `L16` alongside `L1`–`L15`).
-- **Known limitation:** Under Node.js 18+ with zero external dependencies, hosts without an OS `flock` binary (such as Windows or minimal environments missing `flock`) safely fall back to an inode-verified `.reclaim` guard file rather than kernel `flock` during stale session lock reclamation.
+- Unit and integration suite: `env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs` passes **153 suites / 817 tests (`fail 0`)**, covering dual-host adapter and Claude Code transcript/hook/MCP session-reference contracts, workspace-scoped snapshot pins (`pin`/`unpin`/`list_pinned`/`clear`), `k=2`/`k=3` language canary with turn-1 `load_failure` separation, Claude `UserPromptSubmit` turn-snapshot binding, UI/PowerShell transcript tracking, and all existing governance, analyzer, and hardening suites.
+- Strict manifest validation (both hosts): `agy plugin validate --strict --json .` exits `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`. `claude plugin validate --strict --json .` exits `0` with `"success": true`, `0` errors, and `0` warnings.
+- Antigravity CLI isolated live suite (`test/verify-live.mjs`, `gemini-4-neon-xhigh`): `L1-golden-path`, `L3-bypass-stop-recovery`, `L5-high-risk-audit-pass`, and `L16-shell-edit-stop-gate` pass `4/4` with `drifted: 0` and `hookcaller` panics `0`.
+- Claude Code isolated live verification (`claude --plugin-dir`, v2.1.332): verified C1 (SessionStart rules load, namespaced MCP tools, one-use `_hstackContext` redemption and replay rejection), C2 (unverified `Stop` block and recovery, multi-call `--resume` distinct tokens), C3 (read-only `hstack:hstack-auditor` isolation with `Read`/`Glob`/`Grep` only, non-bypass of default permission checks, clean `Stop` on non-mutating and denied shells), and C4 (`load_failure`, `drift`, `suspect`, and `handoff_required` pinned snapshot lifecycle and gate non-interference via `claude.mjs` and `server.mjs`).
+- Known limitations:
+	1. In Claude Code headless mode (`claude -p`), interactive `AskUserQuestion` selection UI and interactive permission prompts cannot be clicked directly. Claude `AskUserQuestion` answer normalization (`toolUseResult.answers` and `"User has answered your questions: ..."`) is verified in `test/claude-transcript.test.mjs`.
+	2. Claude Code writes `PreToolUse` `updatedInput` (including the one-use `_hstackContext` string) into its own session transcript (`hook_success.stdout`). The MCP server deletes the underlying token file immediately on redemption so replaying the recorded token always fails (`isError: true`), and `audit.jsonl` never logs the token.
+	3. On platforms without an OS `flock` binary (such as Windows or minimal containers), stale session lock reclamation falls back to an inode-verified `.reclaim` guard file under zero-dependency Node.js 18+.
 
 See [Publishing guide](docs/PUBLISHING.md) for releases and [MIT License](LICENSE) for licensing.
