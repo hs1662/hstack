@@ -297,9 +297,9 @@ function tryRealpath(rawPath) {
   if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
     return null;
   }
-  return memoFs("realpath", rawPath.trim(), () => {
+  return memoFs("realpath", rawPath, () => {
     try {
-      return realpathSync(rawPath.trim());
+      return realpathSync(rawPath);
     } catch {
       return null;
     }
@@ -311,9 +311,8 @@ function collectBaseVariants(rawBase) {
     return [];
   }
   return memoFs("bases", rawBase, () => {
-    const trimmed = rawBase.trim();
-    const real = tryRealpath(trimmed);
-    return real && real !== trimmed ? [trimmed, real] : [trimmed];
+    const real = tryRealpath(rawBase);
+    return real && real !== rawBase ? [rawBase, real] : [rawBase];
   });
 }
 
@@ -346,14 +345,10 @@ function relativizeAgainstAnyBase(normPath, bases) {
 }
 
 export function normalizeWorkspacePath(rawPath, cwd = "", gitRoot = "") {
-  if (typeof rawPath !== "string") {
+  if (typeof rawPath !== "string" || rawPath.trim().length === 0) {
     return "";
   }
-  const trimmed = rawPath.trim();
-  if (trimmed.length === 0) {
-    return "";
-  }
-  let normalized = posix.normalize(toPosix(trimmed));
+  let normalized = posix.normalize(toPosix(rawPath));
   const gitBases = preparedBases(gitRoot);
   const cwdBases = preparedBases(cwd);
   if (isAbsolutePosix(normalized)) {
@@ -3139,9 +3134,9 @@ export function resolveGitRootFast(startDir) {
   }
   let dir;
   try {
-    dir = realpathSync(startDir.trim());
+    dir = realpathSync(startDir);
   } catch {
-    dir = resolve(startDir.trim());
+    dir = resolve(startDir);
   }
   for (let i = 0; i < 20; i += 1) {
     if (existsSync(resolve(dir, ".git"))) {
@@ -3282,13 +3277,16 @@ export function snapshotWorkingTree(cwd) {
       if (untrackedCodeCount > SNAPSHOT_MAX_FILES) {
         untrackedTruncated = true;
         untrackedFiles = null;
-        break;
+        continue;
       }
-      untrackedFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+      if (!untrackedTruncated) {
+        untrackedFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+      }
     }
   } catch {
     untrackedTruncated = true;
     untrackedFiles = null;
+    docFilesTruncated = true;
   }
 
   return { gitRoot, head, files, docFiles, docFilesTruncated, untrackedFiles, untrackedTruncated, capturedAtMs: Date.now() };
@@ -3351,7 +3349,7 @@ export function readGitLedger(cwd) {
       timeout: remainingTimeout(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    }).replace(/[\r\n]+$/, "");
     if (!gitRoot) {
       return empty;
     }

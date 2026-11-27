@@ -177,8 +177,13 @@ function splitQuotedWhitespaceWithMeta(rawValue, { splitComma = false } = {}) {
     const ch = rawValue[i];
     if (quote) {
       if (ch === "\\" && quote === '"' && i + 1 < rawValue.length) {
-        i += 1;
-        cur += rawValue[i];
+        const next = rawValue[i + 1];
+        if (next === '"' || next === "\\" || next === "$" || next === "`" || next === "\n") {
+          i += 1;
+          cur += next;
+        } else {
+          cur += ch;
+        }
       } else if (ch === quote) {
         quote = null;
       } else {
@@ -320,11 +325,19 @@ function parseTomlStringArray(rawArrayBody) {
   return items;
 }
 
+const PYTEST_COLLECTION_OVERRIDE_KEYS = new Set([
+  "python_files",
+  "python_classes",
+  "python_functions",
+  "norecursedirs",
+]);
+
 function parseIniTestpaths(text, targetSections) {
   const lines = text.split(/\r?\n/);
   let inTargetSection = false;
   let sawTargetSection = false;
   let foundKey = false;
+  let hasCollectionOverride = false;
   const collected = [];
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -340,6 +353,32 @@ function parseIniTestpaths(text, targetSections) {
     }
     if (!inTargetSection) {
       continue;
+    }
+    const genericKeyMatch = /^([A-Za-z0-9_.-]+)\s*=/.exec(trimmed);
+    if (genericKeyMatch) {
+      const keyLower = genericKeyMatch[1].toLowerCase();
+      if (PYTEST_COLLECTION_OVERRIDE_KEYS.has(keyLower)) {
+        hasCollectionOverride = true;
+      } else if (keyLower === "addopts") {
+        let rawAddopts = trimmed.slice(trimmed.indexOf("=") + 1).replace(/\s+[#;].*$/, "").trim();
+        for (let j = i + 1; j < lines.length; j += 1) {
+          const nextLine = lines[j];
+          const nextTrimmed = nextLine.trim();
+          if (!nextTrimmed || nextTrimmed.startsWith("#") || nextTrimmed.startsWith(";")) {
+            continue;
+          }
+          if (/^[ \t]+/.test(nextLine) && !nextTrimmed.startsWith("[") && !nextTrimmed.includes("=")) {
+            rawAddopts += ` ${nextTrimmed.replace(/\s+[#;].*$/, "").trim()}`;
+            i = j;
+          } else {
+            break;
+          }
+        }
+        const addoptsTokens = splitQuotedWhitespace(rawAddopts);
+        if (!addoptsTokens || addoptsTokens.some((tok) => !tok.startsWith("-") || /^(?:-[kmp]|--ignore|--deselect|-c|-o)/.test(tok) || isPytestDiscoveryOverrideToken(tok))) {
+          hasCollectionOverride = true;
+        }
+      }
     }
     const keyMatch = /^testpaths\s*=\s*(.*)$/i.exec(trimmed);
     if (keyMatch) {
@@ -370,6 +409,9 @@ function parseIniTestpaths(text, targetSections) {
   }
   if (!sawTargetSection) {
     return null;
+  }
+  if (hasCollectionOverride) {
+    return { restricted: true, paths: [] };
   }
   return foundKey ? { restricted: true, paths: collected } : { restricted: false, paths: [] };
 }
@@ -474,33 +516,96 @@ function parseTomlKeySegments(rawKeyPart) {
   return segs;
 }
 
+function advanceTomlLexState(rawLine, inMultilineQuote) {
+  let quote = inMultilineQuote;
+  let commentAt = -1;
+  let bracketDepthDelta = 0;
+  let sawTripleInIni = false;
+  for (let i = 0; i < rawLine.length; i += 1) {
+    const ch = rawLine[i];
+    if (quote === '"""' || quote === "'''") {
+      sawTripleInIni = true;
+      if (quote === '"""' && ch === "\\") {
+        i += 1;
+        continue;
+      }
+      if (rawLine.slice(i, i + 3) === quote) {
+        quote = null;
+        i += 2;
+      }
+      continue;
+    }
+    if (quote === '"' || quote === "'") {
+      if (quote === '"' && ch === "\\") {
+        i += 1;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === "#") {
+      commentAt = i;
+      break;
+    }
+    if (rawLine.slice(i, i + 3) === '"""' || rawLine.slice(i, i + 3) === "'''") {
+      sawTripleInIni = true;
+      quote = rawLine.slice(i, i + 3);
+      i += 2;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "[" || ch === "{") {
+      bracketDepthDelta += 1;
+    } else if (ch === "]" || ch === "}") {
+      bracketDepthDelta -= 1;
+    }
+  }
+  const codeOnly = commentAt === -1 ? rawLine : rawLine.slice(0, commentAt);
+  const nextMultiline = quote === '"""' || quote === "'''" ? quote : null;
+  return { codeOnly, nextMultiline, sawTriple: sawTripleInIni, bracketDepthDelta };
+}
+
 function parsePytestPyprojectToml(text) {
   let currentTable = [];
   let iniOptionsCount = 0;
   let inIniOptions = false;
+  let inMultilineQuote = null;
+  let iniBracketDepth = 0;
+  let hasCollectionOverride = false;
   const iniLines = [];
   const lines = text.split(/\r?\n/);
   for (const rawLine of lines) {
-    const t = rawLine.trim();
-    if (inIniOptions && !t.startsWith("[")) {
-      if (/"""|'''/.test(t)) {
-        return { failClosed: true, iniSectionBody: null };
+    const { codeOnly, nextMultiline, sawTriple, bracketDepthDelta } = advanceTomlLexState(rawLine, inMultilineQuote);
+    const wasInMultiline = inMultilineQuote !== null;
+    inMultilineQuote = nextMultiline;
+    const t = codeOnly.trim();
+    if (wasInMultiline || nextMultiline !== null) {
+      if (inIniOptions && sawTriple) {
+        return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
       }
-      iniLines.push(rawLine);
-    }
-    if (!t || t.startsWith("#")) {
       continue;
     }
-    if (t.startsWith("[")) {
+    if (inIniOptions && sawTriple) {
+      return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
+    }
+    if (!t) {
+      continue;
+    }
+    if (iniBracketDepth === 0 && t.startsWith("[")) {
       const closeIdx = t.startsWith("[[") ? t.indexOf("]]") : t.indexOf("]");
       if (closeIdx === -1) {
-        return { failClosed: true, iniSectionBody: null };
+        return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
       }
       const headerBody = t.slice(t.startsWith("[[") ? 2 : 1, closeIdx).trim();
       const segs = parseTomlKeySegments(headerBody);
       if (!segs) {
         if (/pytest/i.test(headerBody)) {
-          return { failClosed: true, iniSectionBody: null };
+          return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
         }
         currentTable = [];
         inIniOptions = false;
@@ -510,16 +615,20 @@ function parsePytestPyprojectToml(text) {
       if (segs.length === 3 && segs[0] === "tool" && segs[1] === "pytest" && segs[2] === "ini_options") {
         iniOptionsCount += 1;
         if (iniOptionsCount > 1) {
-          return { failClosed: true, iniSectionBody: null };
+          return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
         }
         inIniOptions = true;
       } else {
         inIniOptions = false;
         if (segs.length >= 2 && segs[0] === "tool" && segs[1] === "pytest") {
-          return { failClosed: true, iniSectionBody: null };
+          return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
         }
       }
       continue;
+    }
+    if (inIniOptions) {
+      iniLines.push(codeOnly);
+      iniBracketDepth = Math.max(0, iniBracketDepth + bracketDepthDelta);
     }
     const eqPos = t.indexOf("=");
     if (eqPos !== -1) {
@@ -527,7 +636,7 @@ function parsePytestPyprojectToml(text) {
       const keySegs = parseTomlKeySegments(keyPart);
       if (!keySegs) {
         if (/pytest/i.test(keyPart)) {
-          return { failClosed: true, iniSectionBody: null };
+          return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
         }
         continue;
       }
@@ -540,21 +649,30 @@ function parsePytestPyprojectToml(text) {
           currentTable[2] === "ini_options" &&
           keySegs.length === 1;
         if (!isDirectIniOption) {
-          return { failClosed: true, iniSectionBody: null };
+          return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
+        }
+        const optKey = keySegs[0];
+        if (PYTEST_COLLECTION_OVERRIDE_KEYS.has(optKey)) {
+          hasCollectionOverride = true;
+        } else if (optKey === "addopts") {
+          const rhs = t.slice(eqPos + 1).trim();
+          const dec = decodeTomlStringToken(rhs, 0);
+          const addoptsTokens = dec ? splitQuotedWhitespace(dec.value) : null;
+          if (!addoptsTokens || addoptsTokens.some((tok) => !tok.startsWith("-") || /^(?:-[kmp]|--ignore|--deselect|-c|-o)/.test(tok) || isPytestDiscoveryOverrideToken(tok))) {
+            hasCollectionOverride = true;
+          }
         }
       }
       // Root inline table `tool = { ... }` may embed `pytest.ini_options.testpaths`; fail closed when unhandled.
       if (fullPath.length === 1 && fullPath[0] === "tool") {
-        return { failClosed: true, iniSectionBody: null };
-      }
-      if (fullPath[0] === "tool" && /"""|'''/.test(t.slice(eqPos + 1))) {
-        return { failClosed: true, iniSectionBody: null };
+        return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
       }
     }
   }
   return {
     failClosed: false,
     iniSectionBody: iniOptionsCount === 1 ? iniLines.join("\n") : null,
+    hasCollectionOverride,
   };
 }
 
@@ -579,7 +697,7 @@ function readPytestTestpaths(execDir) {
     try {
       const text = readFileSync(pyprojPath, "utf8");
       const parsedToml = parsePytestPyprojectToml(text);
-      if (parsedToml.failClosed) {
+      if (parsedToml.failClosed || parsedToml.hasCollectionOverride) {
         return { restricted: true, paths: [] };
       }
       if (parsedToml.iniSectionBody !== null) {
@@ -587,22 +705,24 @@ function readPytestTestpaths(execDir) {
         if (sectionHasUnsupportedTestpathsKey(sectBody)) {
           return { restricted: true, paths: [] };
         }
-        if (!/(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=/.test(sectBody)) {
+        const keyRe = /(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*([^\n]*)/;
+        const keyMatch = keyRe.exec(sectBody);
+        if (!keyMatch) {
           return { restricted: false, paths: [] };
         }
-        const arrBody = extractBracketedTomlArray(sectBody);
-        if (arrBody !== null) {
-          const paths = parseTomlStringArray(arrBody);
-          return paths ? { restricted: true, paths } : { restricted: true, paths: [] };
-        }
-        const strMatch = /(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*(.+)/.exec(sectBody);
-        if (strMatch) {
-          const rhs = strMatch[1].trim();
-          const dec = decodeTomlStringToken(rhs, 0);
-          if (dec && (!rhs.slice(dec.nextIdx).trim() || rhs.slice(dec.nextIdx).trim().startsWith("#"))) {
-            const split = shlexSplitTestpaths(dec.value);
-            return split ? { restricted: true, paths: split } : { restricted: true, paths: [] };
+        const rhsTrim = keyMatch[1].trim();
+        if (rhsTrim.startsWith("[")) {
+          const arrBody = extractBracketedTomlArray(sectBody);
+          if (arrBody !== null) {
+            const paths = parseTomlStringArray(arrBody);
+            return paths ? { restricted: true, paths } : { restricted: true, paths: [] };
           }
+          return { restricted: true, paths: [] };
+        }
+        const dec = decodeTomlStringToken(rhsTrim, 0);
+        if (dec && !rhsTrim.slice(dec.nextIdx).trim()) {
+          const split = shlexSplitTestpaths(dec.value);
+          return split ? { restricted: true, paths: split } : { restricted: true, paths: [] };
         }
         return { restricted: true, paths: [] };
       }
@@ -767,7 +887,11 @@ function runnerPrefixLength(tokens) {
 }
 
 const PYTEST_DISCOVERY_OVERRIDE_FLAG_RE =
-  /^(?:-c|--config-file|--config|-o|--override-ini|--rootdir|--confcutdir|--pyargs|--noconftest|--import-mode|--ignore|--ignore-glob|--deselect)(?:=|$)/;
+  /^(?:--config-file|--config|--override-ini|--rootdir|--confcutdir|--pyargs|--noconftest|--import-mode|--ignore|--ignore-glob|--deselect)(?:=|$)|^-(?:[vqsx]*[cop]|k=|m=)|^-[cop]/;
+
+function isPytestDiscoveryOverrideToken(tok) {
+  return PYTEST_DISCOVERY_OVERRIDE_FLAG_RE.test(tok);
+}
 
 function droppedTokenIndexes(failed, passed) {
   const dropped = [];
@@ -818,7 +942,7 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   }
   if (
     runner.prefix.includes("pytest") &&
-    [...failed.slice(runner.end), ...passed.slice(runner.end)].some((tok) => PYTEST_DISCOVERY_OVERRIDE_FLAG_RE.test(tok))
+    [...failed.slice(runner.end), ...passed.slice(runner.end)].some((tok) => isPytestDiscoveryOverrideToken(tok))
   ) {
     return false;
   }

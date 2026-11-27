@@ -56,7 +56,7 @@ export function handleStop(stdinText, readTextFile) {
     return {};
   }
 
-  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const cwd = typeof payload.cwd === "string" && payload.cwd.trim().length > 0 ? payload.cwd : "";
   const transcriptPath = payloadTranscriptPath(payload);
   let ledger = null;
   let steps;

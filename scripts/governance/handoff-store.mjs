@@ -619,6 +619,18 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       if (isExemptDocOrAssetPath(relPath)) {
         const beforeDoc = baseline.docFiles?.[relPath];
         const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
+        const inGateRange = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
+        const gateDoc = activeGate?.docFiles?.[relPath];
+        const hasDefinitePostGateDocChange =
+          inGateRange &&
+          (gateDoc !== undefined
+            ? !sameFileSignature(gateDoc, nowDoc)
+            : !activeGate?.docFilesTruncated && nowDoc !== undefined);
+        if (hasDefinitePostGateDocChange) {
+          ledger.turnWrittenFiles.add(relPath);
+          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+          continue;
+        }
         if (beforeDoc === undefined && baseline.docFilesTruncated) {
           continue;
         }
@@ -626,18 +638,10 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
         if (!docChangedThisTurn) {
           continue;
         }
-        const inGateRange = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
-        const gateDoc = activeGate?.docFiles?.[relPath];
-        const docChangedAfterGate =
-          inGateRange &&
-          !(gateDoc !== undefined && sameFileSignature(gateDoc, nowDoc)) &&
-          !(gateDoc === undefined && activeGate?.docFilesTruncated);
-        if (docChangedAfterGate) {
-          ledger.turnWrittenFiles.add(relPath);
-          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
-        } else if (!inGateRange && !preGateKeepsToolDate(relPath)) {
+        const alreadyTrackedByTool = preGateKeepsToolDate(relPath);
+        ledger.turnWrittenFiles.add(relPath);
+        if (!alreadyTrackedByTool) {
           const preStep = preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex;
-          ledger.turnWrittenFiles.add(relPath);
           ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, preStep);
         }
       }

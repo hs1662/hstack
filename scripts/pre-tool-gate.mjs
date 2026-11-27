@@ -440,7 +440,7 @@ export function handlePreToolGate(stdinText, options = {}) {
   const transcriptPath = pickPreferredTranscriptPath(rawTranscriptPath);
   const rawConversationId = payload.conversationId ?? payload.conversation_id;
   const conversationId = typeof rawConversationId === "string" ? rawConversationId.trim() : "";
-  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const cwd = typeof payload.cwd === "string" && payload.cwd.trim().length > 0 ? payload.cwd : "";
 
   if (toolName === SUBAGENT_TOOL_NAME) {
     return handleSubagentPreTool(toolCall, { cwd, transcriptPath });

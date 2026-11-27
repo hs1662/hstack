@@ -93,7 +93,7 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
     const rawConversationId = payload.conversationId ?? payload.conversation_id;
     const conversationId = typeof rawConversationId === "string" ? rawConversationId.trim() : "";
     const latestStep = steps[steps.length - 1];
-    const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+    const cwd = typeof payload.cwd === "string" && payload.cwd.trim().length > 0 ? payload.cwd : "";
     const ledger = options.ledger ?? (transcriptPath ? readTurnLedger(transcriptPath, cwd, "") : null);
     const sessionRole = ledger?.transcriptAvailable ? ledger.sessionRole : detectSessionRoleFromHeaderSteps(steps);
     const tokens = ledger?.latestTokens ?? { inputTokens: null, cacheReadTokens: null, outputTokens: null };
@@ -206,7 +206,7 @@ function loadContextWithLedger(stdinText) {
   if (!payload) return null;
   const transcriptPath = payloadTranscriptPath(payload);
   if (!transcriptPath) return { payload, transcriptPath, steps: [] };
-  const cwd = typeof payload.cwd === "string" ? payload.cwd.trim() : "";
+  const cwd = typeof payload.cwd === "string" && payload.cwd.trim().length > 0 ? payload.cwd : "";
   return { payload, transcriptPath, ...readFactLedgerAndSteps(transcriptPath, cwd, "") };
 }
 

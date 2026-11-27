@@ -4300,11 +4300,47 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
   });
 
   it("R12-F4: preserves literal backslashes inside double quotes in R3 and R5 per POSIX rules", () => {
-    const decR3 = runPytestGate({}, 'pytest "tests/test_\\a.py"', 'pytest "tests/test_a.py"');
+    const repo = makeRepo();
+    const decR3 = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: 'pytest "tests/test_a.py"', outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "테스트 통과.",
+      },
+      {
+        cwd: repo,
+        ledger: {
+          transcriptAvailable: true,
+          sessionRole: "main",
+          turnStartStepIndex: 0,
+          sessionReadFiles: new Set(),
+          turnWrittenFiles: new Set(["app.mjs"]),
+          turnCodeWrittenFiles: new Set(["app.mjs"]),
+          turnCommittedFiles: new Set(),
+          turnInspectedFiles: new Set(),
+          turnFailedCommands: [],
+          turnGateAttempts: [],
+          turnSubagentAudits: [],
+          turnPreflightChallenges: [],
+          turnUserVotes: [],
+          turnExecutions: [
+            { kind: "verification", command: 'pytest "tests/test_\\a.py"', status: "ERROR", passed: false, stepIndex: 1, execCwd: repo },
+            { kind: "verification", command: 'pytest "tests/test_a.py"', status: "DONE", passed: true, stepIndex: 2, execCwd: repo },
+          ],
+          lastWriteStepIndex: 0,
+          lastCodeWriteStepIndex: 0,
+          hasActiveVerification: true,
+          hasFailingTestCommand: false,
+        },
+        testInfra: { hasTestSuite: true },
+        auditEscalation: "off",
+      },
+    );
     assert.equal(decR3.verdict, "REJECT");
     assert.ok(decR3.blockedRules.includes("R3_CONCEALED_FAILURE"), decR3.blockedRules.join(","));
 
-    const repo = makeRepo();
     const trR5 = join(createTempDir("hstack-p10-r12-f4-"), "t.jsonl");
     writeFileSync(
       trR5,
@@ -4381,11 +4417,10 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
       params: { name: "verify_completion", arguments: { ...gateCall.args, ...pre.overwrite } },
     });
     const text = out.result.content[0].text;
-    assert.ok(text.includes(VERDICT_HEADERS.REJECT), text);
-    assert.ok(text.includes("R3_CONCEALED_FAILURE"), text);
+    assert.ok(text.includes(VERDICT_HEADERS.REJECT_NEUTRAL), text);
+    assert.ok(text.includes("실패로 끝났습니다"), text);
 
     // Stop must also resolve gitRoot for spacedRepo and catch uncommitted code edits made via omitted Cwd
-    writeFileSync(join(spacedRepo, "app.mjs"), "export const a = 2;\n");
     const stopTx = join(parent, "stop-tx.jsonl");
     writeFileSync(
       stopTx,
@@ -4400,6 +4435,7 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
       JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId: "p10-r12-f5-stop", cwd: spacedRepo, transcriptPath: stopTx }),
       { dataDir: DATA_DIR, skipAuditLog: true },
     );
+    writeFileSync(join(spacedRepo, "app.mjs"), "export const a = 2;\n");
     const stopOut = handleStop(
       JSON.stringify({
         hookEventName: "Stop",
@@ -4465,6 +4501,10 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
     }
     writeFileSync(join(repo, "z_existing_doc.md"), "# pre-existing doc after 2000+ code files\n");
 
+    const snap = snapshotWorkingTree(repo);
+    assert.equal(snap.untrackedTruncated, true);
+    assert.ok(snap.docFiles["z_existing_doc.md"]);
+
     const res = runTurnOnRepo(repo, "p10-r12-f7-untracked-doc", [
       {
         cmd: "git add z_existing_doc.md && git commit -m add-existing-doc",
@@ -4475,12 +4515,16 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
         },
       },
       {
+        cmd: "node --test",
+        output: PASS_OUTPUT,
+      },
+      {
         gate: {
           modified_files: [],
           inspected_files: [],
-          verification_runs: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
           unverified_scope: [],
-          self_assessment: "기존 미추적 문서만 커밋했습니다.",
+          self_assessment: "기존 미추적 문서만 커밋하고 전체 테스트를 확인했습니다.",
         },
       },
     ]);
@@ -4558,9 +4602,9 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
     assert.equal(res1.reasons.includes("sensitive_path"), false);
 
     const resSafe = classifyRisk({
-      turnCodeWrittenFiles: ["secret/token.txt"],
-      config: { sensitivePatterns: ["[^/]+secret[\\]x]*"] },
+      turnCodeWrittenFiles: ["mysecret/token.txt"],
+      config: { sensitivePatterns: ["[^/]+secret/token[\\]x]*\\.txt"] },
     });
-    assert.equal(resSafe.tier, "TIER_2");
+    assert.equal(resSafe.tier, "TIER_1");
   });
 });

@@ -111,9 +111,11 @@ function isSafeCustomRegex(source) {
     } else if (ch === "[") {
       i += 1;
       if (trimmed[i] === "^") i += 1;
-      if (trimmed[i] === "]") i += 1;
       while (i < trimmed.length && trimmed[i] !== "]") {
         i += trimmed[i] === "\\" ? 2 : 1;
+      }
+      if (i >= trimmed.length) {
+        return false;
       }
       i += 1;
     } else if (ch === "(") {

@@ -273,7 +273,7 @@ export function createMcpServerHandler(options = {}) {
       sessionObj,
       conversationId: typeof sessionObj?.conversationId === "string" ? sessionObj.conversationId.trim() : "",
       transcriptPath: typeof sessionObj?.transcriptPath === "string" ? sessionObj.transcriptPath.trim() : "",
-      cwd: typeof sessionObj?.cwd === "string" ? sessionObj.cwd.trim() : "",
+      cwd: typeof sessionObj?.cwd === "string" && sessionObj.cwd.trim().length > 0 ? sessionObj.cwd : "",
     };
   }
 
