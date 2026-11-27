@@ -7186,3 +7186,260 @@ describe("H23 OMH round-19 regressions (F1-F14)", () => {
     assert.equal(ctrl.tryTake(), false, "must not steal lock held by live PID");
   });
 });
+
+describe("H24 OMH round-20 regressions (F1-F9)", () => {
+  it("R20-F1: preserves R3 block when inline shell rerun changes outer wrapper/env or shell binary", () => {
+    const runShellCase = (failCmd, passCmd) => {
+      const repo = makeRepo();
+      const txPath = join(createTempDir("hstack-p10-r20-f1-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "인라인 셸 바깥 문맥 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: "1 failed" },
+          { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repo } }] },
+          { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      return decideGate(
+        { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: passCmd, outcome: "pass" }], unverified_scope: [], self_assessment: "pytest 완료." },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+    };
+    for (const [failCmd, passCmd] of [
+      ['BACKEND=pg bash -c "pytest"', 'BACKEND=sqlite bash -c "pytest"'],
+      ['export BACKEND=pg && bash -c "pytest"', 'export BACKEND=sqlite && bash -c "pytest"'],
+      ['sh -c "pytest"', 'bash -c "pytest"'],
+    ]) {
+      const dec = runShellCase(failCmd, passCmd);
+      assert.equal(dec.verdict, "REJECT", `${failCmd} -> ${passCmd}`);
+      assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), `${failCmd} -> ${passCmd}: ${dec.blockedRules.join(",")}`);
+    }
+    const okDec = runShellCase('BACKEND=pg bash -c "pytest"', 'BACKEND=pg bash -c "pytest"');
+    assert.equal(okDec.verdict, "PASS", okDec.blockedRules.join(","));
+  });
+
+  it("R20-F2: rejects semantic-changing PYTEST_ADDOPTS flags (--runxfail / unknown) across R3 resolution while keeping display-only -q/--verbose", () => {
+    const runPyCase = (passCmd) => {
+      const repo = makeRepo();
+      const txPath = join(createTempDir("hstack-p10-r20-f2-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "PYTEST_ADDOPTS 의미 변경 옵션 차단" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: "1 failed" },
+          { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repo } }] },
+          { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      return decideGate(
+        { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: passCmd, outcome: "pass" }], unverified_scope: [], self_assessment: "pytest 완료." },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+    };
+    for (const badCmd of ['export PYTEST_ADDOPTS="--runxfail" && pytest', 'PYTEST_ADDOPTS="--runxfail" pytest', 'PYTEST_ADDOPTS="--unknown-plugin-flag" pytest']) {
+      const dec = runPyCase(badCmd);
+      assert.equal(dec.verdict, "REJECT", badCmd);
+      assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), `${badCmd}: ${dec.blockedRules.join(",")}`);
+    }
+    for (const okCmd of ['export PYTEST_ADDOPTS="-q" && pytest', 'export PYTEST_ADDOPTS="--verbose" && pytest']) {
+      const dec = runPyCase(okCmd);
+      assert.equal(dec.verdict, "PASS", `${okCmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R20-F3: prefers invocation execDir over --rootdir when locating pytest config without positional targets", () => {
+    const repo = makeRepo();
+    mkdirSync(join(repo, "other"), { recursive: true });
+    writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+    writeFileSync(join(repo, "other", "pytest.ini"), "[pytest]\naddopts = -q\n");
+    const txPath = join(createTempDir("hstack-p10-r20-f3-"), "t.jsonl");
+    const cmd = "pytest --rootdir=other";
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "대상 없는 rootdir 우선순위" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: cmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R20-F4: compares reserved pytest.toml/.pytest.toml names case-sensitively so custom PYTEST.TOML checks tool.pytest tables", () => {
+    for (const [fname, body] of [
+      ["PYTEST.TOML", '[tool.pytest.ini_options]\naddopts = "--collect-only"\n'],
+      ["PYTEST.TOML", "[tool.other]\nx = 1\n"],
+    ]) {
+      const repo = makeRepo();
+      writeFileSync(join(repo, fname), body);
+      const txPath = join(createTempDir("hstack-p10-r20-f4-"), "t.jsonl");
+      const cmd = `pytest -c ${fname}`;
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "대소문자 구분 TOML 테스트" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: cmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", `${fname}: ${body}`);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${fname}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R20-F5: never treats two opaque wrapper prep directories (env -C $A vs env -C $B) as equivalent", () => {
+    const repo = makeRepo();
+    const txPath = join(createTempDir("hstack-p10-r20-f5-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "불투명 준비 서명 비동등 테스트" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "env -C $A npm ci && pytest", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: "1 failed" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "env -C $B npm ci && pytest", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: "env -C $B npm ci && pytest", outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R20-F6: tracks shell allexport (-a / -o allexport) across inline shells and rejects unsupported shell modes", () => {
+    assert.notEqual(classifyCommand('bash -r -c "pytest"'), "verification", "unsupported restricted shell mode must be rejected");
+    for (const cmd of [
+      `bash -ac "PYTEST_ADDOPTS='--collect-only' && pytest"`,
+      `bash -o allexport -c "PYTEST_ADDOPTS='--collect-only' && pytest"`,
+      `sh -c "set -a && PYTEST_ADDOPTS='--collect-only' && pytest"`,
+      "set -o allexport && PYTEST_ADDOPTS='--collect-only' && pytest",
+    ]) {
+      const repo = makeRepo();
+      const txPath = join(createTempDir("hstack-p10-r20-f6-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "allexport 추적 테스트" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 collected" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: cmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", cmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R20-F7: handles valueless export in both safe verification and collect-only rejection while blocking hijack exports", () => {
+    assert.equal(classifyCommand("PYTEST_ADDOPTS=-q && export PYTEST_ADDOPTS && pytest"), "verification");
+    assert.notEqual(classifyCommand("export NODE_OPTIONS && pytest"), "verification");
+    assert.notEqual(classifyCommand("export PATH && pytest"), "verification");
+
+    const runExportCase = (cmd) => {
+      const repo = makeRepo();
+      const txPath = join(createTempDir("hstack-p10-r20-f7-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "valueless export 양방향 테스트" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      return decideGate(
+        { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: cmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+    };
+    const passDec = runExportCase("PYTEST_ADDOPTS=-q && export PYTEST_ADDOPTS && pytest");
+    assert.equal(passDec.verdict, "PASS", passDec.blockedRules.join(","));
+    const failDec = runExportCase("PYTEST_ADDOPTS='--collect-only' && export PYTEST_ADDOPTS && pytest");
+    assert.equal(failDec.verdict, "REJECT");
+    assert.ok(failDec.blockedRules.includes("R2_STALE_VERIFICATION"), failDec.blockedRules.join(","));
+  });
+
+  it("R20-F8: returns null only when initial lstat fails with ENOENT, returning unreadable sentinel on mid-inspection vanish or dev/ino swap", () => {
+    const repo = createTempDir("hstack-p10-r20-f8-");
+    writeFileSync(join(repo, "swap.mjs"), "hello\n");
+    assert.equal(statSnapshotFile(repo, "never-existed.mjs"), null);
+
+    const realSt = lstatSync(join(repo, "swap.mjs"));
+    const enoentErr = Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+    const vanishSig = statSnapshotFile(repo, "swap.mjs", {
+      fsOps: {
+        lstatSync: () => realSt,
+        openSync: () => { throw enoentErr; },
+      },
+    });
+    assert.equal(typeof vanishSig, "string", `post-lstat ENOENT must return sentinel, got ${JSON.stringify(vanishSig)}`);
+
+    const swapSig = statSnapshotFile(repo, "swap.mjs", {
+      fsOps: {
+        lstatSync: () => realSt,
+        openSync: () => 999,
+        fstatSync: () => ({ ...realSt, isFile: () => true, ino: realSt.ino + 1 }),
+        readSync: () => 0,
+        closeSync: () => {},
+      },
+    });
+    assert.equal(typeof swapSig, "string", `dev/ino mismatch must return sentinel, got ${JSON.stringify(swapSig)}`);
+  });
+
+  it("R20-F9: serializes stale lock reclaim with rename so concurrent reclaimers cannot delete a newly acquired live lock", () => {
+    const base = createTempDir("hstack-p10-r20-f9-");
+    const lockDir = join(base, "cpu.lock");
+    const ctrlA = testHelpers.createCpuLockController(lockDir);
+    const ctrlB = testHelpers.createCpuLockController(lockDir);
+    assert.equal(typeof ctrlA.reclaimStaleLock, "function", "reclaimStaleLock must be exported on controller");
+    assert.equal(typeof ctrlA.holdReclaimLockForTest, "function", "holdReclaimLockForTest must support contention test");
+
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "pid"), "99999999:dead");
+
+    // Reclaimer A enters reclaim section, removes dead lock, then live owner C acquires before A finishes,
+    // and meanwhile Reclaimer B must observe reclaim lock or fail to touch C's newly acquired lock.
+    assert.equal(ctrlA.reclaimStaleLock(), true);
+    const tokenC = ctrlA.tryTake();
+    assert.ok(typeof tokenC === "string" && tokenC.length > 0);
+    assert.equal(ctrlB.reclaimStaleLock(), false, "concurrent reclaimer must not remove live lock C");
+    assert.equal(readFileSync(join(lockDir, "pid"), "utf8").trim(), tokenC);
+  });
+});
