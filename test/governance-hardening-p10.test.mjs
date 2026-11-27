@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS, isExemptDocOrAssetPath } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
-import { classifyCommand, commandMatchesExpectedTokens, detectTestInfrastructure, extractChainPrepSignature, extractToolPaths, inferExecutionFailure, listCommittedPaths, normalizeWorkspacePath, readFactLedger, readGitLedger, readNumstatSinceHead, readSessionRole, resolveGitRootFast, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
+import { classifyCommand, commandMatchesExpectedTokens, detectTestInfrastructure, extractChainPrepSignature, extractToolPaths, inferExecutionFailure, listCommittedPaths, normalizeWorkspacePath, readFactLedger, readGitLedger, readNumstatSinceHead, readSessionRole, resolveGitRootFast, snapshotWorkingTree, statSnapshotFile } from "../scripts/governance/fact-ledger.mjs";
 import { computeWorkspaceKey, loadHandoffSnapshot, mergeShellWrittenFiles, resolveEffectiveConversationKey, resolveSessionStatePath, saveGateSnapshot, saveHandoffSnapshot, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
 import { classifyRisk } from "../scripts/governance/risk-classifier.mjs";
 import { readTranscriptSteps } from "../scripts/hook-io.mjs";
@@ -6484,17 +6484,126 @@ describe("H21 OMH gpt-6.2-astra round-17 regressions (P1 F1-F8, P2 F9-F11)", () 
 
   it("R17-F11: resolves Windows drive-letter and UNC paths in cd commands without appending to previous cwd", () => {
     const repo = makeRepo();
-    const txPath = join(createTempDir("hstack-p10-r17-f11-"), "t.jsonl");
+    for (const [failCmd, failCwd, passCwd] of [
+      ["cd D:/proj && node --test test/a.test.mjs", "C:/base", "D:\\proj"],
+      ["cd //server/share/proj && node --test test/a.test.mjs", "C:/base", "\\\\server\\share\\proj"],
+    ]) {
+      const txPath = join(createTempDir("hstack-p10-r17-f11-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "테스트" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: failCwd } }] },
+          { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: FAIL_OUTPUT },
+          { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: passCwd } }] },
+          { step_index: 6, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "전체 재실행 통과.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "PASS", `${failCmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+});
+
+describe("H22 OMH gpt-6.2-astra round-18 regressions (P1 F1-F11, P2 F12)", () => {
+  it("R18-F1: handles combined wrapper flags (-iCdir) and fails closed on unknown wrapper options", () => {
+    for (const cmd of ["env -iCpackages/sub pytest", "env -iC packages/sub pytest", "env --unknown-flag pytest"]) {
+      const repo = makeRepo();
+      const subDir = join(repo, "packages", "sub");
+      mkdirSync(subDir, { recursive: true });
+      writeFileSync(join(subDir, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+      const txPath = join(createTempDir("hstack-p10-r18-f1-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", cmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R18-F2: preserves exported PYTEST_ADDOPTS on unset -f while clearing on unset -v or plain unset", () => {
+    const runWithUnset = (cmd) => {
+      const repo = makeRepo();
+      const txPath = join(createTempDir("hstack-p10-r18-f2-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+    };
+
+    const decFuncUnset = runWithUnset('export PYTEST_ADDOPTS="--collect-only" && unset -f PYTEST_ADDOPTS && pytest');
+    assert.equal(decFuncUnset.verdict, "REJECT");
+    assert.ok(decFuncUnset.blockedRules.includes("R2_STALE_VERIFICATION"), decFuncUnset.blockedRules.join(","));
+
+    const decVarUnset = runWithUnset('export PYTEST_ADDOPTS="--collect-only" && unset -v PYTEST_ADDOPTS && pytest');
+    assert.equal(decVarUnset.verdict, "PASS", decVarUnset.blockedRules.join(","));
+
+    const decPlainUnset = runWithUnset('export PYTEST_ADDOPTS="--collect-only" && unset PYTEST_ADDOPTS && pytest');
+    assert.equal(decPlainUnset.verdict, "PASS", decPlainUnset.blockedRules.join(","));
+  });
+
+  it("R18-F3: rejects R3 resolution when identical argv runs with a narrowing chain-exported PYTEST_ADDOPTS filter", () => {
+    const repo = makeRepo();
+    const failCmd = "pytest";
+    const passCmd = 'export PYTEST_ADDOPTS="-k foo" && pytest';
+    const txPath = join(createTempDir("hstack-p10-r18-f3-"), "t.jsonl");
     writeFileSync(
       txPath,
       toJsonl([
-        { step_index: 0, type: "USER_INPUT", content: "테스트" },
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
         { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
         { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
-        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "cd D:/proj && node --test test/a.test.mjs", Cwd: "C:/base" } }] },
-        { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: FAIL_OUTPUT },
-        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: "D:\\proj" } }] },
-        { step_index: 6, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
       ]),
     );
     const gl = readGitLedger(repo);
@@ -6502,12 +6611,286 @@ describe("H21 OMH gpt-6.2-astra round-17 regressions (P1 F1-F8, P2 F9-F11)", () 
       {
         modified_files: ["app.mjs"],
         inspected_files: [],
-        verification_runs: [{ command: "node --test", outcome: "pass" }],
+        verification_runs: [{ command: passCmd, outcome: "pass" }],
         unverified_scope: [],
-        self_assessment: "전체 재실행 통과.",
+        self_assessment: "pytest 완료.",
       },
       { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
     );
-    assert.equal(dec.verdict, "PASS", dec.blockedRules.join(","));
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R18-F4: parses [tool:pytest] from custom .cfg paths passed via -c or PYTEST_ADDOPTS=-c", () => {
+    for (const cmd of ['PYTEST_ADDOPTS="-c custom.cfg" pytest', "pytest -c custom.cfg"]) {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "custom.cfg"), "[tool:pytest]\naddopts = --collect-only\n");
+      const txPath = join(createTempDir("hstack-p10-r18-f4-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "cache" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", cmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R18-F5: rejects pytest --cache-show and --version-verbose across CLI, env PYTEST_ADDOPTS, and INI addopts", () => {
+    for (const [ini, cmd] of [
+      [null, "pytest --cache-show"],
+      [null, "pytest --cache-show=foo"],
+      [null, "pytest --version-verbose"],
+      [null, 'PYTEST_ADDOPTS="--cache-show" pytest'],
+      ["[pytest]\naddopts = --cache-show\n", "pytest"],
+    ]) {
+      const repo = makeRepo();
+      if (ini) writeFileSync(join(repo, "pytest.ini"), ini);
+      const txPath = join(createTempDir("hstack-p10-r18-f5-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "cache entries" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", `${ini ?? "no-ini"} | ${cmd}`);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R18-F6: inspects pytest configs inside inline sh/bash -c verification commands recursively", () => {
+    for (const cmd of ['bash -c "pytest"', 'sh -c "cd packages/sub && pytest"']) {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+      const subDir = join(repo, "packages", "sub");
+      mkdirSync(subDir, { recursive: true });
+      writeFileSync(join(subDir, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+
+      const txPath = join(createTempDir("hstack-p10-r18-f6-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", cmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R18-F7: strips attached log redirections before extracting pytest executable so pytest>out.log still checks config", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+    const cmd = "pytest>test.log";
+    const txPath = join(createTempDir("hstack-p10-r18-f7-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: cmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R18-F8: falls back to first target directory config when common ancestor has no pytest config or setup.py", () => {
+    const repo = makeRepo();
+    const pkgA = join(repo, "packages", "a");
+    const pkgB = join(repo, "packages", "b");
+    mkdirSync(pkgA, { recursive: true });
+    mkdirSync(pkgB, { recursive: true });
+    writeFileSync(join(pkgA, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+    writeFileSync(join(pkgA, "test_a.py"), "def test_a(): assert True\n");
+    writeFileSync(join(pkgB, "test_b.py"), "def test_b(): assert True\n");
+
+    const cmd = "pytest packages/a/test_a.py packages/b/test_b.py";
+    const txPath = join(createTempDir("hstack-p10-r18-f8-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: cmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R18-F9: opens POSIX FIFOs non-blockingly so bounded readers return uncertain quickly instead of hanging", () => {
+    if (process.platform === "win32") return;
+    const repo = createTempDir("hstack-p10-r18-f9-");
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@example.com"]);
+    git(repo, ["config", "user.name", "T"]);
+    writeFileSync(join(repo, "app.mjs"), "export const v = 1;\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-qm", "init"]);
+
+    execFileSync("mkfifo", [join(repo, "setup.cfg")]);
+    execFileSync("mkfifo", [join(repo, "pytest.ini")]);
+
+    const t0 = Date.now();
+    const infra = detectTestInfrastructure(repo, repo);
+    assert.ok(Date.now() - t0 < 500, "detectTestInfrastructure hung on FIFO");
+    assert.equal(infra.uncertain, true, JSON.stringify(infra));
+
+    const txPath = join(createTempDir("hstack-p10-r18-f9-tx-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const t1 = Date.now();
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: infra, auditEscalation: "off" },
+    );
+    assert.ok(Date.now() - t1 < 500, "decideGate hung on FIFO pytest.ini");
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R18-F10: propagates uncertain when detectTestInfrastructure inspects a missing or inaccessible root dir", () => {
+    const repo = makeRepo();
+    const missingDir = join(createTempDir("hstack-p10-r18-f10-"), "missing-subdir");
+    const infra = detectTestInfrastructure(missingDir, null);
+    assert.equal(infra.uncertain, true, JSON.stringify(infra));
+
+    const txPath = join(createTempDir("hstack-p10-r18-f10-tx-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "not_applicable", reason_if_na: "테스트 없음" }],
+        unverified_scope: ["실행 검증 미실시"],
+        self_assessment: "수정 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: infra, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R18-F11: tracks files named __proto__ across snapshot, JSON round-trip, and Stop without prototype shadowing", () => {
+    const repo = makeRepo();
+    const res = runTurnOnRepo(repo, "p10-r18-f11-proto", [
+      {
+        cmd: "touch __proto__",
+        output: "ok",
+        effect: (r) => writeFileSync(join(r, "__proto__"), "export const x = 1;\n"),
+      },
+    ]);
+    assertGateBlocked(res.out);
+  });
+
+  it("R18-F12: bounds snapshot hashing by fstat size and skips FIFO special files without hanging", () => {
+    const repo = createTempDir("hstack-p10-r18-f12-");
+    writeFileSync(join(repo, "big.bin"), Buffer.alloc(1024 * 1024 + 64, 65));
+    const bigSig = statSnapshotFile(repo, "big.bin");
+    assert.ok(Array.isArray(bigSig) && bigSig.length === 3, JSON.stringify(bigSig));
+
+    if (process.platform !== "win32") {
+      execFileSync("mkfifo", [join(repo, "pipe.fifo")]);
+      const t0 = Date.now();
+      const fifoSig = statSnapshotFile(repo, "pipe.fifo");
+      assert.ok(Date.now() - t0 < 500, "statSnapshotFile hung on FIFO");
+      assert.equal(fifoSig, null);
+    }
   });
 });
