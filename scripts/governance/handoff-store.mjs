@@ -421,6 +421,7 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
           gitRoot: snapshot.gitRoot,
           head: snapshot.head,
           files: snapshot.files,
+          docFiles: snapshot.docFiles ?? null,
           untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
           untrackedTruncated: Boolean(snapshot.untrackedTruncated),
           capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
@@ -465,6 +466,7 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
           gate: {
             head: snapshot.head,
             files: snapshot.files,
+            docFiles: snapshot.docFiles ?? null,
             untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
             untrackedTruncated: Boolean(snapshot.untrackedTruncated),
             capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
@@ -494,6 +496,8 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   }
   // head is null for a snapshot that predates HEAD recording, so no commit range is checked.
   const headOf = (raw) => (typeof raw?.head === "string" ? raw.head : null);
+  const docFilesOf = (raw) =>
+    raw?.docFiles && typeof raw.docFiles === "object" && !Array.isArray(raw.docFiles) ? raw.docFiles : null;
   const untrackedOf = (raw) =>
     raw?.untrackedFiles && typeof raw.untrackedFiles === "object" && !Array.isArray(raw.untrackedFiles) ? raw.untrackedFiles : null;
   const capturedAtOf = (raw) => (Number.isFinite(raw?.capturedAtMs) ? raw.capturedAtMs : null);
@@ -503,6 +507,7 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
       ? {
           head: headOf(snap.gate),
           files: gateFiles,
+          docFiles: docFilesOf(snap.gate),
           untrackedFiles: untrackedOf(snap.gate),
           untrackedTruncated: Boolean(snap.gate?.untrackedTruncated),
           capturedAtMs: capturedAtOf(snap.gate),
@@ -513,6 +518,7 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
     gitRoot: snap.gitRoot,
     head: headOf(snap),
     files: snap.files,
+    docFiles: docFilesOf(snap),
     untrackedFiles: untrackedOf(snap),
     untrackedTruncated: Boolean(snap.untrackedTruncated),
     capturedAtMs: capturedAtOf(snap),
@@ -607,6 +613,12 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     for (const relPath of sinceTurn) {
       ledger.turnCommittedFiles.add(relPath);
       if (isExemptDocOrAssetPath(relPath)) {
+        const beforeDoc = baseline.docFiles?.[relPath];
+        const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
+        const docChangedThisTurn = beforeDoc !== undefined ? !sameFileSignature(beforeDoc, nowDoc) : nowDoc !== undefined;
+        if (!docChangedThisTurn) {
+          continue;
+        }
         const isPostGate = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
         const docStep = isPostGate
           ? datingStep(postGateShell)

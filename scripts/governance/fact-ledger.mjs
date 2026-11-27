@@ -1116,8 +1116,8 @@ function isMakeVerification(args) {
   for (let i = 0; i < blockedArgs.length; i += 1) {
     const arg = blockedArgs[i];
     if (!arg.startsWith("-") && arg.includes("=")) {
-      const assignMatch = /^([A-Za-z0-9_.-]+)\s*(?::::=|::=|:=|!=|\?=|\+=|=)/.exec(arg);
-      if (!assignMatch || MAKE_BLOCKED_VARS.has(assignMatch[1])) {
+      const assignMatch = /^([A-Za-z0-9_.-]+)\s*(::::=|:::=|::=|:=|!=|\?=|\+=|=)/.exec(arg);
+      if (!assignMatch || assignMatch[2] === "!=" || MAKE_BLOCKED_VARS.has(assignMatch[1])) {
         return false;
       }
       continue;
@@ -3203,7 +3203,9 @@ export function snapshotWorkingTree(cwd) {
     }
   }
   const files = {};
+  const docFiles = {};
   let trackedCodeCount = 0;
+  let trackedDocCount = 0;
   const trackedTokens = trackedOut.split("\0");
   for (let i = 0; i < trackedTokens.length; i += 1) {
     const entry = trackedTokens[i];
@@ -3221,6 +3223,10 @@ export function snapshotWorkingTree(cwd) {
     const candidates = isRename && origPath && origPath !== destPath ? [origPath, destPath] : [destPath];
     for (const relPath of candidates) {
       if (isExemptDocOrAssetPath(relPath)) {
+        if (trackedDocCount < SNAPSHOT_MAX_FILES) {
+          trackedDocCount += 1;
+          docFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+        }
         continue;
       }
       trackedCodeCount += 1;
@@ -3243,7 +3249,14 @@ export function snapshotWorkingTree(cwd) {
     });
     let untrackedCodeCount = 0;
     for (const relPath of untrackedOut.split("\0")) {
-      if (!relPath || isExemptDocOrAssetPath(relPath)) {
+      if (!relPath) {
+        continue;
+      }
+      if (isExemptDocOrAssetPath(relPath)) {
+        if (trackedDocCount < SNAPSHOT_MAX_FILES) {
+          trackedDocCount += 1;
+          docFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+        }
         continue;
       }
       untrackedCodeCount += 1;
@@ -3259,7 +3272,7 @@ export function snapshotWorkingTree(cwd) {
     untrackedFiles = null;
   }
 
-  return { gitRoot, head, files, untrackedFiles, untrackedTruncated, capturedAtMs: Date.now() };
+  return { gitRoot, head, files, docFiles, untrackedFiles, untrackedTruncated, capturedAtMs: Date.now() };
 }
 
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -3302,6 +3315,7 @@ export function readGitLedger(cwd) {
     gitAvailable: false,
     gitRoot: null,
     gitDirtyFiles: new Set(),
+    dirtyFilesAvailable: false,
     diffNumstat: new Map(),
     numstatUnavailable: false,
     gitBranch: "",
@@ -3332,7 +3346,7 @@ export function readGitLedger(cwd) {
         stdio: ["ignore", "pipe", "ignore"],
       });
     } catch {
-      return { ...empty, gitAvailable: true, gitRoot, numstatUnavailable: true };
+      return { ...empty, gitAvailable: true, gitRoot, dirtyFilesAvailable: false, numstatUnavailable: true };
     }
 
     const gitDirtyFiles = new Set();
@@ -3438,7 +3452,7 @@ export function readGitLedger(cwd) {
       }
     }
 
-    return { gitAvailable: true, gitRoot, gitDirtyFiles, diffNumstat, numstatUnavailable, gitBranch, gitHead };
+    return { gitAvailable: true, gitRoot, gitDirtyFiles, dirtyFilesAvailable: true, diffNumstat, numstatUnavailable, gitBranch, gitHead };
   } catch {
     return empty;
   }

@@ -39,11 +39,12 @@ function isBareRuntimeLauncher(normCmd) {
   return !normCmd.includes(" ") && BARE_RUNTIME_LAUNCHERS.has(normCmd);
 }
 
-function normalizeExecDir(dir) {
-  if (typeof dir !== "string" || dir.trim().length === 0) {
+function normalizeExecDir(dir, { preserveSpaces = false } = {}) {
+  if (typeof dir !== "string" || (preserveSpaces ? dir.length === 0 : dir.trim().length === 0)) {
     return ".";
   }
-  const norm = posix.normalize(dir.trim().replace(/\\/g, "/"));
+  const raw = preserveSpaces ? dir : dir.trim();
+  const norm = posix.normalize(raw.replace(/\\/g, "/"));
   return norm.length > 1 ? norm.replace(/\/+$/, "") : norm;
 }
 
@@ -93,12 +94,12 @@ function extractVerificationEntries(cmd, baseDir = ".") {
         state = advanceDir(state, segTokens[0], dirArg, seq);
       } else {
         const nextDir = dirArg.startsWith("/")
-          ? normalizeExecDir(dirArg)
+          ? normalizeExecDir(dirArg, { preserveSpaces: true })
           : state.dir.startsWith("opaque:")
             ? `${state.dir}/${dirArg}`
             : state.dir === "."
-              ? normalizeExecDir(dirArg)
-              : normalizeExecDir(`${state.dir}/${dirArg}`);
+              ? normalizeExecDir(dirArg, { preserveSpaces: true })
+              : normalizeExecDir(`${state.dir}/${dirArg}`, { preserveSpaces: true });
         const stack = segTokens[0] === "pushd" ? [...state.stack, state.dir] : state.stack;
         state = { dir: nextDir, stack };
       }
@@ -164,11 +165,14 @@ function normalizeTestpathItem(raw) {
   return raw.trim().replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
 }
 
-function splitQuotedWhitespace(rawValue, { splitComma = false } = {}) {
+const SHELL_EXPANSION_META_RE = /[*?[\]~$`{}]/;
+
+function splitQuotedWhitespaceWithMeta(rawValue, { splitComma = false } = {}) {
   const items = [];
   let cur = "";
   let quote = null;
   let hasToken = false;
+  let hadUnquotedMeta = false;
   for (let i = 0; i < rawValue.length; i += 1) {
     const ch = rawValue[i];
     if (quote) {
@@ -195,11 +199,15 @@ function splitQuotedWhitespace(rawValue, { splitComma = false } = {}) {
     }
     if (/\s/.test(ch) || (splitComma && ch === ",")) {
       if (hasToken) {
-        items.push(cur);
+        items.push({ value: cur, hadUnquotedMeta });
         cur = "";
         hasToken = false;
+        hadUnquotedMeta = false;
       }
       continue;
+    }
+    if (SHELL_EXPANSION_META_RE.test(ch)) {
+      hadUnquotedMeta = true;
     }
     cur += ch;
     hasToken = true;
@@ -208,9 +216,14 @@ function splitQuotedWhitespace(rawValue, { splitComma = false } = {}) {
     return null;
   }
   if (hasToken) {
-    items.push(cur);
+    items.push({ value: cur, hadUnquotedMeta });
   }
   return items;
+}
+
+function splitQuotedWhitespace(rawValue, opts) {
+  const meta = splitQuotedWhitespaceWithMeta(rawValue, opts);
+  return meta ? meta.map((t) => t.value) : null;
 }
 
 function decodeTomlStringToken(rawBody, startIdx) {
@@ -431,6 +444,98 @@ function sectionHasUnsupportedTestpathsKey(sectionBody) {
   return false;
 }
 
+function parseTomlKeySegments(rawKeyPart) {
+  const segs = [];
+  let i = 0;
+  while (i < rawKeyPart.length) {
+    while (i < rawKeyPart.length && /[ \t.]/.test(rawKeyPart[i])) {
+      i += 1;
+    }
+    if (i >= rawKeyPart.length) {
+      break;
+    }
+    const ch = rawKeyPart[i];
+    if (ch === '"' || ch === "'") {
+      const dec = decodeTomlStringToken(rawKeyPart, i);
+      if (!dec) {
+        return null;
+      }
+      segs.push(dec.value);
+      i = dec.nextIdx;
+    } else {
+      const m = /^[A-Za-z0-9_-]+/.exec(rawKeyPart.slice(i));
+      if (!m) {
+        return null;
+      }
+      segs.push(m[0]);
+      i += m[0].length;
+    }
+  }
+  return segs;
+}
+
+function tomlHasOtherPytestConfig(text, hasPrimaryIniOptions) {
+  let currentTable = [];
+  let iniOptionsCount = 0;
+  const lines = text.split(/\r?\n/);
+  for (const rawLine of lines) {
+    const t = rawLine.trim();
+    if (!t || t.startsWith("#")) {
+      continue;
+    }
+    if (t.startsWith("[")) {
+      const closeIdx = t.startsWith("[[") ? t.indexOf("]]") : t.indexOf("]");
+      if (closeIdx === -1) {
+        return true;
+      }
+      const headerBody = t.slice(t.startsWith("[[") ? 2 : 1, closeIdx).trim();
+      const segs = parseTomlKeySegments(headerBody);
+      if (!segs) {
+        if (/pytest/i.test(headerBody)) {
+          return true;
+        }
+        currentTable = [];
+        continue;
+      }
+      currentTable = segs;
+      if (segs.length === 3 && segs[0] === "tool" && segs[1] === "pytest" && segs[2] === "ini_options") {
+        iniOptionsCount += 1;
+        if (iniOptionsCount > 1 || !hasPrimaryIniOptions) {
+          return true;
+        }
+      } else if (segs.length >= 2 && segs[0] === "tool" && segs[1] === "pytest") {
+        return true;
+      }
+      continue;
+    }
+    const eqPos = t.indexOf("=");
+    if (eqPos !== -1) {
+      const keyPart = t.slice(0, eqPos).trim();
+      const keySegs = parseTomlKeySegments(keyPart);
+      if (!keySegs) {
+        if (/pytest/i.test(keyPart)) {
+          return true;
+        }
+        continue;
+      }
+      const fullPath = [...currentTable, ...keySegs];
+      if (fullPath.length >= 2 && fullPath[0] === "tool" && fullPath[1] === "pytest") {
+        const isDirectIniOption =
+          hasPrimaryIniOptions &&
+          currentTable.length === 3 &&
+          currentTable[0] === "tool" &&
+          currentTable[1] === "pytest" &&
+          currentTable[2] === "ini_options" &&
+          keySegs.length === 1;
+        if (!isDirectIniOption) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 function readPytestTestpaths(execDir) {
   if (!execDir || !existsSync(execDir)) {
     return { restricted: false, paths: [] };
@@ -451,9 +556,9 @@ function readPytestTestpaths(execDir) {
   if (existsSync(pyprojPath)) {
     try {
       const text = readFileSync(pyprojPath, "utf8");
-      const sect = /\[tool\.pytest\.ini_options\]([\s\S]*?)(?:\n\[|$)/.exec(text);
+      const sect = /^\[tool\.pytest\.ini_options\][ \t]*(?:#.*)?\r?\n([\s\S]*?)(?=\r?\n\[|$)/m.exec(text);
       if (sect) {
-        if (sectionHasUnsupportedTestpathsKey(sect[1])) {
+        if (tomlHasOtherPytestConfig(text, true) || sectionHasUnsupportedTestpathsKey(sect[1])) {
           return { restricted: true, paths: [] };
         }
         if (!/(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=/.test(sect[1])) {
@@ -475,7 +580,7 @@ function readPytestTestpaths(execDir) {
         }
         return { restricted: true, paths: [] };
       }
-      if (/^\[(?:["']?tool["']?\s*\.\s*["']?pytest["']?\b)/m.test(text)) {
+      if (/^\[(?:["']?tool["']?\s*\.\s*["']?pytest["']?\b)/m.test(text) || tomlHasOtherPytestConfig(text, false)) {
         return { restricted: true, paths: [] };
       }
     } catch {
@@ -502,11 +607,62 @@ function readPytestTestpaths(execDir) {
   return { restricted: false, paths: [] };
 }
 
-const RUNNER_VALUE_FLAGS = new Set([
+const PYTEST_VALUE_FLAGS = new Set([
   "-c",
   "--config",
+  "-k",
+  "-m",
+  "-o",
+  "-p",
+  "-r",
+  "-W",
+  "-n",
+  "--rootdir",
+  "--confcutdir",
+  "--junitxml",
+  "--maxfail",
+  "--tb",
+  "--ignore",
+  "--deselect",
+  "--basetemp",
+  "--cov",
+  "--cov-report",
+]);
+const JEST_VALUE_FLAGS = new Set([
+  "-c",
+  "--config",
+  "-t",
+  "--testNamePattern",
+  "--testPathPattern",
+  "--testPathIgnorePatterns",
+  "--rootDir",
+  "--projects",
+  "--selectProjects",
+  "--outputFile",
+  "--reporters",
+  "--setupFiles",
+  "--setupFilesAfterEnv",
+  "--maxWorkers",
+  "--shard",
+]);
+const VITEST_VALUE_FLAGS = new Set([
+  "-c",
+  "--config",
+  "-t",
+  "--testNamePattern",
   "-r",
   "--reporter",
+  "--root",
+  "--dir",
+  "--environment",
+  "--mode",
+  "--project",
+  "--outputFile",
+  "--coverage.reporter",
+  "--shard",
+  "--maxWorkers",
+]);
+const NODE_TEST_VALUE_FLAGS = new Set([
   "--test-reporter",
   "--test-reporter-destination",
   "--test-name-pattern",
@@ -514,36 +670,38 @@ const RUNNER_VALUE_FLAGS = new Set([
   "--test-shard",
   "--test-concurrency",
   "--test-timeout",
-  "-t",
-  "--testNamePattern",
-  "--testPathPattern",
-  "--testPathIgnorePatterns",
-  "--root",
-  "--dir",
-  "--environment",
-  "--mode",
-  "--project",
-  "--projects",
-  "--outputFile",
-  "--coverage.reporter",
-  "--setupFiles",
-  "--setupFilesAfterEnv",
-  "-k",
-  "-m",
-  "-o",
-  "--rootdir",
-  "--confcutdir",
-  "--junitxml",
-  "-n",
-  "--maxfail",
-  "--tb",
-  "-p",
   "--import",
   "--require",
   "--loader",
   "--env-file",
+  "--conditions",
+  "-r",
+  "-C",
   "--tsconfig",
 ]);
+const GENERIC_RUNNER_VALUE_FLAGS = new Set([
+  "-c",
+  "--config",
+  "-t",
+  "--test-name-pattern",
+  "--testNamePattern",
+  "--filter",
+  "-w",
+  "--workspace",
+  "--reporter",
+  "-r",
+]);
+
+function runnerValueFlagsFor(runnerPrefix) {
+  if (!Array.isArray(runnerPrefix)) {
+    return GENERIC_RUNNER_VALUE_FLAGS;
+  }
+  if (runnerPrefix.includes("pytest")) return PYTEST_VALUE_FLAGS;
+  if (runnerPrefix.includes("jest")) return JEST_VALUE_FLAGS;
+  if (runnerPrefix.includes("vitest")) return VITEST_VALUE_FLAGS;
+  if (runnerPrefix[0] === "node" && runnerPrefix[1] === "--test") return NODE_TEST_VALUE_FLAGS;
+  return GENERIC_RUNNER_VALUE_FLAGS;
+}
 
 function isDefaultDiscoverableTestTarget(target, runnerPrefix, execDir = "") {
   const unquoted = target.replace(/^['"]|['"]$/g, "");
@@ -634,8 +792,9 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   if (!dropped || dropped.length === 0 || dropped.some((index) => index < runner.end)) {
     return false;
   }
+  const runnerValueFlags = runnerValueFlagsFor(runner.prefix);
   const isTarget = (tokens, index) =>
-    isPathTarget(tokens[index], runner.prefix) && !(index - 1 >= runner.end && RUNNER_VALUE_FLAGS.has(tokens[index - 1]));
+    isPathTarget(tokens[index], runner.prefix) && !(index - 1 >= runner.end && runnerValueFlags.has(tokens[index - 1]));
   const droppedOnlyTargets = dropped.every((index) =>
     failed[index] === "--"
       ? failed.slice(index + 1).every((_, k) => dropped.includes(index + 1 + k))
@@ -653,7 +812,7 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
         continue;
       }
       if (tok.startsWith("-")) {
-        if (RUNNER_VALUE_FLAGS.has(tok) && i + 1 < tokens.length) {
+        if (runnerValueFlags.has(tok) && i + 1 < tokens.length) {
           i += 1;
         }
         continue;
@@ -880,12 +1039,16 @@ export function formatGateReceipt({
   return lines.join("\n");
 }
 
+function metaTokenEqual(a, b) {
+  return a.value === b.value && a.hadUnquotedMeta === b.hadUnquotedMeta;
+}
+
 function tokensEqualExact(a, b) {
-  return a.length === b.length && a.every((tok, idx) => tok === b[idx]);
+  return a.length === b.length && a.every((tok, idx) => metaTokenEqual(tok, b[idx]));
 }
 
 function tokensPrefixMatch(prefixTokens, fullTokens) {
-  return fullTokens.length > prefixTokens.length && prefixTokens.every((tok, idx) => fullTokens[idx] === tok);
+  return fullTokens.length > prefixTokens.length && prefixTokens.every((tok, idx) => metaTokenEqual(tok, fullTokens[idx]));
 }
 
 function commandMatchesExecution(rawClaim, execCommand) {
@@ -894,10 +1057,10 @@ function commandMatchesExecution(rawClaim, execCommand) {
   if (claimText.length === 0 || execText.length === 0) {
     return false;
   }
-  const claimTokens = splitQuotedWhitespace(claimText);
-  const execTokens = splitQuotedWhitespace(execText);
+  const claimTokens = splitQuotedWhitespaceWithMeta(claimText);
+  const execTokens = splitQuotedWhitespaceWithMeta(execText);
   const allowPrefixMatch = claimTokens
-    ? !(claimTokens.length === 1 && BARE_RUNTIME_LAUNCHERS.has(claimTokens[0]))
+    ? !(claimTokens.length === 1 && BARE_RUNTIME_LAUNCHERS.has(claimTokens[0].value))
     : !isBareRuntimeLauncher(normalizeCommandText(claimText));
   if (claimTokens && execTokens) {
     if (tokensEqualExact(claimTokens, execTokens)) {
@@ -911,7 +1074,7 @@ function commandMatchesExecution(rawClaim, execCommand) {
   }
   const execSegments = splitShellSegments(execCommand).map((s) => s.trim()).filter(Boolean);
   for (const seg of execSegments) {
-    const segTokens = splitQuotedWhitespace(seg);
+    const segTokens = splitQuotedWhitespaceWithMeta(seg);
     if (claimTokens && segTokens) {
       if (tokensEqualExact(claimTokens, segTokens)) {
         return true;
@@ -1134,8 +1297,9 @@ export function decideGate(input = {}, context = {}) {
     }
   }
 
+  const hasReliableGitStatus = Boolean(gitLedger.gitAvailable && gitLedger.dirtyFilesAvailable !== false);
   for (const writtenFile of ledger.turnWrittenFiles) {
-    if (gitLedger.gitAvailable && !gitLedger.gitDirtyFiles.has(writtenFile) && !ledger.turnCommittedFiles?.has(writtenFile)) {
+    if (hasReliableGitStatus && !gitLedger.gitDirtyFiles.has(writtenFile) && !ledger.turnCommittedFiles?.has(writtenFile)) {
       continue;
     }
     if (!reportedModifiedSet.has(writtenFile)) {
@@ -1169,12 +1333,12 @@ export function decideGate(input = {}, context = {}) {
   }
 
   for (const reportedFile of reportedModified) {
-    if (!ledger.turnWrittenFiles.has(reportedFile) && !gitLedger.gitDirtyFiles.has(reportedFile)) {
+    if (!ledger.turnWrittenFiles.has(reportedFile) && !(hasReliableGitStatus && gitLedger.gitDirtyFiles.has(reportedFile))) {
       details.phantomModified.push(reportedFile);
     }
   }
   if (details.phantomModified.length > 0) {
-    if (ledger.turnWrittenFiles.size === 0 && gitLedger.gitAvailable) {
+    if (ledger.turnWrittenFiles.size === 0 && hasReliableGitStatus) {
       blockedRules.push("R6_PHANTOM_MODIFIED");
     } else {
       warnedRules.push("R6_PHANTOM_MODIFIED");
