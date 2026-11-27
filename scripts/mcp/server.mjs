@@ -7,13 +7,19 @@ import { HANDOFF_COPY, PASSING_VERDICTS, REGISTER_COPY } from "../governance/con
 import { decideGate } from "../governance/decide-gate.mjs";
 import { detectTestInfrastructure, readFactLedger, readGitLedger, snapshotWorkingTree } from "../governance/fact-ledger.mjs";
 import {
+  clearHandoffSnapshots,
+  computeWorkspaceKey,
+  isHandoffPinOwner,
   listHandoffSnapshots,
+  listPinnedSnapshots,
   loadHandoffSnapshot,
   mergeShellWrittenFiles,
+  pinSnapshot,
   readSessionState,
   resolveEffectiveConversationKey,
   saveGateSnapshot,
   saveHandoffSnapshot,
+  unpinSnapshot,
 } from "../governance/handoff-store.mjs";
 import { resolveAuditEscalationMode } from "../governance/risk-classifier.mjs";
 import { isDirectExecution } from "../hook-io.mjs";
@@ -31,6 +37,7 @@ const PUBLIC_ARG_KEYS = new Set([
 const HANDOFF_ARG_KEYS = new Set([
   "action",
   "snapshot_id",
+  "pin_owner",
   "objective",
   "verified_facts",
   "failed_approaches",
@@ -38,7 +45,8 @@ const HANDOFF_ARG_KEYS = new Set([
   "open_risks",
 ]);
 const ALLOWED_OUTCOMES = new Set(["pass", "fail", "not_applicable"]);
-const ALLOWED_HANDOFF_ACTIONS = new Set(["save", "load", "list"]);
+const HANDOFF_ACTIONS = ["save", "load", "list", "pin", "unpin", "list_pinned", "clear"];
+const ALLOWED_HANDOFF_ACTIONS = new Set(HANDOFF_ACTIONS);
 const VERIFICATION_RUN_KEYS = new Set(["command", "outcome", "reason_if_na"]);
 
 export function buildVerifyCompletionTool(register) {
@@ -116,12 +124,16 @@ export function buildManageHandoffTool() {
       properties: {
         action: {
           type: "string",
-          enum: ["save", "load", "list"],
-          description: HANDOFF_COPY.actionDescription,
+          enum: HANDOFF_ACTIONS,
+          description: `${HANDOFF_COPY.actionDescription} 보존 지정·해제·목록을 지원하며, \`clear\`는 보존 지정이 없는 스냅샷만 삭제합니다.`,
         },
         snapshot_id: {
           type: "string",
           description: HANDOFF_COPY.snapshotIdDescription,
+        },
+        pin_owner: {
+          type: "string",
+          description: "저장 시 보존을 함께 지정하거나 보존을 지정·해제할 때 사용하는 소유자 식별자입니다.",
         },
         objective: {
           type: "string",
@@ -208,11 +220,24 @@ function validateHandoffArgs(publicArgs) {
     errors.push(`허용되지 않은 입력 필드가 포함되었습니다: ${unknownKeys.map((k) => `\`${k}\``).join(", ")}`);
   }
   if (typeof publicArgs.action !== "string" || !ALLOWED_HANDOFF_ACTIONS.has(publicArgs.action)) {
-    errors.push("핸드오프 동작은 `save`, `load`, `list` 가운데 하나여야 합니다.");
+    errors.push(`핸드오프 동작은 ${HANDOFF_ACTIONS.map((action) => `\`${action}\``).join(", ")} 가운데 하나여야 합니다.`);
     return errors;
   }
   if (publicArgs.snapshot_id !== undefined && typeof publicArgs.snapshot_id !== "string") {
     errors.push("스냅샷 식별자는 문자열로 전달해야 합니다.");
+  }
+  const changesPin = publicArgs.action === "pin" || publicArgs.action === "unpin";
+  if (changesPin && !publicArgs.snapshot_id?.trim?.()) {
+    errors.push("보존 지정과 해제에는 스냅샷 식별자가 필요합니다.");
+  }
+  if ((changesPin || publicArgs.pin_owner !== undefined) && !isHandoffPinOwner(publicArgs.pin_owner)) {
+    errors.push("보존 소유자는 영문자 또는 숫자로 시작하는 128자 이하의 식별자여야 합니다.");
+  }
+  if (publicArgs.pin_owner !== undefined && !changesPin && publicArgs.action !== "save") {
+    errors.push("보존 소유자는 저장, 보존 지정 또는 해제에만 사용할 수 있습니다.");
+  }
+  if (publicArgs.action === "clear" && publicArgs.snapshot_id !== undefined) {
+    errors.push("정리는 작업 공간 전체에 적용되며 개별 스냅샷 식별자를 받지 않습니다.");
   }
   if (publicArgs.action === "save") {
     if (typeof publicArgs.objective !== "string" || publicArgs.objective.trim().length === 0) {
@@ -451,6 +476,7 @@ export function createMcpServerHandler(options = {}) {
         cwd: effectiveCwd,
         conversationId,
         dataDir,
+        pinOwner: publicArgs.pin_owner,
       });
 
       appendAuditRecord(
@@ -521,6 +547,39 @@ export function createMcpServerHandler(options = {}) {
         content: [{ type: "text", text: loaded.formattedText }],
         isError: false,
       };
+    }
+
+    const workspaceKeyForPins = computeWorkspaceKey(effectiveCwd, gitLedger.gitRoot);
+    let pinText;
+    switch (publicArgs.action) {
+      case "pin": {
+        const changed = pinSnapshot(workspaceKeyForPins, publicArgs.snapshot_id, publicArgs.pin_owner, dataDir);
+        pinText = changed ? "스냅샷 보존을 지정했습니다." : "이미 보존 중이거나 스냅샷이 없습니다.";
+        break;
+      }
+      case "unpin": {
+        const changed = unpinSnapshot(workspaceKeyForPins, publicArgs.snapshot_id, publicArgs.pin_owner, dataDir);
+        pinText = changed ? "이 소유자의 스냅샷 보존을 해제했습니다." : "이 소유자의 보존 지정이 없습니다.";
+        break;
+      }
+      case "list_pinned": {
+        const roots = listPinnedSnapshots(workspaceKeyForPins, dataDir);
+        pinText = [
+          `[핸드오프 보존 목록] (작업 공간: \`${workspaceKeyForPins}\`, ${roots.length}건)`,
+          ...roots.map(({ snapshotId, pinOwners }) => `- \`${snapshotId}\`: ${pinOwners.map((owner) => `\`${owner}\``).join(", ")}`),
+        ].join("\n");
+        break;
+      }
+      case "clear": {
+        const { clearedCount } = clearHandoffSnapshots({ cwd: effectiveCwd, gitLedger, dataDir });
+        pinText = `보존 지정이 없는 스냅샷 ${clearedCount}건을 삭제했습니다.`;
+        break;
+      }
+      default:
+        break;
+    }
+    if (pinText !== undefined) {
+      return { content: [{ type: "text", text: pinText }], isError: false };
     }
 
     const { workspaceKey, items } = listHandoffSnapshots({

@@ -38,6 +38,9 @@ const MAX_SNAPSHOTS_PER_WORKSPACE = 20;
 const MAX_LIST_SNAPSHOTS = 10;
 const MAX_RECENT_VERIFICATIONS = 5;
 const SAFE_SNAPSHOT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
+const SAFE_PIN_OWNER_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const LATEST_HANDOFF_FILE = "latest.json";
+const HANDOFF_PINS_FILE = "pins.json";
 const SAFE_SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const URL_SPAN_RE = /\b[a-z][a-z0-9+.-]*:\/\/\S+/gi;
 const FILE_PATH_TOKEN_RE = /(?:^|[\s`'"(\[])([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+\.[A-Za-z0-9]{1,10})(?=$|[\s`'")\],:;])/g;
@@ -992,40 +995,183 @@ function detectEpistemicWarnings(verifiedFacts, ledger, cwd, gitRoot) {
 
 function generateSnapshotId() {
   const iso = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const suffix = Math.random().toString(16).slice(2, 6);
-  return `${iso}-${suffix}`;
+  return `${iso}-${randomBytes(8).toString("hex")}`;
 }
 
-function pruneOldSnapshots(workspaceDir) {
-  try {
-    const entries = readdirSync(workspaceDir)
-      .filter((name) => name.endsWith(".json") && name !== "latest.json")
-      .map((name) => {
-        const fullPath = join(workspaceDir, name);
-        let mtimeMs = 0;
-        try {
-          mtimeMs = statSync(fullPath).mtimeMs;
-        } catch {
-        }
-        return { name, fullPath, mtimeMs };
-      })
-      .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name));
+function isSnapshotId(value) {
+  return typeof value === "string" && SAFE_SNAPSHOT_ID_RE.test(value)
+    && !/^(?:latest|pins|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(value);
+}
 
-    if (entries.length <= MAX_SNAPSHOTS_PER_WORKSPACE) {
-      return 0;
+export function isHandoffPinOwner(value) {
+  return typeof value === "string" && SAFE_PIN_OWNER_RE.test(value);
+}
+
+function handoffWorkspaceDir(dataDir, workspaceKey) {
+  if (typeof workspaceKey !== "string" || !/^[0-9a-f]{12}$/.test(workspaceKey)) {
+    throw new TypeError("Invalid handoff workspace key");
+  }
+  const root = join(dataDir, "handoffs");
+  const workspaceDir = join(root, workspaceKey);
+  for (const path of [root, workspaceDir]) {
+    const entry = lstatSync(path, { throwIfNoEntry: false });
+    if (entry && !entry.isDirectory()) {
+      throw new Error("Handoff storage path is not a directory");
     }
+  }
+  return workspaceDir;
+}
+
+function handoffFileStat(path) {
+  const entry = lstatSync(path, { throwIfNoEntry: false });
+  if (entry && !entry.isFile()) {
+    throw new Error("Handoff storage entry is not a regular file");
+  }
+  return entry;
+}
+
+function withHandoffLock(workspaceDir, fn) {
+  const latestPath = join(workspaceDir, LATEST_HANDOFF_FILE);
+  handoffFileStat(`${latestPath}.lock`);
+  return withSessionLock(latestPath, () => fn(latestPath));
+}
+
+function readSnapshotFile(path, workspaceKey, snapshotId = "") {
+  if (!handoffFileStat(path)) return null;
+  const record = JSON.parse(readFileSync(path, "utf8"));
+  if (!isSnapshotId(record?.snapshotId) || record.workspaceKey !== workspaceKey
+    || (snapshotId && record.snapshotId !== snapshotId)) {
+    throw new Error("Invalid handoff snapshot");
+  }
+  return record;
+}
+
+function readPinRoots(workspaceDir) {
+  const path = join(workspaceDir, HANDOFF_PINS_FILE);
+  const roots = new Map();
+  if (!handoffFileStat(path)) return roots;
+  const record = JSON.parse(readFileSync(path, "utf8"));
+  if (record?.schemaVersion !== 1 || !Array.isArray(record.pins) || Object.keys(record).length !== 2) {
+    throw new Error("Invalid handoff pin metadata");
+  }
+  for (const item of record.pins) {
+    const { snapshotId, pinOwners } = item ?? {};
+    if (!isSnapshotId(snapshotId) || roots.has(snapshotId) || Object.keys(item).length !== 2
+      || !Array.isArray(pinOwners) || pinOwners.length === 0 || !pinOwners.every(isHandoffPinOwner)
+      || new Set(pinOwners).size !== pinOwners.length) {
+      throw new Error("Invalid handoff pin root");
+    }
+    roots.set(snapshotId, new Set(pinOwners));
+  }
+  return roots;
+}
+
+function pinItems(roots) {
+  return [...roots.keys()].sort().map((snapshotId) => ({
+    snapshotId, pinOwners: [...roots.get(snapshotId)].sort(),
+  }));
+}
+
+function writePinRoots(workspaceDir, roots) {
+  atomicWriteJson(join(workspaceDir, HANDOFF_PINS_FILE), { schemaVersion: 1, pins: pinItems(roots) });
+}
+
+function snapshotEntries(workspaceDir, workspaceKey, roots = new Map()) {
+  const entries = [];
+  for (const file of readdirSync(workspaceDir, { withFileTypes: true })) {
+    if (!file.isFile() || !file.name.endsWith(".json")) continue;
+    const snapshotId = file.name.slice(0, -5);
+    if (!isSnapshotId(snapshotId) || roots.has(snapshotId)) continue;
+    const path = join(workspaceDir, file.name);
+    try {
+      const stat = handoffFileStat(path);
+      const snapshot = stat && readSnapshotFile(path, workspaceKey, snapshotId);
+      if (snapshot) entries.push({ path, snapshot, mtimeMs: stat.mtimeMs });
+    } catch {
+      // Unknown or damaged entries are not safe to remove as snapshots.
+    }
+  }
+  return entries;
+}
+
+function newestFirst(entries, latestId) {
+  return entries.sort((a, b) =>
+    Number(b.snapshot.snapshotId === latestId) - Number(a.snapshot.snapshotId === latestId)
+    || b.mtimeMs - a.mtimeMs || b.snapshot.snapshotId.localeCompare(a.snapshot.snapshotId));
+}
+
+function pruneOldSnapshots(workspaceDir, workspaceKey, roots, latestId) {
+  try {
+    const entries = newestFirst(snapshotEntries(workspaceDir, workspaceKey, roots), latestId);
     let removed = 0;
-    for (const old of entries.slice(MAX_SNAPSHOTS_PER_WORKSPACE)) {
+    for (const { path } of entries.slice(MAX_SNAPSHOTS_PER_WORKSPACE)) {
       try {
-        unlinkSync(old.fullPath);
+        unlinkSync(path);
         removed += 1;
       } catch {
+        // Best-effort retention; publication is already committed.
       }
     }
     return removed;
   } catch {
     return 0;
   }
+}
+
+function changePin(workspaceKey, snapshotId, pinOwner, dataDir, adding) {
+  if (!isSnapshotId(snapshotId)) throw new TypeError("Invalid handoff snapshot ID");
+  if (!isHandoffPinOwner(pinOwner)) throw new TypeError("Invalid handoff pin owner");
+  const workspaceDir = handoffWorkspaceDir(dataDir, workspaceKey);
+  if (!existsSync(workspaceDir)) return false;
+  return withHandoffLock(workspaceDir, (latestPath) => {
+    const roots = readPinRoots(workspaceDir);
+    const owners = roots.get(snapshotId) ?? new Set();
+    if (adding) {
+      if (owners.has(pinOwner)) return false;
+      if (!readSnapshotFile(join(workspaceDir, `${snapshotId}.json`), workspaceKey, snapshotId)) return false;
+      owners.add(pinOwner);
+      roots.set(snapshotId, owners);
+      writePinRoots(workspaceDir, roots);
+    } else {
+      if (!owners.delete(pinOwner)) return false;
+      const lastOwner = owners.size === 0;
+      const latestId = lastOwner ? readSnapshotFile(latestPath, workspaceKey)?.snapshotId : undefined;
+      if (lastOwner) roots.delete(snapshotId);
+      writePinRoots(workspaceDir, roots);
+      if (lastOwner) pruneOldSnapshots(workspaceDir, workspaceKey, roots, latestId);
+    }
+    return true;
+  });
+}
+
+// A pin is a retention root for this owner, not an authorization credential.
+export function pinSnapshot(workspaceKey, snapshotId, pinOwner, dataDir = resolvePluginDataDir()) {
+  return changePin(workspaceKey, snapshotId, pinOwner, dataDir, true);
+}
+
+export function unpinSnapshot(workspaceKey, snapshotId, pinOwner, dataDir = resolvePluginDataDir()) {
+  return changePin(workspaceKey, snapshotId, pinOwner, dataDir, false);
+}
+
+export function listPinnedSnapshots(workspaceKey, dataDir = resolvePluginDataDir()) {
+  const workspaceDir = handoffWorkspaceDir(dataDir, workspaceKey);
+  if (!existsSync(workspaceDir)) return [];
+  return withHandoffLock(workspaceDir, () => pinItems(readPinRoots(workspaceDir)));
+}
+
+// Clear removes only unpinned snapshots; it invalidates an unpinned latest without promoting another root.
+export function clearHandoffSnapshots({ cwd = "", gitLedger = null, dataDir = resolvePluginDataDir() } = {}) {
+  const workspaceKey = computeWorkspaceKey(cwd, typeof gitLedger?.gitRoot === "string" ? gitLedger.gitRoot : "");
+  const workspaceDir = handoffWorkspaceDir(dataDir, workspaceKey);
+  if (!existsSync(workspaceDir)) return { workspaceKey, clearedCount: 0 };
+  return withHandoffLock(workspaceDir, (latestPath) => {
+    const roots = readPinRoots(workspaceDir);
+    const latest = readSnapshotFile(latestPath, workspaceKey);
+    const entries = snapshotEntries(workspaceDir, workspaceKey, roots);
+    if (latest && !roots.has(latest.snapshotId)) unlinkSync(latestPath);
+    for (const { path } of entries) unlinkSync(path);
+    return { workspaceKey, clearedCount: entries.length };
+  });
 }
 
 function normalizeTextArray(items) {
@@ -1042,11 +1188,14 @@ export function saveHandoffSnapshot({
   cwd = "",
   conversationId = "",
   dataDir = resolvePluginDataDir(),
+  pinOwner,
 } = {}) {
+  if (pinOwner !== undefined && !isHandoffPinOwner(pinOwner)) {
+    throw new TypeError("Invalid handoff pin owner");
+  }
   const gitRoot = typeof gitLedger?.gitRoot === "string" ? gitLedger.gitRoot : "";
   const workspaceKey = computeWorkspaceKey(cwd, gitRoot);
-  const workspaceDir = join(dataDir, "handoffs", workspaceKey);
-  const snapshotId = generateSnapshotId();
+  const workspaceDir = handoffWorkspaceDir(dataDir, workspaceKey);
 
   const objective = typeof input.objective === "string" ? input.objective.trim() : "";
   const verifiedFacts = normalizeTextArray(input.verified_facts);
@@ -1070,11 +1219,9 @@ export function saveHandoffSnapshot({
   const dirtyFilesSorted = Array.from(gitLedger?.gitDirtyFiles ?? []).sort();
   const dirtyFingerprint = computeDirtyFingerprint(dirtyFilesSorted, gitRoot || cwd);
 
-  const snapshot = {
+  const draft = {
     schemaVersion: 1,
-    snapshotId,
     workspaceKey,
-    savedAt: new Date().toISOString(),
     sourceConversationId: conversationId,
     objective,
     verifiedFacts,
@@ -1099,11 +1246,26 @@ export function saveHandoffSnapshot({
     },
   };
 
-  atomicWriteJson(join(workspaceDir, `${snapshotId}.json`), snapshot);
-  atomicWriteJson(join(workspaceDir, "latest.json"), snapshot);
-  const prunedCount = pruneOldSnapshots(workspaceDir);
-
-  return { snapshot, workspaceKey, prunedCount };
+  return withHandoffLock(workspaceDir, (latestPath) => {
+    const roots = readPinRoots(workspaceDir);
+    handoffFileStat(latestPath);
+    let snapshotId;
+    let snapshotPath;
+    do {
+      snapshotId = generateSnapshotId();
+      snapshotPath = join(workspaceDir, `${snapshotId}.json`);
+    } while (roots.has(snapshotId) || lstatSync(snapshotPath, { throwIfNoEntry: false }));
+    const snapshot = { ...draft, snapshotId, savedAt: new Date().toISOString() };
+    atomicWriteJson(snapshotPath, snapshot);
+    // Publish the root before latest and prune. An interruption cannot expose a new unpinned latest.
+    if (pinOwner !== undefined) {
+      roots.set(snapshotId, new Set([pinOwner]));
+      writePinRoots(workspaceDir, roots);
+    }
+    atomicWriteJson(latestPath, snapshot);
+    const prunedCount = pruneOldSnapshots(workspaceDir, workspaceKey, roots, snapshotId);
+    return { snapshot, workspaceKey, prunedCount };
+  });
 }
 
 function sameStringList(a, b) {
@@ -1192,10 +1354,9 @@ export function loadHandoffSnapshot({
 } = {}) {
   const gitRoot = typeof gitLedger?.gitRoot === "string" ? gitLedger.gitRoot : "";
   const workspaceKey = computeWorkspaceKey(cwd, gitRoot);
-  const workspaceDir = join(dataDir, "handoffs", workspaceKey);
-
   const trimmedId = typeof snapshotId === "string" ? snapshotId.trim() : "";
-  if (trimmedId.length > 0 && !SAFE_SNAPSHOT_ID_RE.test(trimmedId)) {
+  const concreteId = trimmedId === "latest" ? "" : trimmedId;
+  if (concreteId && !isSnapshotId(concreteId)) {
     return {
       ok: false,
       error: "올바르지 않은 스냅샷 식별자 형식입니다. 경로 구분자나 특수 문자 없이 지정해 주세요.",
@@ -1203,30 +1364,27 @@ export function loadHandoffSnapshot({
     };
   }
 
-  const targetFile = trimmedId.length > 0 ? `${trimmedId}.json` : "latest.json";
-  const targetPath = join(workspaceDir, targetFile);
-  if (!existsSync(targetPath)) {
+  const targetFile = concreteId ? `${concreteId}.json` : LATEST_HANDOFF_FILE;
+  let snapshot;
+  try {
+    const workspaceDir = handoffWorkspaceDir(dataDir, workspaceKey);
+    snapshot = readSnapshotFile(join(workspaceDir, targetFile), workspaceKey, concreteId);
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      return {
+        ok: false,
+        error: "저장된 스냅샷 파일을 읽을 수 없습니다. 파일이 손상되었는지 확인해 주세요.",
+        workspaceKey,
+      };
+    }
+  }
+  if (!snapshot) {
     return {
       ok: false,
       error:
         trimmedId.length > 0
           ? `요청한 스냅샷 \`${trimmedId}\` 을 현재 작업 공간에서 찾을 수 없습니다.`
           : "현재 작업 공간에 저장된 핸드오프 스냅샷이 없습니다.",
-      workspaceKey,
-    };
-  }
-
-  let snapshot = null;
-  try {
-    snapshot = JSON.parse(readFileSync(targetPath, "utf8"));
-  } catch {
-    snapshot = null;
-  }
-  // `null`, arrays and scalars parse fine but are not snapshots.
-  if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) {
-    return {
-      ok: false,
-      error: "저장된 스냅샷 파일을 읽을 수 없습니다. 파일이 손상되었는지 확인해 주세요.",
       workspaceKey,
     };
   }
@@ -1262,40 +1420,23 @@ export function loadHandoffSnapshot({
 export function listHandoffSnapshots({ cwd = "", gitLedger = null, dataDir = resolvePluginDataDir() } = {}) {
   const gitRoot = typeof gitLedger?.gitRoot === "string" ? gitLedger.gitRoot : "";
   const workspaceKey = computeWorkspaceKey(cwd, gitRoot);
-  const workspaceDir = join(dataDir, "handoffs", workspaceKey);
+  const workspaceDir = handoffWorkspaceDir(dataDir, workspaceKey);
   if (!existsSync(workspaceDir)) {
     return { workspaceKey, items: [] };
   }
 
-  const files = readdirSync(workspaceDir)
-    .filter((name) => name.endsWith(".json") && name !== "latest.json")
-    .map((name) => {
-      const fullPath = join(workspaceDir, name);
-      let mtimeMs = 0;
-      try {
-        mtimeMs = statSync(fullPath).mtimeMs;
-      } catch {
-      }
-      return { name, fullPath, mtimeMs };
-    })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs || b.name.localeCompare(a.name))
-    .slice(0, MAX_LIST_SNAPSHOTS);
-
-  const items = [];
-  for (const file of files) {
+  return withHandoffLock(workspaceDir, (latestPath) => {
+    let latestId;
     try {
-      const parsed = JSON.parse(readFileSync(file.fullPath, "utf8"));
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        continue;
-      }
-      items.push({
-        snapshotId: parsed.snapshotId || file.name.replace(/\.json$/, ""),
-        savedAt: parsed.savedAt || "",
-        objective: parsed.objective || "",
-      });
+      latestId = readSnapshotFile(latestPath, workspaceKey)?.snapshotId;
     } catch {
-      continue;
+      // A damaged pointer does not hide individually readable snapshots.
     }
-  }
-  return { workspaceKey, items };
+    const items = newestFirst(snapshotEntries(workspaceDir, workspaceKey), latestId)
+      .slice(0, MAX_LIST_SNAPSHOTS)
+      .map(({ snapshot }) => ({
+        snapshotId: snapshot.snapshotId, savedAt: snapshot.savedAt || "", objective: snapshot.objective || "",
+      }));
+    return { workspaceKey, items };
+  });
 }
