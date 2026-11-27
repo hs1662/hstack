@@ -406,3 +406,48 @@ test("a timed-out gate records the measured policy argv and exact fact digest, n
   assert.deepEqual([log.argv, log.timedOut, log.factDigest, log.subjectDigest],
     [gateArgv, true, r.provenance.factDigest, r.provenance.factDigest]);
 });
+
+for (const fenced of [false, true]) test(`SIGKILL before the final settlement ${
+  fenced ? "cannot replay measured evidence after fencing" : "reuses durable gate evidence, not another verifier spawn"}`, async t => {
+  const f = await fixture(t, [read("a", { gateArgv: [process.execPath, "-e",
+    "require('fs').appendFileSync('gate-count','x')"] })]);
+  const opts = { root: f.root, token: await f.start("a"), receipt: await proof(f), opId: "s", outcome: "accepted" };
+  const script = `
+    import fs from "node:fs/promises";
+    import {syncBuiltinESMExports} from "node:module";
+    const original = fs.open.bind(fs);
+    fs.open = async (path,...args) => {
+      const fd = await original(path,...args);
+      if (path === ${JSON.stringify(join(f.root, "runs", f.run, "wal/events.jsonl"))} && args[0] === "a") {
+        const write = fd.writeFile.bind(fd);
+        fd.writeFile = async data => {
+          if (JSON.parse(data).type === "AttemptSettled") process.kill(process.pid, "SIGKILL");
+          return write(data);
+        };
+      }
+      return fd;
+    };
+    syncBuiltinESMExports();
+    const {dispatch} = await import(${JSON.stringify(moduleUrl)});
+    await dispatch("settle",JSON.parse(process.argv[1]));`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script, JSON.stringify(opts)]);
+  assert.deepEqual(await once(child, "exit"), [null, "SIGKILL"]);
+  const recovered = await f.call("resume");
+  assert.match(recovered.nodes.a.attempt.measuredUri, /^cas:\/\/sha256\/[a-f0-9]{64}$/);
+  assert.equal(recovered.nodes.a.status, "running");
+  if (fenced) {
+    await f.call("amend", { node: "a", expectedRev: 1, opId: "fence", patch: { exec: { prompt: "different" } } });
+    await f.call("claim", { node: "a", expectedRev: 2, opId: "replacement" });
+    const wal = join(f.root, "runs", f.run, "wal/events.jsonl");
+    const before = await fs.readFile(wal);
+    await assert.rejects(send("settle", opts), { code: "ERR_STALE_FENCING_TOKEN", exitCode: 49 });
+    assert.deepEqual(await fs.readFile(wal), before);
+    assert.equal(await fs.readFile(join(f.workspace, "gate-count"), "utf8"), "x");
+    return;
+  }
+  await assert.rejects(send("settle", { ...opts, outcome: "blocked" }), { code: "ERR_OP_CONFLICT" });
+  const result = await send("settle", opts);
+  assert.equal(result.status, "accepted");
+  assert.deepEqual(await send("settle", opts), result);
+  assert.equal(await fs.readFile(join(f.workspace, "gate-count"), "utf8"), "x");
+});

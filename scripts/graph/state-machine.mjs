@@ -23,6 +23,7 @@ const pending = (n, now) => n.status === "pending" || n.status === "fresh_reset_
 const bad = msg => graphError("ERR_GRAPH_SCHEMA", msg);
 const notReady = msg => graphError("ERR_NOT_READY", msg);
 const reservePrefix = "@hstack-verifier/";
+const measuredPrefix = "@hstack-gate-proof/";
 class GateWork extends Error {
   constructor(policy) { super("Host verification needed"); this.policy = policy; }
 }
@@ -227,6 +228,9 @@ async function settle(s, n, o, io, now) {
   }
   if (n.status !== "accepted") n.receiptUri = await io.put(Buffer.from(canonical(failureRecord(receipt, reason))));
   if (n.status === "failed_logic") n.failedExecKeys = [...new Set([...(n.failedExecKeys ?? []), n.execKey])];
+  // GateWork abandons its first draft. Only the committing draft may touch
+  // the canary session or count a host observation.
+  observeHost(s, n, o);
   n.attempt.settleOp = o.opId;
   n.attempt.failureClass = n.status === "accepted" ? null : reason;
   const verified = ["success", "completed", "accepted"].includes(outcome);
@@ -256,13 +260,19 @@ export async function dispatch(command, options = {}) {
   if (command === "compile") o.opId ??= "compile";
   if (command === "start") o.opId ??= `start-${artifactDigest(o.token)}`;
   nonempty(o.opId, "opId");
-  if (o.opId.startsWith(reservePrefix)) throw bad("Reserved operation ID");
+  if (o.opId.startsWith(reservePrefix) || o.opId.startsWith(measuredPrefix)) throw bad("Reserved operation ID");
   const { root, opId, ...args } = o;
   const payload = { command, ...Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)) };
+  const requestDigest = artifactDigest(payload);
   let authenticated;
-  const guard = authorized ? async s => { authenticated = (await authenticate(s, { ...o, command })).id; } : undefined;
-  const commit = measurements => transaction(root, run, { opId, payload, type, guard }, async (state, store) => {
-    const io = { ...store, measurements, budgetContext: o.telemetry?.budgetContext,
+  const guard = async s => {
+    if (authorized) authenticated = (await authenticate(s, { ...o, command })).id;
+    const owner = Object.values(s?.nodes ?? {}).find(n => n.attempt?.verifierOp === opId);
+    if (owner && owner.attempt.verifierRequestDigest !== requestDigest)
+      throw graphError("ERR_OP_CONFLICT", "Request differs from the reserved verification");
+  };
+  const commit = () => transaction(root, run, { opId, payload, type, guard }, async (state, store) => {
+    const io = { ...store, budgetContext: o.telemetry?.budgetContext ?? o.hostBudget,
       maxInlineBytesPerNode: state?.limits?.maxInlineBytesPerNode, maxInlineBytesPerWave: state?.limits?.maxInlineBytesPerWave };
     if (command === "compile") {
       if (state) throw graphError("ERR_RUN_EXISTS", "Run already compiled");
@@ -276,10 +286,12 @@ export async function dispatch(command, options = {}) {
       const n = getNode(s, authenticated);
       if (command === "settle" && n.attempt.verifierOp && n.attempt.verifierOp !== opId)
         throw graphError("ERR_GATE_IN_PROGRESS", "Another settlement owns this attempt");
-      observeHost(s, n, o);
+      if (command === "settle" && n.attempt.measuredUri)
+        io.measurements = JSON.parse(await store.get(n.attempt.measuredUri));
       if (command === "start") {
         if (n.status !== "claimed") throw notReady("Only claimed attempts may start");
         n.attempt.hostHandle = nonempty(o.hostHandle, "hostHandle");
+        observeHost(s, n, o);
         n.status = "running";
         n.attempt.receiptPhase = "delivered";
         captureStart(s, { nodeId: n.id, atMs: now });
@@ -330,7 +342,7 @@ export async function dispatch(command, options = {}) {
     result.state = validateRunRecords(result.state);
     return result;
   });
-  try { return await commit(null); }
+  try { return await commit(); }
   catch (err) {
     if (!(err instanceof GateWork)) throw err;
     // Reserve the external side effect before releasing the journal mutex. A lost
@@ -340,14 +352,15 @@ export async function dispatch(command, options = {}) {
       const n = getNode(state, authenticated);
       if (n.status !== "running" || n.attempt.verifierOp) throw notReady("Verification already reserved");
       const uri = await io.put(Buffer.from(canonical(failureRecord(o.receipt, "delivered"))));
-      Object.assign(n.attempt, {verifierOp:opId, deliveredUri:uri, verificationStartedAtMs:Date.now()});
+      Object.assign(n.attempt, {verifierOp:opId, verifierRequestDigest:requestDigest,
+        deliveredUri:uri, verificationStartedAtMs:Date.now()});
       winner = true;
       return {state:validateRunRecords(state),response:{nodeId:n.id,epoch:n.attempt.epoch},refs:[uri]};
     });
     if (!winner) {
       // The earlier verifier may already have committed; a replay returns that
       // exact response. A still-pending reservation must not run the command twice.
-      try { return await commit(null); } catch (pending) {
+      try { return await commit(); } catch (pending) {
         if (!(pending instanceof GateWork)) throw pending;
         throw graphError("ERR_GATE_IN_PROGRESS", "Verification reserved; inspect before fencing");
       }
@@ -365,7 +378,14 @@ export async function dispatch(command, options = {}) {
         }
       }
     }
-    return commit({first, diagnostics});
+    await transaction(root, run, {opId:measuredPrefix + opId, payload, type:"GateMeasured", guard}, async (state, io) => {
+      const n = getNode(state, authenticated);
+      if (n.status !== "running" || n.attempt.verifierOp !== opId) throw notReady("Gate no longer reserved");
+      const uri = await io.put(Buffer.from(canonical({first, diagnostics})));
+      n.attempt.measuredUri = uri;
+      return {state:validateRunRecords(state), response:{nodeId:n.id, epoch:n.attempt.epoch}, refs:[uri]};
+    });
+    return commit();
   }
 }
 
