@@ -9,6 +9,7 @@ import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS, isExemptDocOrAssetPath } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
 import { classifyCommand, commandMatchesExpectedTokens, detectTestInfrastructure, extractChainPrepSignature, extractPytestCommandInfo, extractToolPaths, inferExecutionFailure, listCommittedPaths, normalizeWorkspacePath, readFactLedger, readGitLedger, readNumstatSinceHead, readRegularFileBounded, readSessionRole, resolveGitRootFast, snapshotWorkingTree, statSnapshotFile } from "../scripts/governance/fact-ledger.mjs";
+import * as factLedger from "../scripts/governance/fact-ledger.mjs";
 import { computeWorkspaceKey, loadHandoffSnapshot, mergeShellWrittenFiles, resolveEffectiveConversationKey, resolveSessionStatePath, saveGateSnapshot, saveHandoffSnapshot, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
 import { classifyRisk } from "../scripts/governance/risk-classifier.mjs";
 import { readTranscriptSteps } from "../scripts/hook-io.mjs";
@@ -7441,5 +7442,174 @@ describe("H24 OMH round-20 regressions (F1-F9)", () => {
     assert.ok(typeof tokenC === "string" && tokenC.length > 0);
     assert.equal(ctrlB.reclaimStaleLock(), false, "concurrent reclaimer must not remove live lock C");
     assert.equal(readFileSync(join(lockDir, "pid"), "utf8").trim(), tokenC);
+  });
+});
+
+describe("H25 OMH round-21 regressions (F1-F11)", () => {
+  const runPairGate = (failCmd, passCmd) => {
+    const repo = makeRepo();
+    const txPath = join(createTempDir("hstack-p10-r21-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "21차 회귀 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: "1 failed" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    return decideGate(
+      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: passCmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+  };
+
+  const runSingleGate = (cmd) => {
+    const repo = makeRepo();
+    const txPath = join(createTempDir("hstack-p10-r21-single-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "21차 단일 명령 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    return decideGate(
+      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: cmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+  };
+
+  it("R21-F1: preserves shell binary path and invoke flags (-l) in outer context key", () => {
+    for (const [failCmd, passCmd] of [
+      ['/bin/bash -c "pytest"', '/usr/local/bin/bash -c "pytest"'],
+      ['bash -c "pytest"', 'bash -lc "pytest"'],
+    ]) {
+      const dec = runPairGate(failCmd, passCmd);
+      assert.equal(dec.verdict, "REJECT", `${failCmd} -> ${passCmd}`);
+      assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+    }
+    const okDec = runPairGate('bash -lc "pytest"', 'bash -lc "pytest"');
+    assert.equal(okDec.verdict, "PASS", okDec.blockedRules.join(","));
+  });
+
+  it("R21-F2: enforces general env parity across direct commands and inner inline shell runs", () => {
+    for (const [failCmd, passCmd] of [
+      ["export BACKEND=pg && pytest", "export BACKEND=sqlite && pytest"],
+      ["export BACKEND=pg && node --test", "export BACKEND=sqlite && node --test"],
+      ['bash -c "export BACKEND=pg && pytest"', 'bash -c "export BACKEND=sqlite && pytest"'],
+    ]) {
+      const dec = runPairGate(failCmd, passCmd);
+      assert.equal(dec.verdict, "REJECT", `${failCmd} -> ${passCmd}`);
+      assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+    }
+    const okDec = runPairGate("export BACKEND=pg && pytest", "export BACKEND=pg && pytest");
+    assert.equal(okDec.verdict, "PASS", okDec.blockedRules.join(","));
+  });
+
+  it("R21-F3: keeps exported attribute on PYTEST_ADDOPTS assigned under set -a even after set +a", () => {
+    const dec = runSingleGate('set -a && PYTEST_ADDOPTS="-v" && set +a && PYTEST_ADDOPTS="--collect-only" && pytest');
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R21-F4: rejects resolution when opaque prep steps appear only on the passing side", () => {
+    const dec = runPairGate("pytest", "env -C ~ npm ci && pytest");
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R21-F5: handles command-wrapped export uniformly for both hijack denial and PYTEST_ADDOPTS propagation", () => {
+    assert.notEqual(classifyCommand("command export NODE_OPTIONS && pytest"), "verification");
+    assert.notEqual(classifyCommand("command -p export PATH && pytest"), "verification");
+    const bad = runSingleGate("PYTEST_ADDOPTS='--collect-only' && command export PYTEST_ADDOPTS && pytest");
+    assert.equal(bad.verdict, "REJECT");
+    assert.ok(bad.blockedRules.includes("R2_STALE_VERIFICATION"), bad.blockedRules.join(","));
+    const good = runSingleGate("PYTEST_ADDOPTS=-q && command export PYTEST_ADDOPTS && pytest");
+    assert.equal(good.verdict, "PASS", good.blockedRules.join(","));
+  });
+
+  it("R21-F6: preserves prep rawBin and prefixTokens so registry/bin differences never equate prep steps", () => {
+    const infoA = factLedger.extractChainPrepInfo?.("NPM_CONFIG_REGISTRY=https://a.test /usr/bin/npm ci");
+    assert.ok(infoA && infoA.rawBin === "/usr/bin/npm" && infoA.prefixTokens.includes("NPM_CONFIG_REGISTRY=https://a.test"));
+    for (const [failCmd, passCmd] of [
+      ["NPM_CONFIG_REGISTRY=https://a.test npm ci && pytest", "NPM_CONFIG_REGISTRY=https://b.test npm ci && pytest"],
+      ["/usr/bin/npm ci && pytest", "/usr/local/bin/npm ci && pytest"],
+    ]) {
+      const dec = runPairGate(failCmd, passCmd);
+      assert.equal(dec.verdict, "REJECT", `${failCmd} -> ${passCmd}`);
+      assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+    }
+  });
+
+  it("R21-F7: matches GNU Bash option rules (-c requires separate body arg; combined flags parse completely)", () => {
+    assert.notEqual(classifyCommand('bash -c"npm test"'), "verification");
+    assert.notEqual(classifyCommand('bash -cn "npm test"'), "verification");
+    assert.notEqual(classifyCommand('bash -nc "npm test"'), "verification");
+    assert.equal(classifyCommand('bash -ce "npm test"'), "verification");
+    assert.equal(classifyCommand('bash -ec "npm test"'), "verification");
+    assert.equal(classifyCommand('sh -ce "node --test"'), "verification");
+  });
+
+  it("R21-F8: detects post-readlink symlink swaps and post-read file path swaps in statSnapshotFile", () => {
+    const repo = createTempDir("hstack-p10-r21-f8-");
+    writeFileSync(join(repo, "f.mjs"), "hello\n");
+    symlinkSync(join(repo, "f.mjs"), join(repo, "lnk.mjs"));
+    const linkSt = lstatSync(join(repo, "lnk.mjs"));
+    const regSt = lstatSync(join(repo, "f.mjs"));
+
+    let linkCalls = 0;
+    const linkSwap = statSnapshotFile(repo, "lnk.mjs", {
+      fsOps: {
+        lstatSync: () => (++linkCalls === 1 ? linkSt : { ...linkSt, ino: linkSt.ino + 1 }),
+        readlinkSync: () => "f.mjs",
+      },
+    });
+    assert.equal(typeof linkSwap, "string", `symlink swap must return sentinel, got ${JSON.stringify(linkSwap)}`);
+
+    let regCalls = 0;
+    const regSwap = statSnapshotFile(repo, "f.mjs", {
+      fsOps: {
+        lstatSync: () => (++regCalls === 1 ? regSt : { ...regSt, ino: regSt.ino + 1 }),
+        openSync: () => 999,
+        fstatSync: () => ({ ...regSt, isFile: () => true }),
+        readSync: () => 0,
+        closeSync: () => {},
+      },
+    });
+    assert.equal(typeof regSwap, "string", `post-read path swap must return sentinel, got ${JSON.stringify(regSwap)}`);
+  });
+
+  it("R21-F9: uses OS flock / atomic inode guards against reclaim-vs-reclaim and late reclaimer unlink races", () => {
+    const base = createTempDir("hstack-p10-r21-f9-");
+    const lockDir = join(base, "cpu.lock");
+    const ctrl = testHelpers.createCpuLockController(lockDir);
+    assert.equal(ctrl.hasOsFlockSupport?.(), process.platform !== "win32");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "pid"), "99999999:dead");
+    const raced = ctrl.testReclaimAgainstLiveSwap?.();
+    assert.equal(raced, true, "reclaim serialized against swap must leave newly acquired live lock intact");
+  });
+
+  it("R21-F10: excludes --durations-min from pytest display-only allowlist across R3 resolution", () => {
+    const dec = runPairGate("pytest", 'export PYTEST_ADDOPTS="--durations-min=0.5" && pytest');
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R21-F11: does not inherit parent set -a allexport mode into child sh -c / bash -c processes", () => {
+    const passChildLocal = runSingleGate(`set -a && sh -c "PYTEST_ADDOPTS='--collect-only' && pytest"`);
+    assert.equal(passChildLocal.verdict, "PASS", passChildLocal.blockedRules.join(","));
+    const blockParentExported = runSingleGate(`set -a && PYTEST_ADDOPTS='--collect-only' && sh -c "pytest"`);
+    assert.equal(blockParentExported.verdict, "REJECT");
+    assert.ok(blockParentExported.blockedRules.includes("R2_STALE_VERIFICATION"), blockParentExported.blockedRules.join(","));
   });
 });
