@@ -6020,3 +6020,457 @@ describe("H20 OMH gpt-6.2-astra round-16 regressions (P1 F1-F8, P2 F9-F10)", () 
     }
   });
 });
+
+describe("H21 OMH gpt-6.2-astra round-17 regressions (P1 F1-F8, P2 F9-F11)", () => {
+  it("R17-F1: resolves wrapper chdir options (-C / --chdir) before looking up pytest configs", () => {
+    for (const cmd of ["env -C packages/sub pytest", "env --chdir=packages/sub pytest"]) {
+      const repo = makeRepo();
+      const subDir = join(repo, "packages", "sub");
+      mkdirSync(subDir, { recursive: true });
+      writeFileSync(join(subDir, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+      const txPath = join(createTempDir("hstack-p10-r17-f1-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", cmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R17-F2: carries earlier chain export PYTEST_ADDOPTS into R2 non-exec checks and R3 resolution", () => {
+    const repoDry = makeRepo();
+    const dryCmd = 'export PYTEST_ADDOPTS="--collect-only" && pytest';
+    const txDry = join(createTempDir("hstack-p10-r17-f2-dry-"), "t.jsonl");
+    writeFileSync(
+      txDry,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repoDry, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: dryCmd, Cwd: repoDry } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+      ]),
+    );
+    const glDry = readGitLedger(repoDry);
+    const decDry = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: dryCmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repoDry, ledger: readFactLedger(txDry, repoDry, glDry.gitRoot), gitLedger: glDry, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decDry.verdict, "REJECT");
+    assert.ok(decDry.blockedRules.includes("R2_STALE_VERIFICATION"), decDry.blockedRules.join(","));
+
+    const repoR3 = makeRepo();
+    const failCmd = 'export PYTEST_ADDOPTS="-k foo" && pytest tests/test_other.py';
+    const passCmd = 'export PYTEST_ADDOPTS="-k foo" && pytest';
+    const txR3 = join(createTempDir("hstack-p10-r17-f2-r3-"), "t.jsonl");
+    writeFileSync(
+      txR3,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repoR3, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: repoR3 } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repoR3 } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const glR3 = readGitLedger(repoR3);
+    const decR3 = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: passCmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repoR3, ledger: readFactLedger(txR3, repoR3, glR3.gitRoot), gitLedger: glR3, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decR3.verdict, "REJECT");
+    assert.ok(decR3.blockedRules.includes("R3_CONCEALED_FAILURE"), decR3.blockedRules.join(","));
+  });
+
+  it("R17-F3: merges PYTEST_ADDOPTS with CLI args so PYTEST_ADDOPTS=-c dry.ini is inspected for R2", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "dry.ini"), "[pytest]\naddopts = --collect-only\n");
+    const cmd = 'PYTEST_ADDOPTS="-c dry.ini" pytest';
+    const txPath = join(createTempDir("hstack-p10-r17-f3-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: cmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R17-F4: rejects clustered short -h/-V on CLI while allowing -khelp value containing h in addopts", () => {
+    assert.notEqual(classifyCommand("pytest -qh"), "verification");
+
+    const repoHelp = makeRepo();
+    const txHelp = join(createTempDir("hstack-p10-r17-f4-cli-"), "t.jsonl");
+    writeFileSync(
+      txHelp,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repoHelp, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest -qh", Cwd: repoHelp } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "usage: pytest" },
+      ]),
+    );
+    const glHelp = readGitLedger(repoHelp);
+    const decCli = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest -qh", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repoHelp, ledger: readFactLedger(txHelp, repoHelp, glHelp.gitRoot), gitLedger: glHelp, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decCli.verdict, "REJECT");
+    assert.ok(decCli.blockedRules.includes("R2_STALE_VERIFICATION"), decCli.blockedRules.join(","));
+
+    const repoVal = makeRepo();
+    writeFileSync(join(repoVal, "pytest.ini"), "[pytest]\naddopts = -khelp\n");
+    const txVal = join(createTempDir("hstack-p10-r17-f4-val-"), "t.jsonl");
+    writeFileSync(
+      txVal,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repoVal, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repoVal } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const glVal = readGitLedger(repoVal);
+    const decVal = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repoVal, ledger: readFactLedger(txVal, repoVal, glVal.gitRoot), gitLedger: glVal, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decVal.verdict, "PASS", decVal.blockedRules.join(","));
+  });
+
+  it("R17-F5: blocks Stop when gate docFiles is a non-empty truncated subset and shell modifies an outside doc file cleanly from empty turnWrittenFiles", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "CHANGELOG.md"), "# log\n");
+    writeFileSync(join(repo, "README.md"), "# initial\n");
+    git(repo, ["add", "CHANGELOG.md", "README.md"]);
+    git(repo, ["commit", "-q", "-m", "add docs"]);
+
+    const res = runTurnOnRepo(repo, "p10-r17-f5-subset", [
+      {
+        gate: {
+          modified_files: [],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "변경 전 상태 확인 완료.",
+        },
+      },
+      {
+        cmd: "echo post >> README.md",
+        output: "ok",
+        effect: (r) => {
+          const statePath = resolveSessionStatePath("p10-r17-f5-subset", DATA_DIR);
+          const data = JSON.parse(readFileSync(statePath, "utf8"));
+          if (data?.turnSnapshot?.gate) {
+            data.turnSnapshot.gate.docFiles = { "CHANGELOG.md": { size: 6, mtimeMs: 1 } };
+            data.turnSnapshot.gate.docFilesTruncated = true;
+            writeFileSync(statePath, JSON.stringify(data));
+          }
+          // Truncated non-empty subset where doc.txt is tracked in docFiles and README.md was modified AFTER the gate without commit:
+          writeFileSync(join(r, "README.md"), "# outside subset post-gate edit\n");
+        },
+      },
+    ]);
+    assert.equal(res.verdicts[0], VERDICT_HEADERS.PASS);
+    assertGateBlocked(res.out);
+
+    // Direct mergeShellWrittenFiles scenario simulating Stop (without dirtyFiles) when both current and gate snapshots
+    // hold the exact same non-empty subset { "CHANGELOG.md" } with docFilesTruncated=true after post-gate shell write:
+    const subLedger = {
+      sessionRole: "main",
+      transcriptAvailable: true,
+      turnStartStepIndex: 0,
+      lastWriteStepIndex: 1,
+      lastCodeWriteStepIndex: -1,
+      turnWrittenFiles: new Set(["CHANGELOG.md"]),
+      turnCodeWrittenFiles: new Set(),
+      turnToolWriteSteps: new Map([["CHANGELOG.md", 1]]),
+      turnGateAttempts: [{ stepIndex: 3, verdict: "PASS" }],
+      turnExecutions: [{ stepIndex: 5, kind: "other", command: "echo post >> README.md", hasResult: true }],
+    };
+    const cidDirect = "p10-r17-f5-direct";
+    const repoDirect = makeRepo();
+    writeFileSync(join(repoDirect, "CHANGELOG.md"), "# log\n");
+    git(repoDirect, ["add", "CHANGELOG.md"]);
+    git(repoDirect, ["commit", "-qm", "add log"]);
+    const baseSnap = snapshotWorkingTree(repoDirect);
+    baseSnap.docFiles = { "CHANGELOG.md": baseSnap.docFiles["CHANGELOG.md"] };
+    baseSnap.docFilesTruncated = true;
+    saveTurnSnapshot({ conversationId: cidDirect, snapshot: baseSnap, dataDir: DATA_DIR, turnStartStepIndex: 0 });
+    saveGateSnapshot({ conversationId: cidDirect, snapshot: baseSnap, dataDir: DATA_DIR, gatePassCount: 1 });
+    mergeShellWrittenFiles(subLedger, { conversationKey: cidDirect, cwd: repoDirect, dataDir: DATA_DIR });
+    assert.ok(subLedger.lastWriteStepIndex >= 5, `Expected lastWriteStepIndex >= 5 under Stop without dirtyFiles, got ${subLedger.lastWriteStepIndex}`);
+  });
+
+  it("R17-F6: keeps pre-gate shell-committed doc outside truncated baseline docFiles in turnWrittenFiles for R4", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "CHANGELOG.md"), "# log\n");
+    writeFileSync(join(repo, "README.md"), "# initial\n");
+    git(repo, ["add", "CHANGELOG.md", "README.md"]);
+    git(repo, ["commit", "-q", "-m", "add docs"]);
+
+    const res = runTurnOnRepo(repo, "p10-r17-f6-commit-trunc", [
+      {
+        cmd: "echo hi >> README.md && git commit -am doc",
+        output: "ok",
+        effect: (r) => {
+          const statePath = resolveSessionStatePath("p10-r17-f6-commit-trunc", DATA_DIR);
+          const data = JSON.parse(readFileSync(statePath, "utf8"));
+          if (data?.turnSnapshot) {
+            data.turnSnapshot.docFiles = { "CHANGELOG.md": { size: 6, mtimeMs: 1 } };
+            data.turnSnapshot.docFilesTruncated = true;
+            writeFileSync(statePath, JSON.stringify(data));
+          }
+          writeFileSync(join(r, "README.md"), "# committed doc edit\n");
+          git(r, ["commit", "-qam", "doc"]);
+        },
+      },
+      {
+        gate: {
+          modified_files: [],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "변경 없음.",
+        },
+      },
+    ]);
+    assert.ok(res.verdicts[0].includes(VERDICT_HEADERS.REJECT_NEUTRAL), res.verdicts[0]);
+  });
+
+  it("R17-F7: enforces bounded regular-file read in detectTestInfrastructure and sets uncertain on oversized setup.cfg", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "setup.cfg"), `[tool:pytest]\n# ${"a".repeat(300000)}\n`);
+    const infra = detectTestInfrastructure(repo, repo);
+    assert.equal(infra.uncertain, true, JSON.stringify(infra));
+
+    const noPkgRepo = createTempDir("hstack-p10-r17-f7-oversize-");
+    git(noPkgRepo, ["init", "-q"]);
+    git(noPkgRepo, ["config", "user.email", "t@example.com"]);
+    git(noPkgRepo, ["config", "user.name", "T"]);
+    writeFileSync(join(noPkgRepo, "app.mjs"), "export const v = 1;\n");
+    git(noPkgRepo, ["add", "."]);
+    git(noPkgRepo, ["commit", "-qm", "init"]);
+    writeFileSync(join(noPkgRepo, "setup.cfg"), `[metadata]\n# ${"x".repeat(300000)}\n`);
+
+    const infraNoPkg = detectTestInfrastructure(noPkgRepo, noPkgRepo);
+    assert.equal(infraNoPkg.uncertain, true, JSON.stringify(infraNoPkg));
+
+    const txPath = join(createTempDir("hstack-p10-r17-f7-tx-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(noPkgRepo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ]),
+    );
+    const gl = readGitLedger(noPkgRepo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "not_applicable", reason_if_na: "테스트 없음" }],
+        unverified_scope: ["실행 검증 미실시"],
+        self_assessment: "수정 완료.",
+      },
+      { cwd: noPkgRepo, ledger: readFactLedger(txPath, noPkgRepo, gl.gitRoot), gitLedger: gl, testInfra: infraNoPkg, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R17-F8: propagates read/parse errors in scanTestInfraDir as uncertain to block E2 degradation", () => {
+    const repo = createTempDir("hstack-p10-r17-f8-");
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@example.com"]);
+    git(repo, ["config", "user.name", "T"]);
+    writeFileSync(join(repo, "app.mjs"), "export const v = 1;\n");
+    writeFileSync(join(repo, "package.json"), "{invalid json");
+    mkdirSync(join(repo, "setup.cfg"), { recursive: true });
+    git(repo, ["add", "app.mjs", "package.json"]);
+    git(repo, ["commit", "-qm", "init"]);
+
+    const infra = detectTestInfrastructure(repo, repo);
+    assert.equal(infra.uncertain, true, JSON.stringify(infra));
+
+    const txPath = join(createTempDir("hstack-p10-r17-f8-tx-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "not_applicable", reason_if_na: "테스트 없음" }],
+        unverified_scope: ["실행 검증 미실시"],
+        self_assessment: "수정 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: infra, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R17-F9: allows non-pytest test runners whose file arguments contain the word pytest", () => {
+    const repo = makeRepo();
+    const cmd = "node --test test/pytest-hook.test.mjs";
+    const txPath = join(createTempDir("hstack-p10-r17-f9-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: cmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "테스트 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "PASS", dec.blockedRules.join(","));
+  });
+
+  it("R17-F10: selects single pytest config from common ancestor on multi-target runs instead of OR-merging sibling configs", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = -q\n");
+    const pkgA = join(repo, "packages", "a");
+    const pkgB = join(repo, "packages", "b");
+    mkdirSync(pkgA, { recursive: true });
+    mkdirSync(pkgB, { recursive: true });
+    writeFileSync(join(pkgA, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+    writeFileSync(join(pkgA, "test_a.py"), "def test_a(): assert True\n");
+    writeFileSync(join(pkgB, "test_b.py"), "def test_b(): assert True\n");
+
+    const cmd = "pytest packages/a/test_a.py packages/b/test_b.py";
+    const txPath = join(createTempDir("hstack-p10-r17-f10-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "2 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: cmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "PASS", dec.blockedRules.join(","));
+  });
+
+  it("R17-F11: resolves Windows drive-letter and UNC paths in cd commands without appending to previous cwd", () => {
+    const repo = makeRepo();
+    const txPath = join(createTempDir("hstack-p10-r17-f11-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "cd D:/proj && node --test test/a.test.mjs", Cwd: "C:/base" } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: FAIL_OUTPUT },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: "D:\\proj" } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "전체 재실행 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "PASS", dec.blockedRules.join(","));
+  });
+});
