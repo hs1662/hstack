@@ -667,7 +667,7 @@ const INLINE_CODE_FLAG_RE = {
   tsx: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
 };
 
-const SHELL_SAFE_SHORT_FLAGS = new Set(["a", "c", "e", "l", "o", "u", "v", "x"]);
+const SHELL_SAFE_SHORT_FLAGS = new Set(["a", "c", "e", "l", "u", "v", "x"]);
 const SHELL_SAFE_LONG_NAMED_OPTIONS = new Set(["allexport", "errexit", "nounset", "pipefail", "verbose", "xtrace"]);
 
 function buildShellBody(body, pipefail, allexport) {
@@ -1791,63 +1791,84 @@ function normalizePrepPrefixTokens(words) {
   const out = [];
   for (let i = 0; i < words.length; i += 1) {
     const w = words[i];
-    if (w === "env") {
+    if (w === "env" || w === "sudo") {
+      const isEnv = w === "env";
+      const chdirChar = isEnv ? "C" : "D";
+      const valueFlags = WRAPPER_FLAGS_WITH_ARG[w];
+      const valueChars = WRAPPER_VALUE_SHORT_CHARS[w];
       out.push(w);
       i += 1;
       while (i < words.length) {
         const arg = words[i];
-        if (arg === "-C" || arg === "--chdir") {
+        if (arg === "--") {
+          out.push(arg);
+          break;
+        }
+        if ((isEnv && arg === "-C") || (!isEnv && arg === "-D") || arg === "--chdir") {
           i += 2;
           continue;
         }
-        if (arg.startsWith("--chdir=") || (arg.startsWith("-C") && arg.length > 2)) {
+        if (arg.startsWith("--chdir=") || (isEnv && arg.startsWith("-C") && arg.length > 2) || (!isEnv && arg.startsWith("-D") && arg.length > 2)) {
           i += 1;
           continue;
         }
-        if (/^-[A-Za-z0-9]+$/.test(arg) && arg.includes("C")) {
-          const cIdx = arg.indexOf("C");
-          const head = arg.slice(0, cIdx);
-          if (head.length > 1) out.push(head);
-          if (cIdx === arg.length - 1) i += 1;
+        if (valueFlags?.has(arg)) {
+          out.push(arg);
+          if (i + 1 < words.length) {
+            out.push(words[i + 1]);
+            i += 2;
+          } else {
+            i += 1;
+          }
+          continue;
+        }
+        if (arg.startsWith("--")) {
+          out.push(arg);
           i += 1;
           continue;
         }
-        if (!arg.startsWith("-") && !ENV_ASSIGN_RE.test(arg)) {
-          i -= 1;
-          break;
-        }
-        out.push(arg);
-        i += 1;
-      }
-      continue;
-    }
-    if (w === "sudo") {
-      out.push(w);
-      i += 1;
-      while (i < words.length) {
-        const arg = words[i];
-        if (arg === "-D" || arg === "--chdir") {
-          i += 2;
-          continue;
-        }
-        if (arg.startsWith("--chdir=")) {
+        if (isEnv && arg === "-") {
+          out.push(arg);
           i += 1;
           continue;
         }
-        if (/^-[A-Za-z0-9]+$/.test(arg) && arg.includes("D")) {
-          const dIdx = arg.indexOf("D");
-          const head = arg.slice(0, dIdx);
-          if (head.length > 1) out.push(head);
-          if (dIdx === arg.length - 1) i += 1;
+        if (arg.startsWith("-") && arg.length > 1) {
+          let handled = false;
+          for (let k = 1; k < arg.length; k += 1) {
+            const ch = arg[k];
+            if (ch === chdirChar) {
+              const head = arg.slice(0, k);
+              if (head.length > 1) out.push(head);
+              i += k === arg.length - 1 ? 2 : 1;
+              handled = true;
+              break;
+            }
+            if (valueChars?.has(ch)) {
+              out.push(arg);
+              if (k === arg.length - 1 && i + 1 < words.length) {
+                out.push(words[i + 1]);
+                i += 2;
+              } else {
+                i += 1;
+              }
+              handled = true;
+              break;
+            }
+          }
+          if (handled) {
+            continue;
+          }
+          out.push(arg);
           i += 1;
           continue;
         }
-        if (!arg.startsWith("-")) {
-          i -= 1;
-          break;
+        if (isEnv && ENV_ASSIGN_RE.test(arg)) {
+          out.push(arg);
+          i += 1;
+          continue;
         }
-        out.push(arg);
-        i += 1;
+        i -= 1;
+        break;
       }
       continue;
     }

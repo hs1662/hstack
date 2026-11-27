@@ -98,8 +98,8 @@ function advanceDir(currentDir, op, arg, opaqueSeq) {
   return { dir: nextDir, stack };
 }
 
-function unsetClearsVar(args, varName) {
-  let varOnly = false;
+function extractUnsetClearedVars(args) {
+  const cleared = [];
   let afterDoubleDash = false;
   for (let i = 0; i < args.length; i += 1) {
     const tok = args[i];
@@ -109,31 +109,28 @@ function unsetClearsVar(args, varName) {
     }
     if (!afterDoubleDash && tok.startsWith("-") && tok.length > 1) {
       if (tok === "-f" || tok === "-n") {
-        return false;
+        return [];
       }
       if (tok === "-v") {
-        varOnly = true;
         continue;
       }
       if (/^-[fnv]+$/.test(tok)) {
         if (tok.includes("f") || tok.includes("n")) {
-          return false;
-        }
-        if (tok.includes("v")) {
-          varOnly = true;
+          return [];
         }
         continue;
       }
-      return false;
+      return [];
     }
-    if (tok === varName) {
-      return true;
-    }
-    if (varOnly) {
-      continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)) {
+      cleared.push(tok);
     }
   }
-  return false;
+  return cleared;
+}
+
+function unsetClearsVar(args, varName) {
+  return extractUnsetClearedVars(args).includes(varName);
 }
 
 function parseSetAllexportUpdate(segTokens) {
@@ -272,17 +269,18 @@ function extractVerificationEntries(
       }
       continue;
     } else if (unwrapped?.builtin === "unset") {
-      if (unsetClearsVar(unwrapped.args, "PYTEST_ADDOPTS")) {
+      const clearedVars = extractUnsetClearedVars(unwrapped.args);
+      if (clearedVars.includes("PYTEST_ADDOPTS")) {
         chainEnvPytestExported = false;
         chainEnvPytestAddopts = null;
         chainEnvPytestOpaque = false;
         localPytestAddopts = null;
         localPytestOpaque = false;
       }
-      for (const tok of unwrapped.args) {
-        if (!tok.startsWith("-") && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)) {
-          exportedOtherEnv.delete(tok);
-          localOtherEnv.delete(tok);
+      for (const name of clearedVars) {
+        if (name !== "PYTEST_ADDOPTS") {
+          exportedOtherEnv.delete(name);
+          localOtherEnv.delete(name);
         }
       }
       continue;

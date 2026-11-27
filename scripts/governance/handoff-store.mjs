@@ -138,7 +138,9 @@ function reclaimStaleSessionLock(lockPath) {
       ],
       { stdio: "ignore", timeout: 5000 },
     );
-    return !res.error && res.status === 0;
+    if (res.error?.code !== "ENOENT") {
+      return !res.error && res.status === 0;
+    }
   }
   const guardPath = `${lockPath}.reclaim`;
   const guardNonce = randomBytes(8).toString("hex");
