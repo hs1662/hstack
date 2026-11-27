@@ -667,7 +667,7 @@ const INLINE_CODE_FLAG_RE = {
   tsx: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
 };
 
-const SHELL_SAFE_SHORT_FLAGS = new Set(["a", "c", "e", "o", "u", "v", "x"]);
+const SHELL_SAFE_SHORT_FLAGS = new Set(["a", "c", "e", "l", "o", "u", "v", "x"]);
 const SHELL_SAFE_LONG_NAMED_OPTIONS = new Set(["allexport", "errexit", "nounset", "pipefail", "verbose", "xtrace"]);
 
 // The inline body of an interpreter given code on its command line, or null for a script or a plain run.
@@ -680,7 +680,7 @@ function inlineInterpreterBody(bin, args) {
     let noexec = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aeuxv]*o$/.test(arg)) {
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aeluxv]*o$/.test(arg)) {
         if (arg === "-O" || arg === "+O") {
           return "";
         }
@@ -700,7 +700,7 @@ function inlineInterpreterBody(bin, args) {
           return "";
         }
         i += 1;
-      } else if (/^[-+][A-Za-z]+$/.test(arg)) {
+      } else if (/^-[A-Za-z]*c/.test(arg) || /^[-+][A-Za-z]+$/.test(arg)) {
         const enable = arg[0] === "-";
         let cIdx = -1;
         for (let k = 1; k < arg.length; k += 1) {
