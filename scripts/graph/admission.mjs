@@ -4,7 +4,7 @@ import { graphError, immutable, isRecord, nonempty, normalizeGateCommand,
 const defaults = Object.freeze({
   maxNodes: 256, maxWidth: 64, maxDepth: 64, readConcurrency: 6,
   minParallelFraction: 0.65, maxEdgeDensity: 1.2, minEstimatedMinutes: 15, minIndependent: 3,
-  maxInfraRetries: 3, maxFlakyDiagnostics: 1,
+  maxInfraRetries: 3, maxFlakyDiagnostics: 1, maxInlineBytesPerNode: 4500, maxInlineBytesPerWave: 15000,
 });
 const optionalLimits = ['maxPins', 'maxAttempts'];
 const limitError = message => graphError('ERR_GRAPH_LIMIT', message);
@@ -21,7 +21,7 @@ function normalizeLimits(input = {}) {
   for (const key of ['maxNodes', 'maxWidth', 'maxDepth', 'readConcurrency', 'minEstimatedMinutes', 'minIndependent']) {
     if (!Number.isSafeInteger(limits[key]) || limits[key] < 1) throw limitError(`${key} must be a positive safe integer`);
   }
-  for (const key of ['maxInfraRetries', 'maxFlakyDiagnostics', ...optionalLimits]) {
+  for (const key of ['maxInfraRetries', 'maxFlakyDiagnostics', 'maxInlineBytesPerNode', 'maxInlineBytesPerWave', ...optionalLimits]) {
     if (Object.hasOwn(limits, key) && (!Number.isSafeInteger(limits[key]) || limits[key] < 0)) {
       throw limitError(`${key} must be a nonnegative safe integer`);
     }

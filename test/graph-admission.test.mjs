@@ -38,6 +38,15 @@ test('flaky diagnostics keep their own bounded budget through admission and read
   assert.throws(() => compileGraph(graph([node('bad',{flaky:'yes'})])), {code:'ERR_GRAPH_SCHEMA'});
 });
 
+test('host byte budgets round-trip through graph admission without token estimation', async () => {
+  const {compileGraph} = await admission();
+  const nodes = [node('a')];
+  const limits = compileGraph(graph(nodes,{maxInlineBytesPerNode:0,maxInlineBytesPerWave:255})).limits;
+  assert.equal(limits.maxInlineBytesPerNode,0);
+  assert.equal(limits.maxInlineBytesPerWave,255);
+  assert.throws(() => compileGraph(graph(nodes,{maxInlineBytesPerNode:-1})),{code:'ERR_GRAPH_LIMIT'});
+});
+
 test('three independent 5-minute reads recommend parallel work, unlike a chain', async () => {
   const { compileGraph } = await admission();
   const parallel = compileGraph(graph([node('c'), node('a'), node('b')]));
