@@ -7,6 +7,14 @@ import test from 'node:test';
 const admission = () => import('../scripts/graph/admission.mjs');
 const fingerprint = () => import('../scripts/graph/fingerprint.mjs');
 const schema = () => import('../scripts/graph/schema.mjs');
+test('run records can represent both terminal outcomes reported by the engine', async () => {
+  const { Run } = await schema();
+  for (const status of ['completed', 'degraded']) {
+    const record = Run({schemaVersion: 1, runId: 'r', repoIdentity: 'repo', startBase: '1'.repeat(40),
+      graphRev: 1, specDigest: 'a'.repeat(64), policyDigest: 'b'.repeat(64), seq: 2, budget: {}, status});
+    assert.equal(record.status, status);
+  }
+});
 const node = (id, fields = {}) => ({
   id, kind: 'read', dependsOn: [], readScope: [], writeScope: [],
   estimatedMinutes: 5, priority: 0, prompt: `Investigate ${id}`, skills: [], rules: [], ...fields,

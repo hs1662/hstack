@@ -105,7 +105,7 @@ const records = {
   Run: {
     runId: nonempty, repoIdentity: nonempty, startBase: gitOid, integrationRef: optional(nonempty),
     graphRev: positive, specDigest: hash, policyDigest: hash, seq: safeInteger, headHash: optional(hash),
-    budget: object, status: oneOf('open', 'held', 'complete'),
+    budget: object, status: oneOf('open', 'held', 'completed', 'degraded'),
   },
   Node: {
     nodeId: nonempty, graphRev: positive, kind: oneOf('read', 'verify', 'reducer', 'write'),
