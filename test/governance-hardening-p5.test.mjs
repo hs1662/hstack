@@ -220,13 +220,15 @@ describe("MED4 Stop ignores committed files that were already dirty at turn star
       dataDir: DATA_DIR,
       skipAuditLog: true,
     });
+    let passCount = 0;
     for (const step of steps) {
       let call;
       let result = "ok";
       if (step.gate) {
         call = { name: GATE_TOOL_NAME, args: {} };
+        passCount += 1;
         // What the MCP server records on a passing verdict.
-        saveGateSnapshot({ conversationId, snapshot: snapshotWorkingTree(repo), dataDir: DATA_DIR });
+        saveGateSnapshot({ conversationId, snapshot: snapshotWorkingTree(repo), dataDir: DATA_DIR, gatePassCount: passCount });
         result = `${VERDICT_HEADERS.PASS}\n`;
       } else if (step.write) {
         writeFileSync(join(repo, step.write), step.content);

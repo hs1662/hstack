@@ -568,7 +568,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const passingAttempts = ledger.turnGateAttempts.filter((attempt) => PASSING_VERDICTS.has(attempt.verdict));
   const lastGateStep = passingAttempts.at(-1)?.stepIndex ?? -1;
   const activeGate =
-    baseline?.gate && (baseline.gate.passCount === null || baseline.gate.passCount === passingAttempts.length)
+    baseline?.gate && typeof baseline.gate.passCount === "number" && baseline.gate.passCount === passingAttempts.length
       ? baseline.gate
       : null;
   // Commits made this turn leave a clean tree, so the files they touched count as changed too.
@@ -594,12 +594,30 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     }
     return true;
   }
+  const postGateShell = activeGate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
+  const postGateWriter = postGateShell.some(isRiskyShellExec);
+  const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
+  const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
+  const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
+
   if (sinceTurn.size > 0) {
     if (!(ledger.turnCommittedFiles instanceof Set)) {
       ledger.turnCommittedFiles = new Set();
     }
     for (const relPath of sinceTurn) {
       ledger.turnCommittedFiles.add(relPath);
+      if (isExemptDocOrAssetPath(relPath)) {
+        const isPostGate = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
+        const docStep = isPostGate
+          ? datingStep(postGateShell)
+          : preGateShell.length > 0
+            ? datingStep(preGateShell)
+            : ledger.turnStartStepIndex;
+        if (isPostGate || !preGateKeepsToolDate(relPath)) {
+          ledger.turnWrittenFiles.add(relPath);
+          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, docStep);
+        }
+      }
     }
   }
   if (sinceTurn.size > 0 && diffNumstat instanceof Map && baseline.head !== null) {
@@ -648,12 +666,6 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     const now = fromCurrent !== undefined ? fromCurrent : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
     return before !== undefined ? !sameFileSignature(before, now) : now !== undefined;
   };
-  const postGateShell = activeGate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
-  const postGateWriter = postGateShell.some(isRiskyShellExec);
-  const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
-  const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
-  const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
-
   const canDiffTurnUntracked = Boolean(!baseline.untrackedTruncated && !current.untrackedTruncated && baseline.untrackedFiles && current.untrackedFiles);
   const canDiffGateUntracked = Boolean(
     postGateShell.length > 0 &&

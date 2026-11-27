@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import {
   extractLinePrefixType,
@@ -146,7 +146,15 @@ const MAKE_SAFE_LONG_FLAGS = new Set([
   "--stop-on-failure",
   "--stop-on-error",
 ]);
-const MAKE_LONG_VALUE_FLAGS = new Set(["--directory", "--file", "--makefile", "--include-dir", "--output-sync", "--shuffle", "--jobs", "--load-average", "--max-load", "--debug"]);
+const MAKE_LONG_REQUIRED_VALUE_FLAGS = new Set(["--directory", "--file", "--makefile", "--include-dir"]);
+const MAKE_LONG_OPTIONAL_VALUE_FLAGS = new Set(["--debug", "--output-sync", "--shuffle"]);
+const MAKE_LONG_OPT_NUM_FLAGS = new Set(["--jobs", "--load-average", "--max-load"]);
+const MAKE_LONG_VALUE_FLAGS = new Set([
+  ...MAKE_LONG_REQUIRED_VALUE_FLAGS,
+  ...MAKE_LONG_OPTIONAL_VALUE_FLAGS,
+  ...MAKE_LONG_OPT_NUM_FLAGS,
+]);
+const MAKE_BLOCKED_VARS = new Set(["MAKEFLAGS", "GNUMAKEFLAGS", "SHELL", "MAKE", ".SHELLFLAGS", "VPATH", "PATH"]);
 const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "l", "j"]);
 const MAKE_NOOP_SHORT_FLAGS = new Set(["n", "q", "t", "p", "h", "v", "i", "o", "W", "k"]);
 const MAKE_SAFE_SHORT_FLAGS = new Set(["B", "s", "w", "r", "R", "S", "d", "e", "L", "O"]);
@@ -1107,8 +1115,12 @@ function isMakeVerification(args) {
   const blockedArgs = (sepIdx === -1 ? head : args);
   for (let i = 0; i < blockedArgs.length; i += 1) {
     const arg = blockedArgs[i];
-    if (/^(?:MAKEFLAGS|GNUMAKEFLAGS|SHELL|MAKE)=/.test(arg)) {
-      return false;
+    if (!arg.startsWith("-") && arg.includes("=")) {
+      const assignMatch = /^([A-Za-z0-9_.-]+)\s*(?::::=|::=|:=|!=|\?=|\+=|=)/.exec(arg);
+      if (!assignMatch || MAKE_BLOCKED_VARS.has(assignMatch[1])) {
+        return false;
+      }
+      continue;
     }
     if (arg === "--" || !arg.startsWith("-")) {
       continue;
@@ -1122,18 +1134,21 @@ function isMakeVerification(args) {
       if (eqIdx !== -1 && !MAKE_LONG_VALUE_FLAGS.has(flagName)) {
         return false;
       }
-      if (eqIdx !== -1 && (flagName === "--jobs" || flagName === "--load-average" || flagName === "--max-load")) {
+      if (eqIdx !== -1 && MAKE_LONG_OPT_NUM_FLAGS.has(flagName)) {
         const val = arg.slice(eqIdx + 1);
         if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(val)) {
           return false;
         }
       }
-      if (eqIdx === -1 && MAKE_LONG_VALUE_FLAGS.has(flagName)) {
-        if ((flagName === "--jobs" || flagName === "--load-average" || flagName === "--max-load") && (!blockedArgs[i + 1] || !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(blockedArgs[i + 1]))) {
-          continue;
-        }
-        if (i + 1 < blockedArgs.length) {
-          i += 1;
+      if (eqIdx === -1) {
+        if (MAKE_LONG_REQUIRED_VALUE_FLAGS.has(flagName)) {
+          if (i + 1 < blockedArgs.length) {
+            i += 1;
+          }
+        } else if (MAKE_LONG_OPT_NUM_FLAGS.has(flagName)) {
+          if (blockedArgs[i + 1] && /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(blockedArgs[i + 1])) {
+            i += 1;
+          }
         }
       }
       continue;
@@ -1298,6 +1313,11 @@ function extractWrapperDirAfterFlag(flagToken, flagChar) {
   return flagToken.slice(fIdx + 1);
 }
 
+const WRAPPER_DIR_FLAGS = {
+  env: { short: "C", long: "--chdir" },
+  sudo: { short: "D", long: "--chdir" },
+};
+
 export function extractChainPrepSignature(segment) {
   if (typeof segment !== "string" || segment.trim().length === 0) {
     return null;
@@ -1324,7 +1344,7 @@ export function extractChainPrepSignature(segment) {
     }
     if (SHELL_WRAPPERS.has(tok)) {
       const valueFlags = WRAPPER_FLAGS_WITH_ARG[tok];
-      const dirFlagChar = tok === "sudo" ? "D" : tok === "env" ? "C" : "";
+      const dirSpec = WRAPPER_DIR_FLAGS[tok] ?? null;
       pIdx += 1;
       while (pIdx < idx) {
         const arg = parsed.words[pIdx];
@@ -1332,17 +1352,17 @@ export function extractChainPrepSignature(segment) {
           pIdx += 1;
           break;
         }
-        if ((arg === `-${dirFlagChar}` || (tok === "env" && arg === "--chdir")) && dirFlagChar && pIdx + 1 < idx) {
+        if (dirSpec && (arg === `-${dirSpec.short}` || arg === dirSpec.long) && pIdx + 1 < idx) {
           dirParts.push(posix.normalize(toPosix(parsed.words[pIdx + 1])));
           pIdx += 2;
           continue;
         }
-        if (tok === "env" && arg.startsWith("--chdir=")) {
-          dirParts.push(posix.normalize(toPosix(arg.slice("--chdir=".length))));
+        if (dirSpec && arg.startsWith(`${dirSpec.long}=`)) {
+          dirParts.push(posix.normalize(toPosix(arg.slice(dirSpec.long.length + 1))));
           pIdx += 1;
           continue;
         }
-        const attachedDir = dirFlagChar ? extractWrapperDirAfterFlag(arg, dirFlagChar) : "";
+        const attachedDir = dirSpec ? extractWrapperDirAfterFlag(arg, dirSpec.short) : "";
         if (attachedDir) {
           dirParts.push(posix.normalize(toPosix(attachedDir)));
           pIdx += 1;
@@ -2996,14 +3016,26 @@ function decodeWithoutLeadingContent(buf) {
 function countTextFileLinesLightweight(absPath) {
   let fd;
   try {
-    fd = openSync(absPath, "r");
-    const size = fstatSync(fd).size;
+    const lst = lstatSync(absPath);
+    if (!lst.isFile()) {
+      return null;
+    }
+    const openFlags = (fsConstants.O_RDONLY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0);
+    fd = openSync(absPath, openFlags);
+    const fst = fstatSync(fd);
+    if (!fst.isFile()) {
+      return null;
+    }
+    const size = fst.size;
     if (size === 0) {
       return 0;
     }
     const readBytes = Math.min(size, MAX_UNTRACKED_COUNT_BYTES);
     const buf = Buffer.allocUnsafe(readBytes);
     const actual = readSync(fd, buf, 0, readBytes, 0);
+    if (actual < size) {
+      return null;
+    }
     let lines = 0;
     for (let i = 0; i < actual; i += 1) {
       if (buf[i] === 0x00) {
@@ -3291,12 +3323,17 @@ export function readGitLedger(cwd) {
       return empty;
     }
 
-    const statusOut = execFileSync("git", ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-uall", "-z"], {
-      cwd: gitRoot,
-      timeout: remainingTimeout(),
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
+    let statusOut;
+    try {
+      statusOut = execFileSync("git", ["-c", "core.quotepath=false", "status", "--porcelain=v1", "-uall", "-z"], {
+        cwd: gitRoot,
+        timeout: remainingTimeout(),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      return { ...empty, gitAvailable: true, gitRoot, numstatUnavailable: true };
+    }
 
     const gitDirtyFiles = new Set();
     const untrackedFiles = [];

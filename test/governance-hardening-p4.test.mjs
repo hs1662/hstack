@@ -56,13 +56,15 @@ function runTurn(repo, conversationId, steps) {
     JSON.stringify({ hookEventName: "PreInvocation", invocationNum: 0, conversationId, cwd: repo, transcriptPath }),
     { dataDir: DATA_DIR, skipAuditLog: true },
   );
+  let passCount = 0;
   for (const step of steps) {
     let call;
     let result = "ok";
     if (step.gate) {
       call = { name: GATE_TOOL_NAME, args: {} };
+      passCount += 1;
       // What the MCP server records on a passing verdict.
-      saveGateSnapshot({ conversationId, snapshot: snapshotWorkingTree(repo), dataDir: DATA_DIR });
+      saveGateSnapshot({ conversationId, snapshot: snapshotWorkingTree(repo), dataDir: DATA_DIR, gatePassCount: passCount });
       result = `${VERDICT_HEADERS.PASS}\n`;
     } else if (step.write) {
       writeFileSync(join(repo, step.write), step.content);

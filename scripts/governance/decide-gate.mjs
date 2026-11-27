@@ -76,23 +76,42 @@ function extractVerificationEntries(cmd, baseDir = ".") {
   let prepPrefixes = [];
   let seq = 0;
   for (const seg of splitShellSegments(cmd)) {
-    const norm = normalizeCommandText(seg);
-    if (norm.length === 0) {
+    const rawTrimmed = seg.trim();
+    if (rawTrimmed.length === 0) {
       continue;
     }
-    const dirMatch = /^(cd|pushd|popd)(?:\s+(.*))?$/.exec(norm);
-    if (dirMatch) {
+    const segTokens = splitQuotedWhitespace(rawTrimmed);
+    if (segTokens === null && /^(?:cd|pushd|popd)(?:\s|$)/.test(rawTrimmed)) {
       seq += 1;
-      state = advanceDir(state, dirMatch[1], dirMatch[2]?.trim(), seq);
+      state = advanceDir(state, rawTrimmed.split(/\s+/, 1)[0], "$opaque", seq);
       continue;
     }
+    if (segTokens && segTokens.length > 0 && /^(?:cd|pushd|popd)$/.test(segTokens[0])) {
+      seq += 1;
+      const dirArg = segTokens.length === 2 && !segTokens[1].startsWith("-") ? segTokens[1] : segTokens.length === 1 ? undefined : `$${segTokens.slice(1).join(" ")}`;
+      if (dirArg === undefined || dirArg === "-" || dirArg.startsWith("~") || /[$`]/.test(dirArg)) {
+        state = advanceDir(state, segTokens[0], dirArg, seq);
+      } else {
+        const nextDir = dirArg.startsWith("/")
+          ? normalizeExecDir(dirArg)
+          : state.dir.startsWith("opaque:")
+            ? `${state.dir}/${dirArg}`
+            : state.dir === "."
+              ? normalizeExecDir(dirArg)
+              : normalizeExecDir(`${state.dir}/${dirArg}`);
+        const stack = segTokens[0] === "pushd" ? [...state.stack, state.dir] : state.stack;
+        state = { dir: nextDir, stack };
+      }
+      continue;
+    }
+    const norm = normalizeCommandText(seg);
     const prepSig = extractChainPrepSignature(seg);
     if (prepSig) {
       prepPrefixes.push(`${state.dir}::${prepSig}`);
       continue;
     }
     if (classifyCommand(norm) === "verification") {
-      entries.push({ seg: seg.trim(), dir: state.dir, prepKey: prepPrefixes.join(" && ") });
+      entries.push({ seg: rawTrimmed, dir: state.dir, prepKey: prepPrefixes.join(" && ") });
     }
   }
   return entries;
@@ -194,6 +213,68 @@ function splitQuotedWhitespace(rawValue, { splitComma = false } = {}) {
   return items;
 }
 
+function decodeTomlStringToken(rawBody, startIdx) {
+  const quote = rawBody[startIdx];
+  if (quote !== '"' && quote !== "'") {
+    return null;
+  }
+  if (rawBody.slice(startIdx, startIdx + 3) === quote.repeat(3)) {
+    return null;
+  }
+  let i = startIdx + 1;
+  if (quote === "'") {
+    while (i < rawBody.length) {
+      if (rawBody[i] === "'") {
+        return { value: rawBody.slice(startIdx + 1, i), nextIdx: i + 1 };
+      }
+      if (rawBody[i] === "\n" || rawBody[i] === "\r") {
+        return null;
+      }
+      i += 1;
+    }
+    return null;
+  }
+  let out = "";
+  while (i < rawBody.length) {
+    const ch = rawBody[i];
+    if (ch === '"') {
+      return { value: out, nextIdx: i + 1 };
+    }
+    if (ch === "\n" || ch === "\r") {
+      return null;
+    }
+    if (ch === "\\") {
+      if (i + 1 >= rawBody.length) {
+        return null;
+      }
+      const esc = rawBody[i + 1];
+      if (esc === "b") { out += "\b"; i += 2; continue; }
+      if (esc === "t") { out += "\t"; i += 2; continue; }
+      if (esc === "n") { out += "\n"; i += 2; continue; }
+      if (esc === "f") { out += "\f"; i += 2; continue; }
+      if (esc === "r") { out += "\r"; i += 2; continue; }
+      if (esc === '"') { out += '"'; i += 2; continue; }
+      if (esc === "\\") { out += "\\"; i += 2; continue; }
+      if (esc === "u" && /^[0-9A-Fa-f]{4}$/.test(rawBody.slice(i + 2, i + 6))) {
+        out += String.fromCodePoint(parseInt(rawBody.slice(i + 2, i + 6), 16));
+        i += 6;
+        continue;
+      }
+      if (esc === "U" && /^[0-9A-Fa-f]{8}$/.test(rawBody.slice(i + 2, i + 10))) {
+        const cp = parseInt(rawBody.slice(i + 2, i + 10), 16);
+        if (cp > 0x10ffff) return null;
+        out += String.fromCodePoint(cp);
+        i += 10;
+        continue;
+      }
+      return null;
+    }
+    out += ch;
+    i += 1;
+  }
+  return null;
+}
+
 function parseTomlStringArray(rawArrayBody) {
   const items = [];
   let i = 0;
@@ -210,33 +291,15 @@ function parseTomlStringArray(rawArrayBody) {
       continue;
     }
     if (ch === '"' || ch === "'") {
-      const quote = ch;
-      i += 1;
-      let val = "";
-      let closed = false;
-      while (i < rawArrayBody.length) {
-        const c = rawArrayBody[i];
-        if (c === "\\" && quote === '"' && i + 1 < rawArrayBody.length) {
-          i += 1;
-          val += rawArrayBody[i];
-          i += 1;
-          continue;
-        }
-        if (c === quote) {
-          closed = true;
-          i += 1;
-          break;
-        }
-        val += c;
-        i += 1;
-      }
-      if (!closed) {
+      const decoded = decodeTomlStringToken(rawArrayBody, i);
+      if (!decoded) {
         return null;
       }
-      const normalized = normalizeTestpathItem(val);
+      const normalized = normalizeTestpathItem(decoded.value);
       if (normalized) {
         items.push(normalized);
       }
+      i = decoded.nextIdx;
       continue;
     }
     return null;
@@ -304,7 +367,7 @@ function shlexSplitTestpaths(rawValue) {
 }
 
 function extractBracketedTomlArray(sectionBody) {
-  const startMatch = /(?:^|\n)[ \t]*testpaths[ \t]*=[ \t]*\[/.exec(sectionBody);
+  const startMatch = /(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*\[/.exec(sectionBody);
   if (!startMatch) {
     return null;
   }
@@ -343,6 +406,31 @@ function extractBracketedTomlArray(sectionBody) {
   return "";
 }
 
+function sectionHasUnsupportedTestpathsKey(sectionBody) {
+  for (const line of sectionBody.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#") || !t.includes("=")) {
+      continue;
+    }
+    if (t.startsWith('"') || t.startsWith("'")) {
+      const dec = decodeTomlStringToken(t, 0);
+      if (!dec) {
+        return true;
+      }
+      const after = t.slice(dec.nextIdx).trim();
+      if (dec.value === "testpaths" && !after.startsWith("=")) {
+        return true;
+      }
+      if (dec.value === "testpaths" && after.startsWith("=") && !/^["']testpaths["'][ \t]*=/.test(t)) {
+        return true;
+      }
+    } else if (/^testpaths\s*\./.test(t)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function readPytestTestpaths(execDir) {
   if (!execDir || !existsSync(execDir)) {
     return { restricted: false, paths: [] };
@@ -365,7 +453,10 @@ function readPytestTestpaths(execDir) {
       const text = readFileSync(pyprojPath, "utf8");
       const sect = /\[tool\.pytest\.ini_options\]([\s\S]*?)(?:\n\[|$)/.exec(text);
       if (sect) {
-        if (!/(?:^|\n)[ \t]*testpaths[ \t]*=/.test(sect[1])) {
+        if (sectionHasUnsupportedTestpathsKey(sect[1])) {
+          return { restricted: true, paths: [] };
+        }
+        if (!/(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=/.test(sect[1])) {
           return { restricted: false, paths: [] };
         }
         const arrBody = extractBracketedTomlArray(sect[1]);
@@ -373,11 +464,18 @@ function readPytestTestpaths(execDir) {
           const paths = parseTomlStringArray(arrBody);
           return paths ? { restricted: true, paths } : { restricted: true, paths: [] };
         }
-        const strMatch = /testpaths[ \t]*=[ \t]*(.+)/.exec(sect[1]);
-        const split = strMatch ? shlexSplitTestpaths(strMatch[1].replace(/\s+#.*$/, "")) : null;
-        return split ? { restricted: true, paths: split } : { restricted: true, paths: [] };
+        const strMatch = /(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*(.+)/.exec(sect[1]);
+        if (strMatch) {
+          const rhs = strMatch[1].trim();
+          const dec = decodeTomlStringToken(rhs, 0);
+          if (dec && (!rhs.slice(dec.nextIdx).trim() || rhs.slice(dec.nextIdx).trim().startsWith("#"))) {
+            const split = shlexSplitTestpaths(dec.value);
+            return split ? { restricted: true, paths: split } : { restricted: true, paths: [] };
+          }
+        }
+        return { restricted: true, paths: [] };
       }
-      if (/^\[tool\.pytest\b/m.test(text)) {
+      if (/^\[(?:["']?tool["']?\s*\.\s*["']?pytest["']?\b)/m.test(text)) {
         return { restricted: true, paths: [] };
       }
     } catch {
@@ -543,7 +641,28 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
       ? failed.slice(index + 1).every((_, k) => dropped.includes(index + 1 + k))
       : isTarget(failed, index) && isDefaultDiscoverableTestTarget(failed[index], runner.prefix, execDir),
   );
-  return droppedOnlyTargets && !passed.some((_, index) => index >= runner.end && isTarget(passed, index));
+  const hasRemainingPositionalTarget = (tokens) => {
+    let afterDoubleDash = false;
+    for (let i = runner.end; i < tokens.length; i += 1) {
+      const tok = tokens[i];
+      if (afterDoubleDash) {
+        return true;
+      }
+      if (tok === "--") {
+        afterDoubleDash = true;
+        continue;
+      }
+      if (tok.startsWith("-")) {
+        if (RUNNER_VALUE_FLAGS.has(tok) && i + 1 < tokens.length) {
+          i += 1;
+        }
+        continue;
+      }
+      return true;
+    }
+    return false;
+  };
+  return droppedOnlyTargets && !hasRemainingPositionalTarget(passed);
 }
 
 function resolveEntryExecDir(entryDir, baseCwd) {
@@ -761,25 +880,50 @@ export function formatGateReceipt({
   return lines.join("\n");
 }
 
-function commandMatchesExecution(normClaim, execCommand) {
-  const normExec = normalizeCommandText(execCommand);
-  if (normClaim.length === 0 || normExec.length === 0) {
+function tokensEqualExact(a, b) {
+  return a.length === b.length && a.every((tok, idx) => tok === b[idx]);
+}
+
+function tokensPrefixMatch(prefixTokens, fullTokens) {
+  return fullTokens.length > prefixTokens.length && prefixTokens.every((tok, idx) => fullTokens[idx] === tok);
+}
+
+function commandMatchesExecution(rawClaim, execCommand) {
+  const claimText = typeof rawClaim === "string" ? rawClaim.trim() : "";
+  const execText = typeof execCommand === "string" ? execCommand.trim() : "";
+  if (claimText.length === 0 || execText.length === 0) {
     return false;
   }
-  if (normExec === normClaim) {
+  const claimTokens = splitQuotedWhitespace(claimText);
+  const execTokens = splitQuotedWhitespace(execText);
+  const allowPrefixMatch = claimTokens
+    ? !(claimTokens.length === 1 && BARE_RUNTIME_LAUNCHERS.has(claimTokens[0]))
+    : !isBareRuntimeLauncher(normalizeCommandText(claimText));
+  if (claimTokens && execTokens) {
+    if (tokensEqualExact(claimTokens, execTokens)) {
+      return true;
+    }
+    if (allowPrefixMatch && tokensPrefixMatch(claimTokens, execTokens)) {
+      return true;
+    }
+  } else if (execText === claimText) {
     return true;
   }
-  const allowPrefixMatch = !isBareRuntimeLauncher(normClaim);
-  const execSegments = splitShellSegments(execCommand).map(normalizeCommandText).filter(Boolean);
+  const execSegments = splitShellSegments(execCommand).map((s) => s.trim()).filter(Boolean);
   for (const seg of execSegments) {
-    if (seg === normClaim) {
-      return true;
-    }
-    if (allowPrefixMatch && seg.startsWith(`${normClaim} `)) {
+    const segTokens = splitQuotedWhitespace(seg);
+    if (claimTokens && segTokens) {
+      if (tokensEqualExact(claimTokens, segTokens)) {
+        return true;
+      }
+      if (allowPrefixMatch && tokensPrefixMatch(claimTokens, segTokens)) {
+        return true;
+      }
+    } else if (seg === claimText) {
       return true;
     }
   }
-  return allowPrefixMatch && normExec.startsWith(`${normClaim} `);
+  return false;
 }
 
 function mcpToolAliases(toolName) {
@@ -1006,10 +1150,10 @@ export function decideGate(input = {}, context = {}) {
     if (run.outcome !== "pass") {
       continue;
     }
-    const normClaim = normalizeCommandText(run.command);
+    const rawClaim = typeof run.command === "string" ? run.command.trim() : "";
     const matchingExecs =
-      normClaim.length > 0
-        ? postWriteExecutions.filter((exec) => exec.kind !== "read_only" && claimMatchesExecution(normClaim, exec))
+      rawClaim.length > 0
+        ? postWriteExecutions.filter((exec) => exec.kind !== "read_only" && claimMatchesExecution(rawClaim, exec))
         : [];
     const matchedPass = matchingExecs.some((exec) => isCompletedExec(exec) && exec.passed === true);
     const coveredByR3Failure =

@@ -3567,7 +3567,7 @@ describe("H13 OMH gpt-6.2-astra round-9 regressions (P1 F1-F10, P2 F11-F12)", ()
         },
       },
       {
-        cmd: "echo touch-after-legacy-pass",
+        cmd: "python3 -c 'pass'",
         output: "ok",
         effect: (r) => {
           const snapPath = resolveSessionStatePath(convLegacy, DATA_DIR);
@@ -3608,7 +3608,7 @@ describe("H13 OMH gpt-6.2-astra round-9 regressions (P1 F1-F10, P2 F11-F12)", ()
         },
       },
       {
-        cmd: "echo revert-after-2nd-pass",
+        cmd: "python3 -c 'pass'",
         output: "ok",
         effect: (r) => {
           const snapPath = resolveSessionStatePath(convMismatch, DATA_DIR);
