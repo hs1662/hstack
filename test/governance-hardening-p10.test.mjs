@@ -1,8 +1,9 @@
 // v0.1.2 gate audit run 5 (Round H): untracked overflow vs tracked edits, strict npx/npm/go whitelist, sequential pipefail.
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { describe, it } from "node:test";
 
 import { analyzeField } from "../scripts/analyzer.mjs";
@@ -7613,5 +7614,140 @@ describe("H25 OMH round-21 regressions (F1-F11)", () => {
     const blockParentExported = runSingleGate(`set -a && PYTEST_ADDOPTS='--collect-only' && sh -c "pytest"`);
     assert.equal(blockParentExported.verdict, "REJECT");
     assert.ok(blockParentExported.blockedRules.includes("R2_STALE_VERIFICATION"), blockParentExported.blockedRules.join(","));
+  });
+});
+
+describe("H26 OMH round-22 P1 regressions (F1-F4)", () => {
+  const runPairGate = (failCmd, passCmd) => {
+    const repo = makeRepo();
+    const txPath = join(createTempDir("hstack-p10-r22-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "22차 P1 회귀 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: "1 failed" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    return decideGate(
+      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: passCmd, outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+  };
+
+  it("R22-F1: unset -f does not clear exported/local non-PYTEST env vars in extractVerificationEntries", () => {
+    for (const [failCmd, passCmd] of [
+      ["export BACKEND=pg && command -p unset -f BACKEND && pytest", "export BACKEND=sqlite && pytest"],
+      ["export BACKEND=pg && unset -f BACKEND && pytest", "pytest"],
+    ]) {
+      const dec = runPairGate(failCmd, passCmd);
+      assert.equal(dec.verdict, "REJECT", `${failCmd} -> ${passCmd}`);
+      assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+    }
+    for (const [failCmd, passCmd] of [
+      ["export BACKEND=pg && command -p unset -v BACKEND && pytest", "pytest"],
+      ["export BACKEND=pg && unset -- BACKEND && pytest", "pytest"],
+    ]) {
+      const dec = runPairGate(failCmd, passCmd);
+      assert.equal(dec.verdict, "PASS", `${failCmd} -> ${passCmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R22-F2: normalizes wrapper chdir flags even after value-taking env/sudo flags (-u)", () => {
+    const a = factLedger.extractChainPrepInfo?.("env -u MODE -CpkgA npm ci");
+    const b = factLedger.extractChainPrepInfo?.("env -u MODE -C pkgA npm ci");
+    assert.ok(a && b);
+    assert.deepEqual(a.dirs, ["pkgA"]);
+    assert.deepEqual(b.dirs, ["pkgA"]);
+    assert.deepEqual(a.normalizedPrefixTokens, ["env", "-u", "MODE"]);
+    assert.deepEqual(b.normalizedPrefixTokens, ["env", "-u", "MODE"]);
+
+    const sa = factLedger.extractChainPrepInfo?.("sudo -u root -DpkgA npm ci");
+    const sb = factLedger.extractChainPrepInfo?.("sudo -u root -D pkgA npm ci");
+    assert.ok(sa && sb);
+    assert.deepEqual(sa.dirs, ["pkgA"]);
+    assert.deepEqual(sb.dirs, ["pkgA"]);
+    assert.deepEqual(sa.normalizedPrefixTokens, ["sudo", "-u", "root"]);
+    assert.deepEqual(sb.normalizedPrefixTokens, ["sudo", "-u", "root"]);
+
+    const unsetVarC = factLedger.extractChainPrepInfo?.("env -u C npm ci");
+    assert.ok(unsetVarC);
+    assert.deepEqual(unsetVarC.dirs, []);
+    assert.deepEqual(unsetVarC.normalizedPrefixTokens, ["env", "-u", "C"]);
+
+    const samePass = runPairGate("env -u MODE -CpkgA npm ci && pytest", "env -u MODE -C pkgA npm ci && pytest");
+    assert.equal(samePass.verdict, "PASS", samePass.blockedRules.join(","));
+
+    const diffReject = runPairGate("env -u MODE -CpkgA npm ci && pytest", "env -u OTHER -C pkgA npm ci && pytest");
+    assert.equal(diffReject.verdict, "REJECT");
+    assert.ok(diffReject.blockedRules.includes("R3_CONCEALED_FAILURE"), diffReject.blockedRules.join(","));
+  });
+
+  it("R22-F3: rejects shell combined short flags containing option-argument flag -o (-co/-eco/-oc)", () => {
+    for (const cmd of [
+      "bash -co 'npm test'",
+      "sh -co 'node --test'",
+      "bash -eco 'npm test'",
+      "bash -oc 'npm test'",
+    ]) {
+      assert.notEqual(classifyCommand(cmd), "verification", `${cmd} must not classify as verification`);
+    }
+    for (const cmd of [
+      "bash -o pipefail -c 'npm test | tail -n 1'",
+      "bash -ec 'npm test'",
+      "bash -ce 'npm test'",
+      "bash -ao pipefail -c 'npm test'",
+    ]) {
+      assert.equal(classifyCommand(cmd), "verification", `${cmd} must remain verification`);
+    }
+  });
+
+  it("R22-F4: falls back to inode guard reclaim when flock is absent (ENOENT) but never on live flock contention", () => {
+    if (process.platform === "win32") return;
+    const base = createTempDir("hstack-p10-r22-f4-");
+    const emptyBin = join(base, "empty-bin");
+    const busyBin = join(base, "busy-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    mkdirSync(busyBin, { recursive: true });
+    const fakeFlock = join(busyBin, "flock");
+    writeFileSync(fakeFlock, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    chmodSync(fakeFlock, 0o755);
+
+    const storeUrl = pathToFileURL(join(process.cwd(), "scripts/governance/handoff-store.mjs")).href;
+    const runWithLockChild = (targetFile, pathEnv) =>
+      spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          `import { withSessionLock } from ${JSON.stringify(storeUrl)}; console.log(withSessionLock(process.argv[1], () => "acquired"));`,
+          targetFile,
+        ],
+        { env: { ...process.env, PATH: pathEnv }, encoding: "utf8" },
+      );
+
+    // 1) PATH에 flock 없음(ENOENT): 죽은 PID stale lock을 대체 가드 경로로 회수하고 락 획득 성공해야 함
+    const enoentTarget = join(base, "enoent-state.json");
+    const enoentLock = `${enoentTarget}.lock`;
+    writeFileSync(enoentLock, JSON.stringify({ pid: 99999999, createdAt: 1, nonce: "dead" }));
+    const oldMs = new Date(Date.now() - 200_000);
+    utimesSync(enoentLock, oldMs, oldMs);
+    const enoentRes = runWithLockChild(enoentTarget, emptyBin);
+    assert.equal(enoentRes.status, 0, `expected fallback acquisition on ENOENT flock, stderr=${enoentRes.stderr}`);
+    assert.match(enoentRes.stdout, /acquired/);
+
+    // 2) flock 바이너리가 존재하지만 경합으로 status 1 반환 시: 대체 가드로 폴백하지 않고 획득 실패해야 함
+    const busyTarget = join(base, "busy-state.json");
+    const busyLock = `${busyTarget}.lock`;
+    writeFileSync(busyLock, JSON.stringify({ pid: 99999999, createdAt: 1, nonce: "contended" }));
+    utimesSync(busyLock, oldMs, oldMs);
+    const busyRes = runWithLockChild(busyTarget, busyBin);
+    assert.notEqual(busyRes.status, 0, "must not bypass flock contention via fallback guard");
+    assert.ok(existsSync(busyLock), "contended stale lock must not be bypassed by fallback when flock binary exists");
   });
 });
