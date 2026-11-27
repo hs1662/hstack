@@ -60,8 +60,9 @@ export function handleStop(stdinText, readTextFile) {
   const transcriptPath = payloadTranscriptPath(payload);
   let ledger = null;
   let steps;
+  let gitLedger = { gitRoot: "", gitDirtyFiles: new Set(), dirtyFilesAvailable: false };
   if (typeof readTextFile !== "function" && transcriptPath.length > 0) {
-    const gitLedger = cwd.length > 0 ? readGitLedger(cwd) : { gitRoot: "" };
+    gitLedger = cwd.length > 0 ? readGitLedger(cwd) : gitLedger;
     ({ ledger, steps } = readFactLedgerAndSteps(transcriptPath, cwd, gitLedger.gitRoot || ""));
   } else {
     steps = loadHookContext(stdinText, "Stop", readTextFile)?.steps ?? [];
@@ -71,7 +72,15 @@ export function handleStop(stdinText, readTextFile) {
   }
   const rawConversationId = payload.conversationId ?? payload.conversation_id;
   const conversationKey = resolveEffectiveConversationKey(typeof rawConversationId === "string" ? rawConversationId : "", cwd);
-  const undiffableShellWrite = Boolean(ledger?.transcriptAvailable && mergeShellWrittenFiles(ledger, { conversationKey, cwd }));
+  const undiffableShellWrite = Boolean(
+    ledger?.transcriptAvailable &&
+      mergeShellWrittenFiles(ledger, {
+        conversationKey,
+        cwd,
+        dirtyFiles: gitLedger.gitDirtyFiles,
+        dirtyFilesAvailable: gitLedger.dirtyFilesAvailable,
+      }),
+  );
 
   const isReadOnlyGovernanceRole = ledger?.sessionRole === "auditor" || ledger?.sessionRole === "challenger";
   const hasPendingAsyncAuditor = Boolean(ledger && ledger.pendingAsyncAuditsAfterLastWrite > 0);

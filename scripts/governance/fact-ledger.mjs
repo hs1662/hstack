@@ -103,6 +103,126 @@ const CARGO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "clippy", "buil
 const CARGO_VALUE_FLAGS = new Set(["--manifest-path", "--target", "--target-dir", "--package", "-p", "--features", "-F", "--jobs", "-j", "--color", "--config", "-Z"]);
 const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench", "compile"]);
 const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
+const PYTEST_NON_EXEC_LONG_RE = /^--(?:collect-only|co|fixtures|fixtures-per-test|markers|setup-plan|setup-only|help|version)(?:=|$)/;
+const PYTEST_SHORT_VALUE_CHARS = new Set(["c", "k", "m", "o", "p", "r", "W", "n"]);
+const PYTEST_LONG_VALUE_FLAGS = new Set([
+  "--config",
+  "--config-file",
+  "--override-ini",
+  "--rootdir",
+  "--confcutdir",
+  "--junitxml",
+  "--maxfail",
+  "--tb",
+  "--ignore",
+  "--ignore-glob",
+  "--deselect",
+  "--basetemp",
+  "--cov",
+  "--cov-report",
+  "--import-mode",
+  "--log-level",
+  "--log-format",
+  "--log-date-format",
+  "--log-file",
+  "--log-cli-level",
+  "-c",
+  "-k",
+  "-m",
+  "-o",
+  "-p",
+  "-r",
+  "-W",
+  "-n",
+]);
+export const MAX_PYTEST_CONFIG_BYTES = 262144;
+export const MAX_PYTEST_CONFIG_LINES = 5000;
+export const MAX_PYTEST_CONFIG_LINE_CHARS = 16384;
+
+export function readRegularFileBounded(
+  filePath,
+  { maxBytes = MAX_PYTEST_CONFIG_BYTES, maxLines = MAX_PYTEST_CONFIG_LINES, maxLineChars = MAX_PYTEST_CONFIG_LINE_CHARS } = {},
+) {
+  let fd = -1;
+  try {
+    fd = openSync(filePath, "r");
+    const st = fstatSync(fd);
+    if (!st.isFile()) {
+      return { ok: false, reason: "not_regular", text: "" };
+    }
+    const buf = Buffer.allocUnsafe(maxBytes + 1);
+    let total = 0;
+    while (total <= maxBytes) {
+      const n = readSync(fd, buf, total, maxBytes + 1 - total, null);
+      if (n <= 0) {
+        break;
+      }
+      total += n;
+    }
+    if (total > maxBytes) {
+      return { ok: false, reason: "too_large", text: "" };
+    }
+    const text = buf.subarray(0, total).toString("utf8");
+    const lines = text.split(/\r?\n/);
+    if (lines.length > maxLines) {
+      return { ok: false, reason: "line_budget", text: "" };
+    }
+    for (const line of lines) {
+      if (line.length > maxLineChars) {
+        return { ok: false, reason: "line_budget", text: "" };
+      }
+    }
+    return { ok: true, reason: "", text };
+  } catch {
+    return { ok: false, reason: "read_error", text: "" };
+  } finally {
+    if (fd !== -1) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
+  }
+}
+
+export function hasPytestNonExecFlag(args) {
+  if (!Array.isArray(args)) {
+    return false;
+  }
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (typeof arg !== "string") {
+      return true;
+    }
+    if (arg === "--") {
+      return false;
+    }
+    if (PYTEST_NON_EXEC_LONG_RE.test(arg)) {
+      return true;
+    }
+    if (arg.startsWith("--")) {
+      if (!arg.includes("=") && PYTEST_LONG_VALUE_FLAGS.has(arg)) {
+        i += 1;
+      }
+      continue;
+    }
+    if (arg.startsWith("-") && arg.length > 1) {
+      for (let k = 1; k < arg.length; k += 1) {
+        const ch = arg[k];
+        if (ch === "h" || ch === "V") {
+          return true;
+        }
+        if (PYTEST_SHORT_VALUE_CHARS.has(ch)) {
+          if (k === arg.length - 1) {
+            i += 1;
+          }
+          break;
+        }
+      }
+    }
+  }
+  return false;
+}
 const JS_TEST_LIST_FLAGS = new Set(["--listTests", "--list-tests", "--list", "--showConfig", "--show-config"]);
 const MAKE_DRY_RUN_LONG_FLAGS = new Set([
   "--just-print",
@@ -659,16 +779,23 @@ function isCommandProbeInvocation(tokens) {
   return false;
 }
 
-// The index of the binary after leading assignments and wrappers (sudo, env, time…), or -1 when one of them
-// can swap the binary or rewrite the command line.
-function skipCommandPrefix(tokens) {
+// The binary index and wrapper context after leading assignments and wrappers, or binIdx: -1 on hijack/opaque prefix.
+function parseCommandPrefix(tokens) {
   let idx = 0;
+  let envPytestAddopts = null;
+  let envPytestCleared = false;
+  const chdirs = [];
+  let chdirOpaque = false;
   while (idx < tokens.length) {
     const tok = tokens[idx];
     if (isExecHijackAssign(tok)) {
-      return -1;
+      return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
     }
     if (tok === "!" || tok === "(" || ENV_ASSIGN_RE.test(tok)) {
+      if (tok.startsWith("PYTEST_ADDOPTS=")) {
+        envPytestAddopts = tok.slice("PYTEST_ADDOPTS=".length);
+        envPytestCleared = false;
+      }
       idx += 1;
       continue;
     }
@@ -679,7 +806,42 @@ function skipCommandPrefix(tokens) {
         const arg = tokens[idx];
         // `env -S` splits its argument into a whole new command line.
         if (tok === "env" && (/^-[A-Za-z]*S/.test(arg) || arg.startsWith("--split-string") || isExecHijackAssign(arg))) {
-          return -1;
+          return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
+        }
+        if (tok === "env" && (arg === "-i" || arg === "--ignore-environment" || arg === "-")) {
+          envPytestAddopts = null;
+          envPytestCleared = true;
+          idx += 1;
+          continue;
+        }
+        if (tok === "env" && (arg.startsWith("--chdir=") || (arg.startsWith("-C") && arg.length > 2))) {
+          const dirVal = arg.startsWith("--chdir=") ? arg.slice("--chdir=".length) : arg.slice(2);
+          if (!dirVal || dirVal === "-" || dirVal.startsWith("~") || /[$`]/.test(dirVal)) {
+            chdirOpaque = true;
+          } else {
+            chdirs.push(dirVal);
+          }
+          idx += 1;
+          continue;
+        }
+        if (tok === "env" && (arg.startsWith("--unset=") || (arg.startsWith("-u") && arg.length > 2))) {
+          const varName = arg.startsWith("--unset=") ? arg.slice("--unset=".length) : arg.slice(2);
+          if (varName === "PYTEST_ADDOPTS") {
+            envPytestAddopts = null;
+            envPytestCleared = true;
+          }
+          idx += 1;
+          continue;
+        }
+        if (tok === "sudo" && arg.startsWith("--chdir=")) {
+          const dirVal = arg.slice("--chdir=".length);
+          if (!dirVal || dirVal === "-" || dirVal.startsWith("~") || /[$`]/.test(dirVal)) {
+            chdirOpaque = true;
+          } else {
+            chdirs.push(dirVal);
+          }
+          idx += 1;
+          continue;
         }
         if (arg === "--") {
           idx += 1;
@@ -693,9 +855,20 @@ function skipCommandPrefix(tokens) {
           if (!arg.startsWith("-")) {
             break;
           }
-          return -1;
+          return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
         }
         if (valueFlags && valueFlags.has(arg)) {
+          const val = tokens[idx + 1];
+          if ((tok === "env" && (arg === "-C" || arg === "--chdir")) || (tok === "sudo" && (arg === "-D" || arg === "--chdir"))) {
+            if (!val || val === "-" || val.startsWith("~") || /[$`]/.test(val)) {
+              chdirOpaque = true;
+            } else {
+              chdirs.push(val);
+            }
+          } else if (tok === "env" && (arg === "-u" || arg === "--unset") && val === "PYTEST_ADDOPTS") {
+            envPytestAddopts = null;
+            envPytestCleared = true;
+          }
           idx += 2;
           continue;
         }
@@ -704,6 +877,10 @@ function skipCommandPrefix(tokens) {
           continue;
         }
         if (tok === "env" && ENV_ASSIGN_RE.test(arg)) {
+          if (arg.startsWith("PYTEST_ADDOPTS=")) {
+            envPytestAddopts = arg.slice("PYTEST_ADDOPTS=".length);
+            envPytestCleared = false;
+          }
           idx += 1;
           continue;
         }
@@ -713,7 +890,11 @@ function skipCommandPrefix(tokens) {
     }
     break;
   }
-  return idx;
+  return { binIdx: idx, chdirs, chdirOpaque, envPytestAddopts, envPytestCleared };
+}
+
+function skipCommandPrefix(tokens) {
+  return parseCommandPrefix(tokens).binIdx;
 }
 
 // read_only, empty or other; runners are other here, since only matchesVerificationGrammar grants verification.
@@ -942,18 +1123,22 @@ export function extractPytestCommandInfo(segment) {
   if (!tokens || tokens.length === 0) {
     return null;
   }
-  const idx = skipCommandPrefix(tokens);
+  const prefix = parseCommandPrefix(tokens);
+  const idx = prefix.binIdx;
   if (idx === -1 || idx >= tokens.length) {
     return null;
   }
-  const envPytestAddopts = collectPrefixPytestEnv(tokens, idx);
   const baseBin = posix.basename(toPosix(tokens[idx]));
   if (baseBin === "pytest" || baseBin === "py.test") {
     return {
+      isPytest: true,
       runnerKind: "pytest",
       bin: baseBin,
       args: tokens.slice(idx + 1),
-      envPytestAddopts,
+      envPytestAddopts: prefix.envPytestAddopts,
+      envPytestCleared: prefix.envPytestCleared,
+      chdirs: prefix.chdirs,
+      chdirOpaque: prefix.chdirOpaque,
       prefixEndIdx: idx + 1,
       tokens,
     };
@@ -962,16 +1147,25 @@ export function extractPytestCommandInfo(segment) {
     const pyMod = parsePythonPytestArgs(tokens.slice(idx + 1));
     if (pyMod) {
       return {
+        isPytest: true,
         runnerKind: "python-pytest",
         bin: baseBin,
         args: pyMod.modArgs,
-        envPytestAddopts,
+        envPytestAddopts: prefix.envPytestAddopts,
+        envPytestCleared: prefix.envPytestCleared,
+        chdirs: prefix.chdirs,
+        chdirOpaque: prefix.chdirOpaque,
         prefixEndIdx: idx + 1 + pyMod.moduleArgConsumed,
         tokens,
       };
     }
   }
-  return null;
+  return {
+    isPytest: false,
+    bin: baseBin,
+    chdirs: prefix.chdirs,
+    chdirOpaque: prefix.chdirOpaque,
+  };
 }
 
 // python runs any program, so it counts only for `-m pytest|unittest` (with actual test execution) or a test file.
@@ -997,7 +1191,7 @@ function pythonRunsTests(args) {
       if (modHead.some((a) => a === "--version" || a === "-V" || a === "--help" || a === "-h")) {
         return false;
       }
-      if (module === "pytest" && modHead.some((a) => PYTEST_DRY_RUN_FLAGS.has(a))) {
+      if (module === "pytest" && hasPytestNonExecFlag(modArgs)) {
         return false;
       }
       return true;
@@ -1116,7 +1310,10 @@ function hasLeadingVersionProbe(bin, args) {
   if (!VERIFICATION_BINARIES.has(bin) && !PACKAGE_EXEC_VERIFICATION_TOOLS.has(bin)) {
     return false;
   }
-  const verboseDashVAllowed = bin === "pytest" || bin === "go" || bin === "cargo" || bin === "ctest" || bin === "rspec";
+  if (bin === "pytest" || bin === "py.test") {
+    return hasPytestNonExecFlag(args);
+  }
+  const verboseDashVAllowed = bin === "go" || bin === "cargo" || bin === "ctest" || bin === "rspec";
   const sepIdx = args.indexOf("--");
   const head = sepIdx === -1 ? args : args.slice(0, sepIdx);
   for (let i = 0; i < head.length; i += 1) {
@@ -1557,7 +1754,7 @@ function isRunnerCommand({ words, redirects }) {
   if ((baseBin === "python" || baseBin === "python3") && !pythonRunsTests(args)) {
     return false;
   }
-  if (baseBin === "pytest" && args.some((a) => PYTEST_DRY_RUN_FLAGS.has(a))) {
+  if ((baseBin === "pytest" || baseBin === "py.test") && hasPytestNonExecFlag(args)) {
     return false;
   }
   if (baseBin === "cargo" && !isCargoVerification(args)) {
@@ -3584,18 +3781,25 @@ export function readGitLedger(cwd) {
 
 function scanTestInfraDir(dir, indicators) {
   if (!dir || !existsSync(dir)) {
-    return;
+    return { uncertain: false };
   }
+  let uncertain = false;
 
   const pkgPath = join(dir, "package.json");
   if (existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-      const testScript = typeof pkg?.scripts?.test === "string" ? pkg.scripts.test.trim() : "";
-      if (testScript.length > 0 && !/no test specified/i.test(testScript)) {
-        indicators.add("package.json:scripts.test");
+    const res = readRegularFileBounded(pkgPath);
+    if (!res.ok) {
+      uncertain = true;
+    } else {
+      try {
+        const pkg = JSON.parse(res.text);
+        const testScript = typeof pkg?.scripts?.test === "string" ? pkg.scripts.test.trim() : "";
+        if (testScript.length > 0 && !/no test specified/i.test(testScript)) {
+          indicators.add("package.json:scripts.test");
+        }
+      } catch {
+        uncertain = true;
       }
-    } catch {
     }
   }
 
@@ -3617,11 +3821,11 @@ function scanTestInfraDir(dir, indicators) {
   ]) {
     const cfgPath = join(dir, cfgName);
     if (existsSync(cfgPath)) {
-      try {
-        if (sectionRe.test(readFileSync(cfgPath, "utf8"))) {
-          indicators.add(cfgName);
-        }
-      } catch {
+      const res = readRegularFileBounded(cfgPath);
+      if (!res.ok) {
+        uncertain = true;
+      } else if (sectionRe.test(res.text)) {
+        indicators.add(cfgName);
       }
     }
   }
@@ -3633,7 +3837,9 @@ function scanTestInfraDir(dir, indicators) {
       }
     }
   } catch {
+    uncertain = true;
   }
+  return { uncertain };
 }
 
 function resolveNormalizedPath(dir) {
@@ -3685,12 +3891,17 @@ export function detectTestInfrastructure(cwd, gitRoot = null, { maxDepth = 64 } 
   if (typeof gitRoot === "string" && gitRoot.trim().length > 0) {
     roots.add(gitRoot);
   }
+  let scanUncertain = false;
   for (const root of roots) {
-    scanTestInfraDir(root, indicators);
+    const scan = scanTestInfraDir(root, indicators);
+    if (scan.uncertain) {
+      scanUncertain = true;
+    }
   }
+  const uncertain = Boolean(walk?.truncated || scanUncertain);
   return {
     hasTestSuite: indicators.size > 0,
     indicators: [...indicators],
-    ...(walk?.truncated ? { uncertain: true } : {}),
+    ...(uncertain ? { uncertain: true } : {}),
   };
 }

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, posix, relative, resolve, win32 } from "node:path";
 import {
   ALLOWED_AUDIT_ESCALATION_MODES,
@@ -8,7 +8,7 @@ import {
   REGISTER_COPY,
   RISK_REASON_LABELS,
 } from "./constants.mjs";
-import { classifyCommand, extractChainPrepSignature, extractPytestCommandInfo, normalizeWorkspacePath, splitShellSegments } from "./fact-ledger.mjs";
+import { classifyCommand, extractChainPrepSignature, extractPytestCommandInfo, hasPytestNonExecFlag, normalizeWorkspacePath, readRegularFileBounded, splitShellSegments } from "./fact-ledger.mjs";
 import { detectHedges } from "./hedge-detector.mjs";
 import { classifyRisk } from "./risk-classifier.mjs";
 
@@ -63,6 +63,27 @@ function normalizeExecDir(dir, { preserveSpaces = false } = {}) {
   return norm.length > 1 ? norm.replace(/\/+$/, "") : norm;
 }
 
+function isWindowsAbsolutePath(raw) {
+  return /^\\\\[^\\]|^\/\/[^/]|^[A-Za-z]:[\\/]/.test(raw);
+}
+
+function isAbsoluteExecDir(raw) {
+  return typeof raw === "string" && (raw.startsWith("/") || isWindowsAbsolutePath(raw));
+}
+
+function resolveExecDirStep(currentDir, dirArg, { preserveSpaces = false } = {}) {
+  if (isAbsoluteExecDir(dirArg)) {
+    return normalizeExecDir(dirArg, { preserveSpaces });
+  }
+  if (typeof currentDir === "string" && currentDir.startsWith("opaque:")) {
+    return `${currentDir}/${dirArg}`;
+  }
+  if (!currentDir || currentDir === ".") {
+    return normalizeExecDir(dirArg, { preserveSpaces });
+  }
+  return normalizeExecDir(`${currentDir}/${dirArg}`, { preserveSpaces });
+}
+
 function advanceDir(currentDir, op, arg, opaqueSeq) {
   if (op === "popd") {
     return currentDir.stack.length > 0 ? { dir: currentDir.stack.pop(), stack: currentDir.stack } : currentDir;
@@ -72,13 +93,7 @@ function advanceDir(currentDir, op, arg, opaqueSeq) {
     return { dir: `opaque:${opaqueSeq}:${arg ?? ""}`, stack };
   }
   const cleanArg = arg.replace(/^['"]|['"]$/g, "");
-  const nextDir = cleanArg.startsWith("/")
-    ? normalizeExecDir(cleanArg)
-    : currentDir.dir.startsWith("opaque:")
-      ? `${currentDir.dir}/${cleanArg}`
-      : currentDir.dir === "."
-        ? normalizeExecDir(cleanArg)
-        : normalizeExecDir(`${currentDir.dir}/${cleanArg}`);
+  const nextDir = resolveExecDirStep(currentDir.dir, cleanArg);
   const stack = op === "pushd" ? [...currentDir.stack, currentDir.dir] : currentDir.stack;
   return { dir: nextDir, stack };
 }
@@ -91,12 +106,17 @@ function extractVerificationEntries(cmd, baseDir = ".") {
   let state = { dir: normalizeExecDir(baseDir, { preserveSpaces: true }), stack: [] };
   let prepPrefixes = [];
   let seq = 0;
+  let chainEnvPytestAddopts = null;
+  let chainEnvPytestOpaque = false;
   for (const seg of splitShellSegments(cmd)) {
     const rawTrimmed = seg.trim();
     if (rawTrimmed.length === 0) {
       continue;
     }
     const segTokens = splitQuotedWhitespace(rawTrimmed);
+    if (segTokens === null && /\bPYTEST_ADDOPTS\b/.test(rawTrimmed)) {
+      chainEnvPytestOpaque = true;
+    }
     if (segTokens === null && /^(?:cd|pushd|popd)(?:\s|$)/.test(rawTrimmed)) {
       seq += 1;
       state = advanceDir(state, rawTrimmed.split(/\s+/, 1)[0], "$opaque", seq);
@@ -108,17 +128,24 @@ function extractVerificationEntries(cmd, baseDir = ".") {
       if (dirArg === undefined || dirArg === "-" || dirArg.startsWith("~") || /[$`]/.test(dirArg)) {
         state = advanceDir(state, segTokens[0], dirArg, seq);
       } else {
-        const nextDir = dirArg.startsWith("/")
-          ? normalizeExecDir(dirArg, { preserveSpaces: true })
-          : state.dir.startsWith("opaque:")
-            ? `${state.dir}/${dirArg}`
-            : state.dir === "."
-              ? normalizeExecDir(dirArg, { preserveSpaces: true })
-              : normalizeExecDir(`${state.dir}/${dirArg}`, { preserveSpaces: true });
+        const nextDir = resolveExecDirStep(state.dir, dirArg, { preserveSpaces: true });
         const stack = segTokens[0] === "pushd" ? [...state.stack, state.dir] : state.stack;
         state = { dir: nextDir, stack };
       }
       continue;
+    }
+    if (segTokens && segTokens.length > 0 && segTokens[0] === "export") {
+      for (const tok of segTokens.slice(1)) {
+        if (tok.startsWith("PYTEST_ADDOPTS=")) {
+          chainEnvPytestAddopts = tok.slice("PYTEST_ADDOPTS=".length);
+          chainEnvPytestOpaque = /[$`]/.test(rawTrimmed);
+        }
+      }
+    } else if (segTokens && segTokens.length > 0 && segTokens[0] === "unset") {
+      if (segTokens.slice(1).includes("PYTEST_ADDOPTS")) {
+        chainEnvPytestAddopts = null;
+        chainEnvPytestOpaque = false;
+      }
     }
     const norm = normalizeCommandText(seg);
     const prepSig = extractChainPrepSignature(seg);
@@ -127,7 +154,13 @@ function extractVerificationEntries(cmd, baseDir = ".") {
       continue;
     }
     if (classifyCommand(norm) === "verification") {
-      entries.push({ seg: rawTrimmed, dir: state.dir, prepKey: prepPrefixes.join(" && ") });
+      entries.push({
+        seg: rawTrimmed,
+        dir: state.dir,
+        prepKey: prepPrefixes.join(" && "),
+        envPytestAddopts: chainEnvPytestAddopts,
+        envPytestOpaque: chainEnvPytestOpaque,
+      });
     }
   }
   return entries;
@@ -368,31 +401,7 @@ const PYTEST_COLLECTION_OVERRIDE_KEYS = new Set([
   "norecursedirs",
 ]);
 
-const MAX_PYTEST_CONFIG_BYTES = 262144;
-const MAX_PYTEST_CONFIG_LINES = 5000;
 const MAX_PYTEST_CONFIG_LINE_CHARS = 16384;
-
-function readBoundedConfigText(filePath) {
-  try {
-    const st = statSync(filePath);
-    if (!Number.isFinite(st.size) || st.size > MAX_PYTEST_CONFIG_BYTES) {
-      return { ok: false, text: "" };
-    }
-    const text = readFileSync(filePath, "utf8");
-    const lines = text.split(/\r?\n/);
-    if (lines.length > MAX_PYTEST_CONFIG_LINES) {
-      return { ok: false, text: "" };
-    }
-    for (const line of lines) {
-      if (line.length > MAX_PYTEST_CONFIG_LINE_CHARS) {
-        return { ok: false, text: "" };
-      }
-    }
-    return { ok: true, text };
-  } catch {
-    return { ok: false, text: "" };
-  }
-}
 
 function stripIniInlineComment(raw) {
   let quote = null;
@@ -475,7 +484,7 @@ function parseIniTestpaths(text, targetSections) {
           if (addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
             hasCollectionOverride = true;
           }
-          if (addoptsTokens.some((tok) => isPytestDryRunToken(tok))) {
+          if (hasPytestNonExecFlag(addoptsTokens)) {
             hasDryRunAddopts = true;
           }
         }
@@ -725,7 +734,7 @@ function evaluatePytestIniEntries(entries) {
         if (addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
           hasCollectionOverride = true;
         }
-        if (addoptsTokens.some((tok) => isPytestDryRunToken(tok))) {
+        if (hasPytestNonExecFlag(addoptsTokens)) {
           hasDryRunAddopts = true;
         }
       }
@@ -878,7 +887,7 @@ function parsePytestToml(text, targetTablePath) {
 }
 
 function readPytestTomlFile(filePath, targetTablePath, configDir) {
-  const bounded = readBoundedConfigText(filePath);
+  const bounded = readRegularFileBounded(filePath);
   if (!bounded.ok) {
     return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir };
   }
@@ -934,7 +943,7 @@ function readPytestConfigInDir(dir) {
     if (!existsSync(pytestIniPath)) {
       continue;
     }
-    const bounded = readBoundedConfigText(pytestIniPath);
+    const bounded = readRegularFileBounded(pytestIniPath);
     if (!bounded.ok) {
       return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir: dir };
     }
@@ -962,7 +971,7 @@ function readPytestConfigInDir(dir) {
     if (!existsSync(cfgPath)) {
       continue;
     }
-    const bounded = readBoundedConfigText(cfgPath);
+    const bounded = readRegularFileBounded(cfgPath);
     if (!bounded.ok) {
       return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir: dir };
     }
@@ -1012,7 +1021,7 @@ function readPytestConfigFile(rawPath, execDir) {
     const evaluated = readPytestTomlFile(resolvedPath, tablePath, configDir);
     return evaluated ?? { restricted: false, paths: [], hasDryRunAddopts: false, uncertain: false, configDir };
   }
-  const bounded = readBoundedConfigText(resolvedPath);
+  const bounded = readRegularFileBounded(resolvedPath);
   if (!bounded.ok) {
     return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir };
   }
@@ -1241,17 +1250,6 @@ function resolvePytestConfigForCommand(args, execDir) {
       }
       const lookupRoot = targetDirs.length > 0 ? commonAncestorDir(targetDirs) : execDir;
       baseConfig = readPytestConfig(lookupRoot || execDir);
-      for (const td of targetDirs) {
-        const subCfg = readPytestConfig(td);
-        if (subCfg.hasDryRunAddopts || subCfg.uncertain) {
-          baseConfig = {
-            ...baseConfig,
-            restricted: Boolean(baseConfig.restricted || subCfg.restricted),
-            hasDryRunAddopts: Boolean(baseConfig.hasDryRunAddopts || subCfg.hasDryRunAddopts),
-            uncertain: Boolean(baseConfig.uncertain || subCfg.uncertain),
-          };
-        }
-      }
       if (targetUncertain) {
         baseConfig = { ...baseConfig, uncertain: true };
       }
@@ -1260,7 +1258,7 @@ function resolvePytestConfigForCommand(args, execDir) {
   if (cliOverrideAddopts !== null) {
     const cleanedOverride = unwrapSingleShellQuotePair(cliOverrideAddopts);
     const overrideTokens = cleanedOverride === "" ? [] : splitQuotedWhitespace(cleanedOverride);
-    const hasDryRunInOverride = !overrideTokens || overrideTokens.some((t) => isPytestDryRunToken(t));
+    const hasDryRunInOverride = !overrideTokens || hasPytestNonExecFlag(overrideTokens);
     const hasUnsafeInOverride = !overrideTokens || overrideTokens.some((t) => isPytestAddoptsUnsafeToken(t));
     return {
       ...baseConfig,
@@ -1328,13 +1326,7 @@ const PYTEST_ADDOPTS_DISALLOWED_LONG_RE = /^--(?:k|m|p|lf|ff|nf|sw|stepwise|last
 const PYTEST_DRY_RUN_OPT_RE = /^--(?:collect-only|co|fixtures|fixtures-per-test|markers|setup-plan|setup-only|help|version)(?:=|$)/;
 
 function isPytestDryRunToken(tok) {
-  if (typeof tok !== "string") {
-    return false;
-  }
-  if (PYTEST_DRY_RUN_OPT_RE.test(tok) || tok === "-h" || tok === "-V") {
-    return true;
-  }
-  return /^-[A-Za-z]*[hV][A-Za-z]*$/.test(tok);
+  return hasPytestNonExecFlag([tok]);
 }
 
 function isPytestDiscoveryOverrideToken(tok) {
@@ -1367,19 +1359,35 @@ function isEffectiveVerificationExecution(exec, defaultCwd = ".") {
   const hasEffective = entries.some((entry) => {
     const pytestInfo = extractPytestCommandInfo(entry.seg);
     if (!pytestInfo) {
-      if (/\b(?:pytest|py\.test)\b/.test(entry.seg)) {
-        return false;
-      }
+      return false;
+    }
+    if (!pytestInfo.isPytest) {
       return true;
     }
-    if (pytestInfo.envPytestAddopts !== null) {
-      const envToks = splitQuotedWhitespace(unwrapSingleShellQuotePair(pytestInfo.envPytestAddopts));
-      if (!envToks || envToks.some((t) => isPytestDryRunToken(t))) {
+    if (pytestInfo.chdirOpaque) {
+      return false;
+    }
+    let execDir = resolveEntryExecDir(entry.dir, normalizeExecDir(exec?.execCwd || defaultCwd || ".", { preserveSpaces: true }));
+    for (const ch of pytestInfo.chdirs ?? []) {
+      execDir = resolveExecDirStep(execDir, ch, { preserveSpaces: true });
+    }
+    const rawEnv = pytestInfo.envPytestCleared ? null : (pytestInfo.envPytestAddopts ?? entry.envPytestAddopts ?? null);
+    if (!pytestInfo.envPytestCleared && pytestInfo.envPytestAddopts === null && entry.envPytestOpaque) {
+      return false;
+    }
+    let envTokens = [];
+    if (rawEnv !== null) {
+      const parsed = splitQuotedWhitespace(unwrapSingleShellQuotePair(rawEnv));
+      if (!parsed) {
         return false;
       }
+      envTokens = parsed;
     }
-    const execDir = resolveEntryExecDir(entry.dir, normalizeExecDir(exec?.execCwd || defaultCwd || ".", { preserveSpaces: true }));
-    const cfg = resolvePytestConfigForCommand(pytestInfo.args, execDir);
+    const effectiveArgs = [...envTokens, ...pytestInfo.args];
+    if (hasPytestNonExecFlag(effectiveArgs)) {
+      return false;
+    }
+    const cfg = resolvePytestConfigForCommand(effectiveArgs, execDir);
     if (cfg.hasDryRunAddopts || cfg.uncertain) {
       return false;
     }
@@ -1404,7 +1412,7 @@ function droppedTokenIndexes(failed, passed) {
 // A passing command clears a failing one when it is the same command, or the same runner and flags
 // with every file target removed on a runner whose target-less form runs every test. Dropping only
 // some targets narrows the run. Go widens only to `./...`, over relative package targets inside it.
-function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
+function segmentResolvedBy(failedSeg, passedSeg, execDir = "", { failedEntry = null, passedEntry = null } = {}) {
   if (failedSeg.length === 0 || passedSeg.length === 0) {
     return false;
   }
@@ -1438,7 +1446,14 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   if (runner.prefix.includes("pytest")) {
     const failedPyInfo = extractPytestCommandInfo(failedSeg);
     const passedPyInfo = extractPytestCommandInfo(passedSeg);
-    const hasRestrictedEnvAddopts = [failedPyInfo?.envPytestAddopts, passedPyInfo?.envPytestAddopts].some((rawEnv) => {
+    const failedEnvOpaque = !failedPyInfo?.envPytestCleared && failedPyInfo?.envPytestAddopts === null && Boolean(failedEntry?.envPytestOpaque);
+    const passedEnvOpaque = !passedPyInfo?.envPytestCleared && passedPyInfo?.envPytestAddopts === null && Boolean(passedEntry?.envPytestOpaque);
+    if (failedEnvOpaque || passedEnvOpaque) {
+      return false;
+    }
+    const failedEnvRaw = failedPyInfo?.envPytestCleared ? null : (failedPyInfo?.envPytestAddopts ?? failedEntry?.envPytestAddopts ?? null);
+    const passedEnvRaw = passedPyInfo?.envPytestCleared ? null : (passedPyInfo?.envPytestAddopts ?? passedEntry?.envPytestAddopts ?? null);
+    const hasRestrictedEnvAddopts = [failedEnvRaw, passedEnvRaw].some((rawEnv) => {
       if (rawEnv === null || rawEnv === undefined) {
         return false;
       }
@@ -1492,10 +1507,7 @@ function resolveEntryExecDir(entryDir, baseCwd) {
   if (!entryDir || entryDir === ".") {
     return baseCwd;
   }
-  if (isAbsolute(entryDir) || isWindowsLikePath(entryDir)) {
-    return entryDir;
-  }
-  return baseCwd ? join(baseCwd, entryDir) : entryDir;
+  return resolveExecDirStep(baseCwd || ".", entryDir, { preserveSpaces: true });
 }
 
 function entriesMatchForResolution(failedEntry, passedEntry, baseCwd = "") {
@@ -1505,7 +1517,10 @@ function entriesMatchForResolution(failedEntry, passedEntry, baseCwd = "") {
   if (failedEntry.prepKey && passedEntry.prepKey !== failedEntry.prepKey) {
     return false;
   }
-  return segmentResolvedBy(failedEntry.seg, passedEntry.seg, resolveEntryExecDir(failedEntry.dir, baseCwd));
+  return segmentResolvedBy(failedEntry.seg, passedEntry.seg, resolveEntryExecDir(failedEntry.dir, baseCwd), {
+    failedEntry,
+    passedEntry,
+  });
 }
 
 function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBaseDir = ".") {

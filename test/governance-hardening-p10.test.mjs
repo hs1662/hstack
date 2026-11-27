@@ -4135,20 +4135,47 @@ describe("H15 OMH gpt-6.2-astra round-11 regressions (P1 F1-F7, P2 F8-F9)", () =
     assert.equal(classifyCommand("make FOO=bar test"), "verification");
   });
 
-  it("R11-F8: skips R4 attribution for pre-existing dirty doc committed in turn when docFiles snapshot was truncated", () => {
-    const repo = makeRepo();
-    writeFileSync(join(repo, "README.md"), "# initial\n");
-    git(repo, ["add", "README.md"]);
-    git(repo, ["commit", "-q", "-m", "add readme"]);
-    writeFileSync(join(repo, "README.md"), "# edited before turn\n");
+  it("R11-F8: skips R4 attribution when committed doc matches baseline docFiles signature, but fails closed on truncated docFiles snapshot", () => {
+    const repoCleanSkip = makeRepo();
+    writeFileSync(join(repoCleanSkip, "README.md"), "# initial\n");
+    git(repoCleanSkip, ["add", "README.md"]);
+    git(repoCleanSkip, ["commit", "-q", "-m", "add readme"]);
+    writeFileSync(join(repoCleanSkip, "README.md"), "# edited before turn\n");
 
-    const convId = "p10-r11-f8-doc-truncated";
-    const { verdicts } = runTurnOnRepo(repo, convId, [
+    const convSkip = "p10-r11-f8-doc-skip";
+    const resSkip = runTurnOnRepo(repoCleanSkip, convSkip, [
       {
         cmd: "git commit -am commit-old-readme",
         output: "ok",
         effect: (r) => {
-          const statePath = resolveSessionStatePath(convId, DATA_DIR);
+          git(r, ["commit", "-qam", "commit-old-readme"]);
+        },
+      },
+      {
+        gate: {
+          modified_files: [],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "기존 수정 문서만 커밋했습니다.",
+        },
+      },
+    ]);
+    assert.equal(resSkip.verdicts[0], VERDICT_HEADERS.PASS, resSkip.verdicts[0]);
+
+    const repoTrunc = makeRepo();
+    writeFileSync(join(repoTrunc, "README.md"), "# initial\n");
+    git(repoTrunc, ["add", "README.md"]);
+    git(repoTrunc, ["commit", "-q", "-m", "add readme"]);
+    writeFileSync(join(repoTrunc, "README.md"), "# edited before turn\n");
+
+    const convTrunc = "p10-r11-f8-doc-truncated";
+    const resTrunc = runTurnOnRepo(repoTrunc, convTrunc, [
+      {
+        cmd: "git commit -am commit-old-readme",
+        output: "ok",
+        effect: (r) => {
+          const statePath = resolveSessionStatePath(convTrunc, DATA_DIR);
           const data = JSON.parse(readFileSync(statePath, "utf8"));
           if (data.turnSnapshot) {
             data.turnSnapshot.docFiles = {};
@@ -4164,11 +4191,21 @@ describe("H15 OMH gpt-6.2-astra round-11 regressions (P1 F1-F7, P2 F8-F9)", () =
           inspected_files: [],
           verification_runs: [],
           unverified_scope: [],
-          self_assessment: "기존 수정 문서만 커밋했습니다.",
+          self_assessment: "수정 문서 미보고.",
+        },
+      },
+      {
+        gate: {
+          modified_files: ["README.md"],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "커밋된 문서 수정 보고 완료.",
         },
       },
     ]);
-    assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts[0]);
+    assert.ok(resTrunc.verdicts[0].includes(VERDICT_HEADERS.REJECT_NEUTRAL), resTrunc.verdicts[0]);
+    assert.equal(resTrunc.verdicts[1], VERDICT_HEADERS.PASS, resTrunc.verdicts[1]);
   });
 
   it("R11-F9: allows Stop after committing verified doc unchanged, while blocking Stop if doc is edited after gate", () => {

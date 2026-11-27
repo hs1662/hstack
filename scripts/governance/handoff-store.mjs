@@ -553,7 +553,7 @@ function syncPendingAsyncAfterWrite(ledger) {
 
 // Shell commands (sed -i, redirects) write files no write tool records; diff the tree against the turn-start snapshot.
 // Returns true when an arbitrary shell command ran in a git tree that could not be diffed (fail closed).
-export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), diffNumstat = null, dataDir = resolvePluginDataDir() }) {
+export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFiles = new Set(), dirtyFilesAvailable = true, diffNumstat = null, dataDir = resolvePluginDataDir() }) {
   // run_command and mcp_agy-fast_fast_run_checks both run arbitrary shell commands.
   const shellExecs = ledger.turnExecutions;
   if (ledger.sessionRole !== "main" || shellExecs.length === 0 || !cwd) {
@@ -618,6 +618,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       return null;
     }
   };
+  let postGateDocRequiresReverify = false;
   const postGateHandledDocs = new Set();
   if (postGateShell.length > 0 && activeGate) {
     if (!(ledger.turnCommittedFiles instanceof Set)) {
@@ -636,9 +637,8 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
         gateDocCandidates.add(relPath);
       }
     }
-    const postGateDocTruncated = Boolean(activeGate.docFilesTruncated || current.docFilesTruncated);
+    const postGateDocTruncated = Boolean(activeGate.docFilesTruncated || current.docFilesTruncated || dirtyFilesAvailable === false);
     const gateCutoffMs = Number.isFinite(activeGate.capturedAtMs) ? activeGate.capturedAtMs - 10 : 0;
-    let sawTruncatedPostGateDoc = false;
     for (const relPath of gateDocCandidates) {
       const inSinceGate = sinceGate.has(relPath);
       if (inSinceGate) {
@@ -657,8 +657,6 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
         const freshMs = statFreshnessMs(current.gitRoot, relPath);
         if (freshMs !== null && freshMs >= gateCutoffMs) {
           hasDefinitePostGateDocChange = true;
-        } else {
-          sawTruncatedPostGateDoc = true;
         }
       }
       if (hasDefinitePostGateDocChange) {
@@ -667,11 +665,9 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
         postGateHandledDocs.add(relPath);
       }
     }
-    if (postGateDocTruncated && postGateWriter && !sawTruncatedPostGateDoc && gateDocCandidates.size === 0) {
-      sawTruncatedPostGateDoc = true;
-    }
-    if (sawTruncatedPostGateDoc && !postGateHandledDocs.size) {
+    if (postGateDocTruncated && postGateWriter) {
       ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postGateStep);
+      postGateDocRequiresReverify = true;
     }
   }
 
@@ -707,7 +703,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     if (beforeDoc !== undefined) {
       docChangedThisTurn = !sameFileSignature(beforeDoc, nowDoc);
     } else if (sinceTurn.has(relPath)) {
-      docChangedThisTurn = !baseline.docFilesTruncated && nowDoc !== undefined;
+      docChangedThisTurn = true;
     } else if (!turnDocTruncated) {
       docChangedThisTurn = nowDoc !== undefined;
     } else if (riskyShellExecs.length > 0) {
@@ -841,7 +837,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       return true;
     }
   }
-  return false;
+  return postGateDocRequiresReverify;
 }
 
 export function markPreflightChallengeLogged({
