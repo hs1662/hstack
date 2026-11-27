@@ -5578,4 +5578,74 @@ describe("H19 OMH gpt-6.2-astra round-15 regressions (P1 F1-F9, P2 F10-F12)", ()
     assert.equal(resRegate.verdicts[1], VERDICT_HEADERS.PASS, resRegate.verdicts[1]);
     assert.deepEqual(resRegate.out, {});
   });
+
+  it("R15-F13: allows non-dry-run pytest addopts/python_files for R2 while keeping conservative R3 coverage check", () => {
+    const repo = makeRepo();
+    writeFileSync(
+      join(repo, "pyproject.toml"),
+      '[tool.pytest.ini_options]\npython_files = "check_*.py"\naddopts = ["--strict-markers", "-n", "auto"]\n',
+    );
+    const txPass = join(createTempDir("hstack-p10-r15-f13-pass-"), "t.jsonl");
+    writeFileSync(
+      txPass,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "2 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const decPass = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPass, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decPass.verdict, "PASS", decPass.blockedRules.join(","));
+
+    const txFailThenBare = join(createTempDir("hstack-p10-r15-f13-r3-"), "t.jsonl");
+    writeFileSync(
+      txFailThenBare,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 3;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest unit/test_a.py", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const decR3 = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txFailThenBare, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decR3.verdict, "REJECT");
+    assert.ok(decR3.blockedRules.includes("R3_CONCEALED_FAILURE"), decR3.blockedRules.join(","));
+  });
+
+  it("R15-F14: does not walk past unrelated ancestor above cwd when cwd is outside gitRoot", () => {
+    const outer = createTempDir("hstack-p10-r15-f14-");
+    const parentWithMake = join(outer, "parent-make");
+    const workCwd = join(parentWithMake, "sub", "app");
+    const otherRepo = join(outer, "other-repo");
+    mkdirSync(workCwd, { recursive: true });
+    mkdirSync(otherRepo, { recursive: true });
+    writeFileSync(join(parentWithMake, "Makefile"), "test:\n\techo hi\n");
+
+    const infra = detectTestInfrastructure(workCwd, otherRepo);
+    assert.equal(infra.hasTestSuite, false, JSON.stringify(infra));
+  });
 });
