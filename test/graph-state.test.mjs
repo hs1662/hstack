@@ -238,6 +238,29 @@ test("gate-only amend revalidates the pinned artifact without generating new con
   assert.equal((await f.call("status")).nodes.a.status, "failed_logic");
 });
 
+test("gate-only revalidation keeps artifact identity when a new budget spills the same summary to CAS", async t => {
+  const f = await fixture(t, [read("a")]);
+  const r = await proof(f);
+  await f.settle(await f.start("a"), "accepted", r, "before");
+  const original = (await f.call("status")).nodes.a;
+  await f.call("amend", { node: "a", expectedRev: 1, opId: "rev", patch: { gate: { timeoutMs: 3001 } } });
+  const { instructionPath: token } = await f.call("claim", { node: "a", expectedRev: 2, opId: "recheck" });
+  const directive = JSON.parse(await fs.readFile(token));
+  assert.equal(directive.gate.timeoutMs, 3001);
+  await send("start", { root: f.root, token, hostHandle: "review" });
+  const result = await send("settle", { root: f.root, token, opId: "after", outcome: "accepted", receipt: r,
+    telemetry: { budgetContext: { verified: true, actualUsage: { inputTokens: 1, outputTokens: 1 },
+      W_eff: 1, reservedTokens: 1, contentTokens: {} } } });
+  assert.equal(result.status, "accepted");
+  const current = (await f.call("status")).nodes.a;
+  assert.equal(current.artifactDigest, original.artifactDigest);
+  assert.notEqual(current.gateKey, original.gateKey);
+  const { getBlob } = await import("../scripts/graph/gc.mjs");
+  const checked = JSON.parse(await getBlob(f.root, result.receiptUri));
+  assert.match(checked.inlineSummary, /^cas:\/\/sha256\//);
+  assert.equal((await getBlob(f.root, checked.inlineSummary)).toString(), r.inlineSummary);
+});
+
 test("external gate files enter CAS only as host evidence and remain audit roots on rejection", async t => {
   const nodes = ["ok", "missing", "wrong-policy"].map(id => ({ id, kind: "read", prompt: id }));
   const f = await fixture(t, nodes);
@@ -351,19 +374,56 @@ test("steering: dirty required read needs explicit revalidation, and a volatile 
   const external = await (await import("../scripts/graph/verify-gate.mjs")).measureGate({
     argv: [process.execPath, "-e", "process.exit(0)"], cwd: f.workspace, subjectDigest: proof1.provenance.factDigest });
   await f.settle(await f.start("a"), "accepted", proof1, "parent1");
-  for (const id of ["child", "volatile"]) await send("settle", { root: f.root, token: await f.start(id),
-    opId: "s-"+id, outcome: "accepted", receipt: proof1, gateLog: external });
+  const { getBlob } = await import("../scripts/graph/gc.mjs");
+  const parentUri = (await f.call("status")).nodes.a.receiptUri;
+  for (const id of ["child", "volatile"]) {
+    const token = await f.start(id);
+    const directive = await fs.readFile(token, "utf8");
+    const { inputUris } = JSON.parse(directive);
+    assert.equal(inputUris.length, 1);
+    assert.deepEqual(JSON.parse(await getBlob(f.root, inputUris[0])), proof1.provenance);
+    assert.equal(directive.includes(parentUri), false);
+    assert.ok((await f.call("status")).nodes[id].attempt.inputUris.includes(parentUri), "engine pins original, never delivers it");
+    await send("settle", { root: f.root, token, opId: "s-"+id, outcome: "accepted", receipt: proof1, gateLog: external });
+  }
+  const previous = (await f.call("status")).nodes.child.receiptUri;
   await f.call("amend", { node: "a", expectedRev: 1, opId: "change", patch: { exec: { prompt: "new prompt" } } });
   const next = await f.call("claim", { node: "a", expectedRev: 2, opId: "c2" });
   await send("start", { root: f.root, token: next.instructionPath, hostHandle: "again" });
   await f.settle(next.instructionPath, "accepted", { ...proof1, inlineSummary: "different wording" }, "parent2");
   assert.equal((await f.call("status")).nodes.child.status, "pending");
-  const reused = await f.call("revalidate", { node: "child", expectedRev: 2, opId: "reuse" });
+  const cli = new URL("../scripts/graph/cli.mjs", import.meta.url);
+  const { stdout } = await promisify(execFile)(process.execPath, [cli.pathname, "revalidate", "--root", f.root,
+    "--workspace", f.workspace, "--run", f.run, "--node", "child", "--expected-rev", "2", "--op-id", "reuse"]);
+  const reused = JSON.parse(stdout).result;
   assert.equal(reused.status, "accepted");
   await assert.rejects(f.call("revalidate", { node: "volatile", expectedRev: 2, opId: "unsafe" }),
     { code: "ERR_REVALIDATION_REQUIRED" });
   const frames = (await fs.readFile(join(f.root, "runs", f.run, "wal/events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
-  assert.deepEqual(frames.filter(r => r.type === "NodeRevalidated").map(r => r.body.nodeId), ["child"]);
+  const records = frames.filter(r => r.type === "NodeRevalidated");
+  assert.deepEqual(records.map(r => [r.body.nodeId, r.body.graphRev, r.body.priorReceiptUri]), [["child", 2, previous]]);
+  assert.ok(records[0].body.reason);
+  assert.ok(records[0].body.refs.includes(previous));
+});
+
+test("explicit full receipt input prevents a facts-v1 delivery marker", async t => {
+  const f = await fixture(t, [{ id: "p", kind: "read", prompt: "p" }]);
+  const r = await proof(f);
+  const log = await (await import("../scripts/graph/verify-gate.mjs")).measureGate({ argv: ["test", "-f", "source"],
+    cwd: f.workspace, subjectDigest: r.provenance.factDigest });
+  const finish = token => send("settle", { root: f.root, token, receipt: r, gateLog: log, outcome: "accepted", opId: "done" });
+  const { receiptUri } = await finish(await f.start("p"));
+  const o = { root: f.root, run: "second" };
+  await send("compile", { ...o, workspace: f.workspace, spec: { schemaVersion: 1,
+    nodes: [{ id: "p", kind: "read", prompt: "p" }, { id: "c", kind: "read", prompt: "c",
+      dependsOn: ["p"], projection: "facts-v1", inputUris: [receiptUri] }] } });
+  const claim = node => send("claim", { ...o, node, expectedRev: 1, opId: "claim-" + node });
+  const token = (await claim("p")).instructionPath;
+  await send("start", { root: f.root, token, hostHandle: "host" });
+  assert.equal((await finish(token)).receiptUri, receiptUri);
+  const directive = JSON.parse(await fs.readFile((await claim("c")).instructionPath));
+  assert.deepEqual(directive.inputUris, [receiptUri]);
+  assert.equal((await send("status", o)).nodes.c.attempt.deliveredProjection, null);
 });
 
 test("gate runs outside the graph lock and stale completion cannot publish its measurement", async t => {

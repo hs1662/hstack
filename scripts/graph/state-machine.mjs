@@ -156,8 +156,9 @@ async function accept(s, n, o, io) {
   if (!/^[a-f0-9]{64}$/.test(subjectDigest)) throw graphError("ERR_FORGED_EVIDENCE", "Invalid subject digest");
   if (receipt.workerReportedStatus === "blocked" || receipt.workerReportedStatus === "needs_clarification")
     throw graphError("ERR_MISSING_EVIDENCE", "Worker needs clarification");
-  if (n.gateArgv && !io.measurements) {
-    throw new GateWork({ argv:n.gateArgv, cwd:s.workspace, subjectDigest, timeoutMs:n.timeoutMs,
+  const policy = gatePolicy(n);
+  if (policy.gateArgv && !io.measurements) {
+    throw new GateWork({ argv:policy.gateArgv, cwd:s.workspace, subjectDigest, timeoutMs:policy.timeoutMs,
       diagnostics:n.flaky ? s.limits.maxFlakyDiagnostics : 0 });
   }
   const log = n.gateArgv ? io.measurements.first : o.gateLog;
@@ -173,11 +174,11 @@ async function accept(s, n, o, io) {
     throw graphError("ERR_FLAKY_GATE", "Diagnostic reruns cannot certify a failing gate");
   }
   const checked = Receipt(await validateReceipt(receipt, { ...io, workspaceRoot: s.workspace, gateLogUri }));
-  const artifact = validatedArtifact(checked);
-  const key = gateKey({ ...gatePolicy(n), candidateTree: artifact, environment: s.environment });
+  const artifact = await validatedArtifact(checked, io);
+  const key = gateKey({ ...policy, candidateTree: artifact, environment: s.environment });
   if (n.revalidateReceiptUri) {
     const pinned = JSON.parse(await io.get(n.kind === "reducer" ? n.workerReceiptUri ?? n.revalidateReceiptUri : n.revalidateReceiptUri));
-    if (validatedArtifact(pinned) !== artifact) throw graphError("ERR_FORGED_EVIDENCE", "Revalidation changed the pinned artifact");
+    if (await validatedArtifact(pinned, io) !== artifact) throw graphError("ERR_FORGED_EVIDENCE", "Revalidation changed the pinned artifact");
   }
   const requiresPolicyKey = !n.gateArgv && (n.revalidateReceiptUri || n.testPlan?.length || n.auditPolicy || n.gateVersion);
   if ((requiresPolicyKey || Object.hasOwn(log, "gateKey")) && log.gateKey !== key)

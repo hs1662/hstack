@@ -153,6 +153,9 @@ export function failureRecord(receipt, reason) {
   return { schemaVersion: 1, reason, encoding: "base64", raw: Buffer.from(JSON.stringify(receipt ?? null)).toString("base64") };
 }
 
-export function validatedArtifact(receipt) {
-  return artifactDigest({ provenance: receipt.provenance, inlineSummary: receipt.inlineSummary });
+export async function validatedArtifact(receipt, io) {
+  // Presentation may spill the same summary under a tighter delivery budget.
+  const summary = receipt.inlineSummary;
+  const inlineSummary = summary.startsWith("cas://") ? (await io.get(summary)).toString("utf8") : summary;
+  return artifactDigest({ provenance: receipt.provenance, inlineSummary });
 }
