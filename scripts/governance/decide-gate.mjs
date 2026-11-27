@@ -313,7 +313,7 @@ function extractVerificationEntries(
     const prepInfo = extractChainPrepInfo(seg);
     if (prepInfo) {
       prepPrefixes.push(`${state.dir}::${prepInfo.sig}`);
-      prepItems.push({ dir: state.dir, dirs: prepInfo.dirs, prefixTokens: prepInfo.prefixTokens, argv: prepInfo.argv, opaque: prepInfo.opaque });
+      prepItems.push({ dir: state.dir, dirs: prepInfo.dirs, prefixKeyTokens: prepInfo.normalizedPrefixTokens ?? prepInfo.prefixTokens, argv: prepInfo.argv, opaque: prepInfo.opaque });
       continue;
     }
     if (classifyCommand(norm) === "verification") {
@@ -1836,7 +1836,7 @@ function prepItemsEqual(failedItems, passedItems) {
   }
   return failedItems.every((f, i) => {
     const p = passedItems[i];
-    return f.dir === p.dir && strArrayEqual(f.dirs, p.dirs) && strArrayEqual(f.prefixTokens, p.prefixTokens) && strArrayEqual(f.argv, p.argv);
+    return f.dir === p.dir && strArrayEqual(f.dirs, p.dirs) && strArrayEqual(f.prefixKeyTokens, p.prefixKeyTokens) && strArrayEqual(f.argv, p.argv);
   });
 }
 

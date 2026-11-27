@@ -688,7 +688,7 @@ function inlineInterpreterBody(bin, args) {
     let noexec = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aceluxvn]*o$/.test(arg)) {
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aeluxvn]*o$/.test(arg)) {
         if (arg === "-O" || arg === "+O") {
           return "";
         }
@@ -697,10 +697,7 @@ function inlineInterpreterBody(bin, args) {
           const ch = arg[k];
           if (ch === "n") noexec = enable;
           else if (ch === "a") allexport = enable;
-          else if (ch === "c") {
-            if (!enable) return "";
-            inline = true;
-          } else if (!SHELL_SAFE_SHORT_FLAGS.has(ch)) {
+          else if (!SHELL_SAFE_SHORT_FLAGS.has(ch)) {
             return "";
           }
         }
@@ -1790,6 +1787,75 @@ function isChainPrepCommand({ words, redirects }) {
   return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
 }
 
+function normalizePrepPrefixTokens(words) {
+  const out = [];
+  for (let i = 0; i < words.length; i += 1) {
+    const w = words[i];
+    if (w === "env") {
+      out.push(w);
+      i += 1;
+      while (i < words.length) {
+        const arg = words[i];
+        if (arg === "-C" || arg === "--chdir") {
+          i += 2;
+          continue;
+        }
+        if (arg.startsWith("--chdir=") || (arg.startsWith("-C") && arg.length > 2)) {
+          i += 1;
+          continue;
+        }
+        if (/^-[A-Za-z0-9]+$/.test(arg) && arg.includes("C")) {
+          const cIdx = arg.indexOf("C");
+          const head = arg.slice(0, cIdx);
+          if (head.length > 1) out.push(head);
+          if (cIdx === arg.length - 1) i += 1;
+          i += 1;
+          continue;
+        }
+        if (!arg.startsWith("-") && !ENV_ASSIGN_RE.test(arg)) {
+          i -= 1;
+          break;
+        }
+        out.push(arg);
+        i += 1;
+      }
+      continue;
+    }
+    if (w === "sudo") {
+      out.push(w);
+      i += 1;
+      while (i < words.length) {
+        const arg = words[i];
+        if (arg === "-D" || arg === "--chdir") {
+          i += 2;
+          continue;
+        }
+        if (arg.startsWith("--chdir=")) {
+          i += 1;
+          continue;
+        }
+        if (/^-[A-Za-z0-9]+$/.test(arg) && arg.includes("D")) {
+          const dIdx = arg.indexOf("D");
+          const head = arg.slice(0, dIdx);
+          if (head.length > 1) out.push(head);
+          if (dIdx === arg.length - 1) i += 1;
+          i += 1;
+          continue;
+        }
+        if (!arg.startsWith("-")) {
+          i -= 1;
+          break;
+        }
+        out.push(arg);
+        i += 1;
+      }
+      continue;
+    }
+    out.push(w);
+  }
+  return out;
+}
+
 export function extractChainPrepInfo(segment) {
   if (typeof segment !== "string" || segment.trim().length === 0) {
     return null;
@@ -1810,6 +1876,7 @@ export function extractChainPrepInfo(segment) {
   const dirs = prefix.chdirs.map((dir) => posix.normalize(toPosix(dir)));
   const rawBin = parsed.words[idx];
   const prefixTokens = parsed.words.slice(0, idx);
+  const normalizedPrefixTokens = normalizePrepPrefixTokens(prefixTokens);
   const argv = [rawBin, ...parsed.words.slice(idx + 1)];
   const legacyArgv = ["npm", ...parsed.words.slice(idx + 1)];
   const dirParts = prefix.chdirOpaque ? [...dirs, "$opaque"] : dirs;
@@ -1819,6 +1886,7 @@ export function extractChainPrepInfo(segment) {
     dirs,
     rawBin,
     prefixTokens,
+    normalizedPrefixTokens,
     argv,
     opaque: Boolean(prefix.chdirOpaque),
   };
