@@ -3,7 +3,7 @@ name: hstack-graph
 description: 독립된 읽기·검증 작업을 여러 호스트 작업자에게 나누고, 검증된 출처와 누락 없는 증거 색인을 모아야 할 때 사용하는 무데몬 그래프 실행 절차입니다.
 ---
 
-# hstack:graph
+# hstack:hstack-graph
 
 호스트가 작업자를 실행하고, CLI는 짧은 호출마다 로컬 상태와 증거를 기록한다. CLI가 작업자를 자동 실행하지는 않는다. `node "$PLUGIN_ROOT/scripts/graph/cli.mjs"`를 사용한다. Claude Code에서는 `$PLUGIN_ROOT` 대신 `$CLAUDE_PLUGIN_ROOT`를 사용한다.
 
@@ -14,6 +14,6 @@ description: 독립된 읽기·검증 작업을 여러 호스트 작업자에게
 
 병렬 코드 쓰기와 Git 통합은 v1 기능이 아니다. `ERR_V2_WRITE_INTEGRATION_NOT_ENABLED`를 우회하지 않는다. 락이나 WAL이 불확실하면 수동 삭제로 진행하지 않는다.
 
-- [CLI 참조](references/cli.md) · [대량 팬인](references/mass.md) · [장애 복구](references/recovery.md)
+- [실행 가능한 읽기 노드 예제](references/example.md) · [CLI 참조](references/cli.md) · [대량 팬인](references/mass.md) · [장애 복구](references/recovery.md)
 - [장기 작업자 규약](references/long-worker.md): 최근 10턴 관찰, 12턴 단위 마스킹, 실측 창의 55~65%에서 핀 인계, 검사 시간 제한·결정론적 표본·`ERROR` 색인.
 - [실제 호스트 점검](references/live-host.md): 패키지 엄격 검증과 별도로 양 호스트에서 확인하는 디스패치·핸드오프·완료 게이트.
