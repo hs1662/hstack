@@ -6,7 +6,7 @@ import { graphError, isRecord, nonempty } from "./schema.mjs";
 import { withLock } from "./lock.mjs";
 import {
   atomicFile, casUri, corrupt, digest, directory, entries, getBlob, optionalFile,
-  putBlob, refsIn, syncDir, trace, validateUris,
+  pendingIntent, putBlob, refsIn, syncDir, trace, uncertain, validateUris, withIntent,
 } from "./gc.mjs";
 
 function paths(root, runId) {
@@ -30,6 +30,26 @@ function parse(bytes, label) {
 
 const checksum = (frame) => digest(canonical(frame));
 const hex = /^[a-f0-9]{64}$/;
+
+// V1 commits a complete addressed post-image: replay is replacement, not
+// re-execution of the command that measured time, issued tokens, or ran gates.
+export function foldCommitted(prev, frame, state) {
+  const { recordHash, ...header } = frame;
+  if (header.schemaVersion !== 1 || header.seq !== (prev?.lastSeq ?? 0) + 1 ||
+      header.prevHash !== (prev?.lastHash ?? null) || checksum(header) !== recordHash ||
+      !isRecord(state) || header.body?.stateUri !== `cas://sha256/${checksum(state)}`) {
+    throw corrupt("Invalid v1 post-image transition");
+  }
+  return { lastSeq: header.seq, lastHash: recordHash, state };
+}
+
+function verifySnapshot(bytes, frame) {
+  const s = parse(bytes, "snapshot");
+  if (!frame || s?.schemaVersion !== 1 || s.lastSeq !== frame.seq || s.lastHash !== frame.recordHash ||
+      !isRecord(s.state) || !hex.test(s.stateHash) || `cas://sha256/${s.stateHash}` !== frame.body.stateUri ||
+      checksum(s.state) !== s.stateHash) throw corrupt("Snapshot does not match its committed post-image");
+  return s;
+}
 
 function framesFrom(bytes) {
   const frames = [], ops = new Map(), roots = new Set();
@@ -82,21 +102,17 @@ async function inspect(p, marked = new Set()) {
   const bytes = await optionalFile(p.file) ?? Buffer.alloc(0);
   const log = framesFrom(bytes);
   await trace(p.root, log.roots, marked);
-  let state = null;
+  let head = null;
   if (latest) {
-    const checkpoint = parse(await optionalFile(join(p.snapshots, `${latest}.json`)), "snapshot");
-    const frame = log.frames[latest - 1];
-    if (!frame || checkpoint?.schemaVersion !== 1 || checkpoint.seq !== latest ||
-        checkpoint.recordHash !== frame.recordHash || !isRecord(checkpoint.state) ||
-        `cas://sha256/${checksum(checkpoint.state)}` !== frame.body.stateUri) {
-      throw corrupt(`Snapshot ${latest} does not match its WAL frame`);
-    }
-    state = checkpoint.state;
+    head = verifySnapshot(await optionalFile(join(p.snapshots, `${latest}.json`)), log.frames[latest - 1]);
   }
-  // Each event points to a complete immutable post-state (not a patch).
+  for (let i = latest; i < log.frames.length; i++) {
+    const frame = log.frames[i];
+    const state = parse(await getBlob(p.root, frame.body.stateUri), "committed post-state");
+    head = foldCommitted(head, frame, state);
+  }
   const last = log.frames.at(-1);
-  if (last && last.seq > latest) state = parse(await getBlob(p.root, last.body.stateUri), "post-state");
-  return { ...log, bytes, state, last, checkpointSeq: latest };
+  return { ...log, bytes, state: head?.state ?? null, last, checkpointSeq: latest };
 }
 
 // Internal collector entry point: caller already holds the global lock.
@@ -112,9 +128,16 @@ async function pins(p, log, staging = []) {
 
 async function checkpoint(p, frame, state) {
   await directory(p.root, ["runs", p.runId, "snapshots"]);
-  await atomicFile(join(p.snapshots, `${frame.seq}.json`), canonical({
-    schemaVersion: 1, seq: frame.seq, recordHash: frame.recordHash, state,
-  }));
+  const path = join(p.snapshots, `${frame.seq}.json`);
+  // The global lock allocates one new sequence number; never replace a checkpoint.
+  if (await optionalFile(path)) throw corrupt(`Checkpoint already exists at ${frame.seq}`);
+  await atomicFile(path, canonical({ schemaVersion: 1, lastSeq: frame.seq, lastHash: frame.recordHash,
+    stateHash: checksum(state), state }), true);
+  try {
+    verifySnapshot(await optionalFile(path), frame);
+  } catch (err) {
+    throw uncertain(p.runId, err);
+  }
 }
 
 async function stabilize(p, log) {
@@ -133,7 +156,9 @@ async function stabilize(p, log) {
 }
 
 export async function readState(root, runId) {
-  return (await inspect(paths(root, runId))).state;
+  const p = paths(root, runId);
+  await pendingIntent(root, runId);
+  return (await inspect(p)).state;
 }
 
 // Last writer wins; progress is not state, authorization, or a GC root.
@@ -143,18 +168,23 @@ export async function writeHeartbeats(root, runId, progress) {
   const bytes = canonical(progress);
   assertPublic(progress);
   if (!await directory(root, ["runs", runId], false)) throw graphError("ERR_RUN_NOT_FOUND", "Unknown run");
-  const runtime = await directory(root, ["runs", runId, "runtime"]);
-  await atomicFile(join(runtime, "heartbeats.json"), bytes, true);
+  return withLock(root, () => withIntent(root, runId, async () => {
+    const runtime = await directory(root, ["runs", runId, "runtime"]);
+    await atomicFile(join(runtime, "heartbeats.json"), bytes, true);
+  }));
 }
 
 export async function recover(root, runId) {
   const p = paths(root, runId);
   return withLock(root, async () => {
+    await pendingIntent(root, runId);
     const log = await inspect(p);
-    await stabilize(p, log);
-    if (log.last && log.checkpointSeq !== log.last.seq) await checkpoint(p, log.last, log.state);
-    if (log.last || await optionalFile(p.pin)) await pins(p, log);
-    return log.state;
+    return withIntent(root, runId, async () => {
+      await stabilize(p, log);
+      if (log.last && log.checkpointSeq !== log.last.seq) await checkpoint(p, log.last, log.state);
+      if (log.last || await optionalFile(p.pin)) await pins(p, log);
+      return log.state;
+    });
   });
 }
 
@@ -164,6 +194,7 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
   nonempty(type, "type");
   const payloadDigest = checksum(["hstack.transaction/v1", type, payload]);
   return withLock(root, async () => {
+    await pendingIntent(root, runId);
     const log = await inspect(p);
     if (guard) await guard(log.state); // Fencing must apply even to a cached receipt.
     const prior = log.ops.get(opId);
@@ -171,6 +202,7 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
       throw graphError("ERR_OP_CONFLICT", "Operation ID already committed with different input");
     }
     if (prior && beforeReplay) await beforeReplay(log.state);
+    return withIntent(root, runId, async () => {
     if (prior || log.offset !== log.bytes.length) await stabilize(p, log);
     if (prior) return prior.body.response;
 
@@ -207,11 +239,12 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
       const refs = [...new Set([...refsIn(state), ...(data.refs ?? [])])];
       const body = { ...data.body, refs, stateUri, response: data.response };
       await trace(root, refsIn(body));
+      const eventType = nonempty(data.eventType ?? type, "eventType");
       const header = { schemaVersion: 1, seq: log.frames.length + 1,
-        prevHash: log.last?.recordHash ?? null, opId, payloadDigest, type, body };
+        prevHash: log.last?.recordHash ?? null, opId, payloadDigest, type: eventType, body };
       frame = { ...header, recordHash: checksum(header) };
     } catch (err) {
-      if (staging.size) await pins(p, log);
+      if (staging.size && !["EIO", "ENOSPC"].includes(err.code)) await pins(p, log);
       throw err;
     }
     await directory(root, ["runs", runId, "wal"]);
@@ -225,5 +258,6 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
     await pins(p, { ...log, last: frame });
     await checkpoint(p, frame, state);
     return frame.body.response;
+    });
   });
 }

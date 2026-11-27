@@ -273,3 +273,76 @@ test("a concurrent GC sees the writer's committed roots, not the in-flight pin s
   assert.equal(await fs.readFile(blob(root, "claimed"), "utf8"), "claimed");
   await assert.rejects(fs.stat(blob(root, "discarded")), { code: "ENOENT" });
 });
+
+for (const [point, code] of [["wal sync", "EIO"], ["wal directory sync", "ENOSPC"], ["snapshot reopen", "EIO"]]) {
+  test(`${point} ${code} freezes only the affected run across processes without rolling back history`, async t => {
+    const root = await fixture(t);
+    await transaction(root, "r", request("original"), () => result(1));
+    const committed = await fs.readFile(wal(root));
+    const oldSnapshot = join(root, "runs", "r", "snapshots", "1.json");
+    const checkpoint = await fs.readFile(oldSnapshot);
+    const file = point === "wal sync" ? wal(root) : point === "wal directory sync" ? dirname(wal(root)) :
+      join(dirname(oldSnapshot), "2.json");
+    const module = new URL("../scripts/graph/wal-store.mjs", import.meta.url).href;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+      import fs from "node:fs/promises";
+      import { syncBuiltinESMExports } from "node:module";
+      const target = ${JSON.stringify(file)}, reopen = ${point === "snapshot reopen"};
+      const fail = () => { throw Object.assign(new Error("injected"), {code:${JSON.stringify(code)}}); };
+      let fault = false;
+      const open = fs.open.bind(fs), read = fs.readFile.bind(fs);
+      const rename = fs.rename.bind(fs);
+      fs.rename = async (from, to) => {
+        if (fault && to.includes(".io-uncertain.")) fail();
+        return rename(from, to);
+      };
+      fs.open = async (path,...args) => {
+        const flags = args[0];
+        const writes = typeof flags === "number" ? (flags & 3) !== 0 : /[wa+]/.test(flags ?? "r");
+        if (fault && writes) fail(); // reads, including numeric read-only lock-owner FDs, still work
+        if (path === target && reopen && args[0] === "r") { fault = true; fail(); }
+        const fd = await open(path,...args);
+        if (path === target && !reopen) fd.sync = async () => { fault = true; fail(); };
+        return fd;
+      };
+      fs.readFile = async (path,...args) => {
+        if (reopen && path === target) { fault = true; fail(); }
+        return read(path,...args);
+      };
+      syncBuiltinESMExports();
+      const {transaction} = await import(${JSON.stringify(module)});
+      try { await transaction(${JSON.stringify(root)}, "r", ${JSON.stringify(request("pending"))}, () => (${JSON.stringify(result(2))})); }
+      catch (err) { console.log(JSON.stringify({code:err.code,outcome:err.outcome})); }
+    `], { encoding: "utf8", timeout: 20000 });
+    assert.equal(child.status, 0, child.stderr);
+    assert.deepEqual(JSON.parse(child.stdout), { code: "ERR_IO_UNCERTAIN", outcome: "IO_UNKNOWN" });
+    const frozen = { code: "ERR_IO_UNCERTAIN" };
+    await assert.rejects(transaction(root, "r", request("pending"), assert.fail), frozen);
+    await assert.rejects(recover(root, "r"), frozen);
+    await assert.rejects(readState(root, "r"), frozen);
+    await assert.rejects(collectGarbage(root), frozen);
+    assert.deepEqual(await fs.readFile(oldSnapshot), checkpoint);
+    assert.deepEqual((await fs.readFile(wal(root))).subarray(0, committed.length), committed);
+    assert.deepEqual(await transaction(root, "unaffected", request("other"), () => result(7)), { receipt: 7 });
+  });
+}
+
+test("versioned pure fold checks frame links and pinned post-state, independent of runtime inputs", async t => {
+  const root = await fixture(t);
+  for (const n of [1, 2]) {
+    await transaction(root, "r", request(String(n)), prev => ({
+      ...result(n), eventType: prev ? "RevalidationAccepted" : "RevalidationRequested",
+    }));
+  }
+  const frames = (await fs.readFile(wal(root), "utf8")).trimEnd().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(frames.map(f => f.type), ["RevalidationRequested", "RevalidationAccepted"]);
+  const { foldCommitted } = await import("../scripts/graph/wal-store.mjs");
+  const first = foldCommitted(null, frames[0], { n: 1 });
+  const folded = foldCommitted(first, frames[1], { n: 2 });
+  assert.deepEqual(folded, { lastSeq: 2, lastHash: frames[1].recordHash, state: { n: 2 } });
+  assert.throws(() => foldCommitted(null, frames[1], { n: 2 }), corrupt);
+  assert.throws(() => foldCommitted(first, frames[1], { n: 9 }), corrupt);
+  assert.throws(() => foldCommitted(first, { ...frames[1], schemaVersion: 99 }, { n: 2 }), corrupt);
+  const snap = JSON.parse(await fs.readFile(join(root, "runs", "r", "snapshots", "2.json")));
+  assert.deepEqual(snap, { schemaVersion: 1, ...folded, stateHash: hash('{"n":2}') });
+});

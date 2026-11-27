@@ -56,6 +56,66 @@ export async function optionalFile(path) {
   }
 }
 
+export function uncertain(runId, cause) {
+  return Object.assign(graphError("ERR_IO_UNCERTAIN", `Run ${runId}: durability unknown; offline inspection required`),
+    { status: "IO_UNCERTAIN", outcome: "IO_UNKNOWN", cause });
+}
+
+const intentName = /^\.io-intent\.([a-f0-9-]{36})\.(.+)$/;
+
+// The lock grave is positive evidence of owner death. An intent left by a
+// normally released lock is NOT a killed writer and must never be auto-cleared.
+export async function pendingIntent(root, runId) {
+  const names = await entries(root);
+  if (names.includes(`.io-uncertain.${runId}`)) throw uncertain(runId);
+  const abandoned = [];
+  for (const name of names) {
+    const match = intentName.exec(name);
+    if (match?.[2] !== runId) continue;
+    const token = match[1];
+    if (!(await entries(join(root, "graveyard"))).some(n => n.startsWith(`lock.${token}.`))) {
+      // A lock-free read can race normal completion; don't poison after release.
+      const owner = await optionalFile(join(root, "lock", "owner.json"));
+      if (owner && JSON.parse(owner).lockToken === token) {
+        throw graphError("ERR_LOCK_BUSY", "Run durability decision in progress");
+      }
+      if ((await entries(root)).includes(name)) throw uncertain(runId);
+    } else abandoned.push(join(root, name));
+  }
+  return abandoned;
+}
+
+// Under the global lock. The durable intent precedes *all* run writes. If
+// publishing a poison marker also fails, retaining the intent is sufficient:
+// the caller releases its lock normally before exposing the uncertain outcome.
+export async function withIntent(root, runId, fn) {
+  const abandoned = await pendingIntent(root, runId);
+  const { lockToken } = JSON.parse(await fs.readFile(join(root, "lock", "owner.json")));
+  const path = join(root, `.io-intent.${lockToken}.${runId}`);
+  await fs.mkdir(path, { mode: 0o700 });
+  try {
+    await syncDir(root);
+    for (const prior of abandoned) await fs.rmdir(prior);
+    const result = await fn();
+    // No further commit IO after disarming. A reappearing intent after power
+    // loss conservatively holds rather than trusting an ambiguous device.
+    await fs.rmdir(path);
+    return result;
+  } catch (err) {
+    if (["EIO", "ENOSPC", "ERR_IO_UNCERTAIN"].includes(err.code)) {
+      try {
+        await fs.rename(path, join(root, `.io-uncertain.${runId}`));
+        await syncDir(root);
+      } catch {
+        // Never clear the already-armed intent just because poisoning failed.
+      }
+      throw uncertain(runId, err);
+    }
+    await fs.rmdir(path);
+    throw err;
+  }
+}
+
 // Only mutable indexes use rename. For immutable objects, link is the POSIX
 // no-replace publication point; even a preexisting corrupted inode is not replaced.
 export async function atomicFile(path, bytes, mutable = false) {
@@ -148,6 +208,12 @@ const tmpName = /^\.tmp-[a-f0-9-]{36}$/;
 export async function collectGarbage(root) {
   return withLock(root, async () => {
     const marked = new Set(), histories = new Map();
+    // A first transaction can be uncertain before it even publishes runs/<id>.
+    for (const name of await entries(root)) {
+      if (name.startsWith(".io-uncertain.")) throw uncertain(name.slice(".io-uncertain.".length));
+      const match = intentName.exec(name);
+      if (match) await pendingIntent(root, match[2]);
+    }
     await directory(root, ["runs"], false);
     for (const id of await entries(join(root, "runs"))) {
       histories.set(id, await markJournal(root, id, marked));
