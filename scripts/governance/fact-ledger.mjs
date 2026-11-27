@@ -866,7 +866,7 @@ function parseCommandPrefix(tokens) {
       while (idx < tokens.length) {
         const arg = tokens[idx];
         // `env -S` splits its argument into a whole new command line.
-        if (tok === "env" && (arg === "--split-string" || arg.startsWith("--split-string=") || isExecHijackAssign(arg))) {
+        if (tok === "env" && (arg === "-S" || arg === "--split-string" || arg.startsWith("--split-string=") || isExecHijackAssign(arg))) {
           return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
         }
         if (tok === "env" && (arg === "-" || arg === "--ignore-environment")) {
