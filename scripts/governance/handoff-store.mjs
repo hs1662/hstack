@@ -483,6 +483,17 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
   }
 }
 
+function toNullProtoRecord(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const out = Object.create(null);
+  for (const [k, v] of Object.entries(raw)) {
+    out[k] = v;
+  }
+  return out;
+}
+
 export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir = resolvePluginDataDir() } = {}) {
   const snap = readSessionState(conversationId, dataDir)?.turnSnapshot;
   if (
@@ -496,31 +507,28 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
   ) {
     return null;
   }
-  // head is null for a snapshot that predates HEAD recording, so no commit range is checked.
+
   const headOf = (raw) => (typeof raw?.head === "string" ? raw.head : null);
-  const docFilesOf = (raw) =>
-    raw?.docFiles && typeof raw.docFiles === "object" && !Array.isArray(raw.docFiles) ? raw.docFiles : null;
-  const untrackedOf = (raw) =>
-    raw?.untrackedFiles && typeof raw.untrackedFiles === "object" && !Array.isArray(raw.untrackedFiles) ? raw.untrackedFiles : null;
+  const docFilesOf = (raw) => toNullProtoRecord(raw?.docFiles);
+  const untrackedOf = (raw) => toNullProtoRecord(raw?.untrackedFiles);
   const capturedAtOf = (raw) => (Number.isFinite(raw?.capturedAtMs) ? raw.capturedAtMs : null);
-  const gateFiles = snap.gate?.files;
-  const gate =
-    gateFiles && typeof gateFiles === "object" && !Array.isArray(gateFiles)
-      ? {
-          head: headOf(snap.gate),
-          files: gateFiles,
-          docFiles: docFilesOf(snap.gate),
-          docFilesTruncated: Boolean(snap.gate?.docFilesTruncated),
-          untrackedFiles: untrackedOf(snap.gate),
-          untrackedTruncated: Boolean(snap.gate?.untrackedTruncated),
-          capturedAtMs: capturedAtOf(snap.gate),
-          passCount: Number.isInteger(snap.gate?.passCount) ? snap.gate.passCount : null,
-        }
-      : null;
+  const gateFiles = toNullProtoRecord(snap.gate?.files);
+  const gate = gateFiles
+    ? {
+        head: headOf(snap.gate),
+        files: gateFiles,
+        docFiles: docFilesOf(snap.gate),
+        docFilesTruncated: Boolean(snap.gate?.docFilesTruncated),
+        untrackedFiles: untrackedOf(snap.gate),
+        untrackedTruncated: Boolean(snap.gate?.untrackedTruncated),
+        capturedAtMs: capturedAtOf(snap.gate),
+        passCount: Number.isInteger(snap.gate?.passCount) ? snap.gate.passCount : null,
+      }
+    : null;
   return {
     gitRoot: snap.gitRoot,
     head: headOf(snap),
-    files: snap.files,
+    files: toNullProtoRecord(snap.files),
     docFiles: docFilesOf(snap),
     docFilesTruncated: Boolean(snap.docFilesTruncated),
     untrackedFiles: untrackedOf(snap),
@@ -745,10 +753,10 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     if (!snapObj) {
       return undefined;
     }
-    if (relPath in snapObj.files) {
+    if (Object.hasOwn(snapObj.files, relPath)) {
       return snapObj.files[relPath];
     }
-    if (snapObj.untrackedFiles && relPath in snapObj.untrackedFiles) {
+    if (snapObj.untrackedFiles && Object.hasOwn(snapObj.untrackedFiles, relPath)) {
       return snapObj.untrackedFiles[relPath];
     }
     return undefined;
@@ -811,7 +819,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     const targetStep = postGateWriter ? datingStep(postGateShell) : riskyStep;
     const markRecentUntracked = (step) => {
       for (const relPath of dirtyFiles) {
-        if (isExemptDocOrAssetPath(relPath) || relPath in baseline.files || relPath in current.files) {
+        if (isExemptDocOrAssetPath(relPath) || Object.hasOwn(baseline.files, relPath) || Object.hasOwn(current.files, relPath)) {
           continue;
         }
         const freshMs = statFreshnessMs(current.gitRoot, relPath);

@@ -102,8 +102,7 @@ const GO_EXEC_FLAG_RE = /^--?(?:exec|toolexec|vettool)(?:=|$)/;
 const CARGO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "clippy", "build", "bench", "doc"]);
 const CARGO_VALUE_FLAGS = new Set(["--manifest-path", "--target", "--target-dir", "--package", "-p", "--features", "-F", "--jobs", "-j", "--color", "--config", "-Z"]);
 const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench", "compile"]);
-const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
-const PYTEST_NON_EXEC_LONG_RE = /^--(?:collect-only|co|fixtures|fixtures-per-test|markers|setup-plan|setup-only|help|version)(?:=|$)/;
+const PYTEST_NON_EXEC_LONG_RE = /^--(?:collect-only|co|fixtures|fixtures-per-test|markers|setup-plan|setup-only|help|version|version-verbose|cache-show)(?:=|$)/;
 const PYTEST_SHORT_VALUE_CHARS = new Set(["c", "k", "m", "o", "p", "r", "W", "n"]);
 const PYTEST_LONG_VALUE_FLAGS = new Set([
   "--config",
@@ -145,7 +144,8 @@ export function readRegularFileBounded(
 ) {
   let fd = -1;
   try {
-    fd = openSync(filePath, "r");
+    const flags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+    fd = openSync(filePath, flags);
     const st = fstatSync(fd);
     if (!st.isFile()) {
       return { ok: false, reason: "not_regular", text: "" };
@@ -779,6 +779,23 @@ function isCommandProbeInvocation(tokens) {
   return false;
 }
 
+const WRAPPER_VALUE_SHORT_CHARS = {
+  env: new Set(["u", "C", "S"]),
+  sudo: new Set(["u", "g", "C", "h", "p", "r", "t", "D"]),
+};
+const WRAPPER_NOARG_SHORT_CHARS = {
+  env: new Set(["i", "0", "v"]),
+  sudo: new Set(["A", "b", "E", "H", "K", "k", "l", "n", "P", "S", "s", "V", "v"]),
+  time: new Set(["p", "v"]),
+  nohup: new Set([]),
+};
+const WRAPPER_SAFE_LONG_NOARG = {
+  env: new Set(["--ignore-environment", "--null", "--debug"]),
+  sudo: new Set(["--askpass", "--background", "--preserve-env", "--set-home", "--remove-timestamp", "--reset-timestamp", "--list", "--non-interactive", "--preserve-groups", "--stdin", "--shell", "--validate"]),
+  time: new Set(["--portability", "--verbose"]),
+  nohup: new Set([]),
+};
+
 // The binary index and wrapper context after leading assignments and wrappers, or binIdx: -1 on hijack/opaque prefix.
 function parseCommandPrefix(tokens) {
   let idx = 0;
@@ -786,6 +803,19 @@ function parseCommandPrefix(tokens) {
   let envPytestCleared = false;
   const chdirs = [];
   let chdirOpaque = false;
+  const applyChdirVal = (dirVal) => {
+    if (!dirVal || dirVal === "-" || dirVal.startsWith("~") || /[$`]/.test(dirVal)) {
+      chdirOpaque = true;
+    } else {
+      chdirs.push(dirVal);
+    }
+  };
+  const applyEnvUnset = (varName) => {
+    if (varName === "PYTEST_ADDOPTS") {
+      envPytestAddopts = null;
+      envPytestCleared = true;
+    }
+  };
   while (idx < tokens.length) {
     const tok = tokens[idx];
     if (isExecHijackAssign(tok)) {
@@ -801,45 +831,40 @@ function parseCommandPrefix(tokens) {
     }
     if (SHELL_WRAPPERS.has(tok)) {
       const valueFlags = WRAPPER_FLAGS_WITH_ARG[tok];
+      const valueChars = WRAPPER_VALUE_SHORT_CHARS[tok];
+      const noargChars = WRAPPER_NOARG_SHORT_CHARS[tok];
+      const safeLongNoarg = WRAPPER_SAFE_LONG_NOARG[tok];
       idx += 1;
       while (idx < tokens.length) {
         const arg = tokens[idx];
         // `env -S` splits its argument into a whole new command line.
-        if (tok === "env" && (/^-[A-Za-z]*S/.test(arg) || arg.startsWith("--split-string") || isExecHijackAssign(arg))) {
+        if (tok === "env" && (/^-[A-Za-z0-9]*S/.test(arg) || arg.startsWith("--split-string") || isExecHijackAssign(arg))) {
           return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
         }
-        if (tok === "env" && (arg === "-i" || arg === "--ignore-environment" || arg === "-")) {
+        if (tok === "env" && arg === "-") {
           envPytestAddopts = null;
           envPytestCleared = true;
           idx += 1;
           continue;
         }
-        if (tok === "env" && (arg.startsWith("--chdir=") || (arg.startsWith("-C") && arg.length > 2))) {
-          const dirVal = arg.startsWith("--chdir=") ? arg.slice("--chdir=".length) : arg.slice(2);
-          if (!dirVal || dirVal === "-" || dirVal.startsWith("~") || /[$`]/.test(dirVal)) {
-            chdirOpaque = true;
-          } else {
-            chdirs.push(dirVal);
-          }
+        if (tok === "env" && (arg === "--ignore-environment")) {
+          envPytestAddopts = null;
+          envPytestCleared = true;
           idx += 1;
           continue;
         }
-        if (tok === "env" && (arg.startsWith("--unset=") || (arg.startsWith("-u") && arg.length > 2))) {
-          const varName = arg.startsWith("--unset=") ? arg.slice("--unset=".length) : arg.slice(2);
-          if (varName === "PYTEST_ADDOPTS") {
-            envPytestAddopts = null;
-            envPytestCleared = true;
-          }
+        if (tok === "env" && arg.startsWith("--chdir=")) {
+          applyChdirVal(arg.slice("--chdir=".length));
+          idx += 1;
+          continue;
+        }
+        if (tok === "env" && arg.startsWith("--unset=")) {
+          applyEnvUnset(arg.slice("--unset=".length));
           idx += 1;
           continue;
         }
         if (tok === "sudo" && arg.startsWith("--chdir=")) {
-          const dirVal = arg.slice("--chdir=".length);
-          if (!dirVal || dirVal === "-" || dirVal.startsWith("~") || /[$`]/.test(dirVal)) {
-            chdirOpaque = true;
-          } else {
-            chdirs.push(dirVal);
-          }
+          applyChdirVal(arg.slice("--chdir=".length));
           idx += 1;
           continue;
         }
@@ -860,20 +885,63 @@ function parseCommandPrefix(tokens) {
         if (valueFlags && valueFlags.has(arg)) {
           const val = tokens[idx + 1];
           if ((tok === "env" && (arg === "-C" || arg === "--chdir")) || (tok === "sudo" && (arg === "-D" || arg === "--chdir"))) {
-            if (!val || val === "-" || val.startsWith("~") || /[$`]/.test(val)) {
-              chdirOpaque = true;
-            } else {
-              chdirs.push(val);
-            }
-          } else if (tok === "env" && (arg === "-u" || arg === "--unset") && val === "PYTEST_ADDOPTS") {
-            envPytestAddopts = null;
-            envPytestCleared = true;
+            applyChdirVal(val);
+          } else if (tok === "env" && (arg === "-u" || arg === "--unset")) {
+            applyEnvUnset(val);
           }
           idx += 2;
           continue;
         }
-        if (arg.startsWith("-") && arg.length > 1) {
+        if (arg.startsWith("--")) {
+          if (arg.includes("=")) {
+            const optName = arg.slice(0, arg.indexOf("="));
+            if (tok === "sudo" && valueFlags?.has(optName)) {
+              idx += 1;
+              continue;
+            }
+            chdirOpaque = true;
+            idx += 1;
+            continue;
+          }
+          if (!safeLongNoarg?.has(arg)) {
+            chdirOpaque = true;
+          }
           idx += 1;
+          continue;
+        }
+        if (arg.startsWith("-") && arg.length > 1) {
+          let consumedNext = false;
+          let opaqueShort = false;
+          for (let k = 1; k < arg.length; k += 1) {
+            const ch = arg[k];
+            if (tok === "env" && ch === "i") {
+              envPytestAddopts = null;
+              envPytestCleared = true;
+              continue;
+            }
+            if (valueChars?.has(ch)) {
+              const attached = arg.slice(k + 1);
+              const val = attached.length > 0 ? attached : tokens[idx + 1];
+              if (!attached) {
+                consumedNext = true;
+              }
+              if ((tok === "env" && ch === "C") || (tok === "sudo" && ch === "D")) {
+                applyChdirVal(val);
+              } else if (tok === "env" && ch === "u") {
+                applyEnvUnset(val);
+              } else if (tok === "env" && ch === "S") {
+                return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
+              }
+              break;
+            }
+            if (!noargChars?.has(ch)) {
+              opaqueShort = true;
+            }
+          }
+          if (opaqueShort) {
+            chdirOpaque = true;
+          }
+          idx += consumedNext ? 2 : 1;
           continue;
         }
         if (tok === "env" && ENV_ASSIGN_RE.test(arg)) {
@@ -1103,24 +1171,17 @@ function parsePythonPytestArgs(args) {
   return null;
 }
 
-function collectPrefixPytestEnv(tokens, binIdx) {
-  let envPytestAddopts = null;
-  for (let i = 0; i < binIdx; i += 1) {
-    const tok = tokens[i];
-    if (typeof tok === "string" && tok.startsWith("PYTEST_ADDOPTS=")) {
-      envPytestAddopts = tok.slice("PYTEST_ADDOPTS=".length);
-    }
-  }
-  return envPytestAddopts;
-}
-
 export function extractPytestCommandInfo(segment) {
   if (typeof segment !== "string" || segment.trim().length === 0) {
     return null;
   }
   const cleaned = segment.trim().replace(/^[(!\s]+/, "");
-  const tokens = tokenizeSegment(cleaned);
+  const lexed = lexVerificationChain(cleaned);
+  let tokens = lexed && lexed.length === 1 ? lexed[0].words : tokenizeSegment(cleaned);
   if (!tokens || tokens.length === 0) {
+    return null;
+  }
+  if (!lexed && tokens.some((tok) => /[<>]/.test(tok))) {
     return null;
   }
   const prefix = parseCommandPrefix(tokens);
@@ -1129,6 +1190,23 @@ export function extractPytestCommandInfo(segment) {
     return null;
   }
   const baseBin = posix.basename(toPosix(tokens[idx]));
+  if (SHELL_INTERPRETERS.has(baseBin)) {
+    const body = inlineInterpreterBody(baseBin, tokens.slice(idx + 1));
+    if (body === "") {
+      return null;
+    }
+    if (body !== null) {
+      return {
+        isPytest: false,
+        shellBody: body,
+        bin: baseBin,
+        envPytestAddopts: prefix.envPytestAddopts,
+        envPytestCleared: prefix.envPytestCleared,
+        chdirs: prefix.chdirs,
+        chdirOpaque: prefix.chdirOpaque,
+      };
+    }
+  }
   if (baseBin === "pytest" || baseBin === "py.test") {
     return {
       isPytest: true,
@@ -3464,7 +3542,10 @@ const SNAPSHOT_MAX_BUFFER = 16 * 1024 * 1024;
 
 const MAX_SNAPSHOT_HASH_BYTES = 1024 * 1024;
 
+const SNAPSHOT_READ_CHUNK_BYTES = 65536;
+
 export function statSnapshotFile(gitRoot, relPath) {
+  let fd = -1;
   try {
     const fullPath = join(gitRoot, relPath);
     const st = lstatSync(fullPath);
@@ -3472,13 +3553,49 @@ export function statSnapshotFile(gitRoot, relPath) {
     if (st.isSymbolicLink()) {
       return [st.mtimeMs, st.size, modeSig, readlinkSync(fullPath)];
     }
-    if (st.isFile() && st.size <= MAX_SNAPSHOT_HASH_BYTES) {
-      const digest = createHash("sha1").update(readFileSync(fullPath)).digest("hex");
-      return [st.mtimeMs, st.size, modeSig, digest];
+    if (!st.isFile()) {
+      return null;
+    }
+    if (st.size <= MAX_SNAPSHOT_HASH_BYTES) {
+      const flags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+      fd = openSync(fullPath, flags);
+      const fst = fstatSync(fd);
+      if (!fst.isFile()) {
+        return null;
+      }
+      if (fst.size > MAX_SNAPSHOT_HASH_BYTES) {
+        return [fst.mtimeMs, fst.size, (fst.mode & 0o170000) | (fst.mode & 0o111)];
+      }
+      const chunk = Buffer.allocUnsafe(SNAPSHOT_READ_CHUNK_BYTES);
+      const hasher = createHash("sha1");
+      let total = 0;
+      while (total <= MAX_SNAPSHOT_HASH_BYTES) {
+        const n = readSync(fd, chunk, 0, Math.min(SNAPSHOT_READ_CHUNK_BYTES, MAX_SNAPSHOT_HASH_BYTES + 1 - total), null);
+        if (n <= 0) {
+          break;
+        }
+        total += n;
+        if (total > MAX_SNAPSHOT_HASH_BYTES) {
+          return [fst.mtimeMs, fst.size, (fst.mode & 0o170000) | (fst.mode & 0o111)];
+        }
+        hasher.update(chunk.subarray(0, n));
+      }
+      if (total !== fst.size) {
+        return null;
+      }
+      const digest = hasher.digest("hex");
+      return [fst.mtimeMs, fst.size, (fst.mode & 0o170000) | (fst.mode & 0o111), digest];
     }
     return [st.mtimeMs, st.size, modeSig];
   } catch {
     return null;
+  } finally {
+    if (fd !== -1) {
+      try {
+        closeSync(fd);
+      } catch {
+      }
+    }
   }
 }
 
@@ -3515,8 +3632,8 @@ export function snapshotWorkingTree(cwd) {
       return null;
     }
   }
-  const files = {};
-  const docFiles = {};
+  const files = Object.create(null);
+  const docFiles = Object.create(null);
   let trackedCodeCount = 0;
   let trackedDocCount = 0;
   let docFilesTruncated = false;
@@ -3553,7 +3670,7 @@ export function snapshotWorkingTree(cwd) {
     }
   }
 
-  let untrackedFiles = {};
+  let untrackedFiles = Object.create(null);
   let untrackedTruncated = false;
   try {
     const untrackedOut = execFileSync("git", ["-c", "core.quotepath=false", "ls-files", "--others", "--exclude-standard", "-z"], {
@@ -3780,8 +3897,11 @@ export function readGitLedger(cwd) {
 }
 
 function scanTestInfraDir(dir, indicators) {
-  if (!dir || !existsSync(dir)) {
+  if (!dir) {
     return { uncertain: false };
+  }
+  if (!existsSync(dir)) {
+    return { uncertain: true };
   }
   let uncertain = false;
 
