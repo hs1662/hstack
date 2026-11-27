@@ -623,9 +623,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
       const gateDoc = activeGate?.docFiles?.[relPath];
       const hasDefinitePostGateDocChange =
-        gateDoc !== undefined
-          ? !sameFileSignature(gateDoc, nowDoc)
-          : !activeGate?.docFilesTruncated && nowDoc !== undefined;
+        gateDoc !== undefined ? !sameFileSignature(gateDoc, nowDoc) : true;
       if (hasDefinitePostGateDocChange) {
         ledger.turnWrittenFiles.add(relPath);
         ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));

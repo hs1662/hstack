@@ -256,11 +256,14 @@ const VERDICT_HEADER_ENTRIES = [
   [VERDICT_HEADERS.SKIPPED_NO_SESSION, "SKIPPED_NO_SESSION"],
 ];
 
-const TEST_INFRA_EXACT_FILES = ["pytest.ini", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile"];
+const TEST_INFRA_EXACT_FILES = ["pytest.ini", ".pytest.ini", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile"];
 const TEST_INFRA_CONFIG_PREFIXES = ["vitest.config.", "jest.config."];
 
 function toPosix(rawPath) {
-  return rawPath.replace(/\\/g, "/");
+  if (process.platform === "win32" || /^[A-Za-z]:\\|^\\\\/.test(rawPath)) {
+    return rawPath.replace(/\\/g, "/");
+  }
+  return rawPath;
 }
 
 function stripTrailingSlashes(p) {
@@ -3368,7 +3371,7 @@ export function readGitLedger(cwd) {
       timeout: remainingTimeout(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-    }).replace(/\r?\n$/, "");
+    }).replace(process.platform === "win32" ? /\r?\n$/ : /\n$/, "");
     if (!gitRoot) {
       return empty;
     }
@@ -3520,6 +3523,21 @@ function scanTestInfraDir(dir, indicators) {
   for (const exact of TEST_INFRA_EXACT_FILES) {
     if (existsSync(join(dir, exact))) {
       indicators.add(exact);
+    }
+  }
+
+  for (const [cfgName, sectionRe] of [
+    ["tox.ini", /^\[pytest\][ \t]*$/im],
+    ["setup.cfg", /^\[tool:pytest\][ \t]*$/im],
+  ]) {
+    const cfgPath = join(dir, cfgName);
+    if (existsSync(cfgPath)) {
+      try {
+        if (sectionRe.test(readFileSync(cfgPath, "utf8"))) {
+          indicators.add(cfgName);
+        }
+      } catch {
+      }
     }
   }
 

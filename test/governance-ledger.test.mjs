@@ -90,7 +90,11 @@ describe("resolvePluginDataDir and streamTranscriptRecords", () => {
 
 describe("normalizeWorkspacePath and doc/asset exemption", () => {
   it("normalizes slashes, dot prefixes, and absolute paths relative to gitRoot or cwd", () => {
-    assert.equal(normalizeWorkspacePath("./src\\governance\\gate.mjs"), "src/governance/gate.mjs");
+    assert.equal(
+      normalizeWorkspacePath("./src\\governance\\gate.mjs"),
+      process.platform === "win32" ? "src/governance/gate.mjs" : "src\\governance\\gate.mjs",
+    );
+    assert.equal(normalizeWorkspacePath("./src/governance/gate.mjs"), "src/governance/gate.mjs");
     assert.equal(normalizeWorkspacePath("/repo/src/a.mjs", "/repo/sub", "/repo"), "src/a.mjs");
     assert.equal(normalizeWorkspacePath("a.mjs", "/repo/sub", "/repo"), "sub/a.mjs");
     assert.equal(normalizeWorkspacePath("/work/file.mjs", "/work", ""), "file.mjs");
