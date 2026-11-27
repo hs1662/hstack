@@ -2,9 +2,9 @@
 
 [English](README.md)
 
-`hstack` (v0.1.1)는 외부 npm 의존성이 없는 순수 Node.js 18+ ESM 기반 Antigravity CLI 통합 거버넌스 플러그인입니다. 하나의 플러그인 안에 한국어 모국어 사고·UI·응답 가드, 표결 우회 차단을 포함한 결정론적 증거 기반 완료 게이트, 위험도 기반 읽기 전용 독립 감사관, 팩트 증류 핸드오프, 명령어 없는 완전 자율 거버넌스(`smart` 모드)를 통합합니다.
+`hstack` (v0.1.2)는 외부 npm 의존성이 없는 순수 Node.js 18+ ESM 기반 Antigravity CLI 통합 거버넌스 플러그인입니다. 하나의 플러그인 안에 한국어 모국어 사고·UI·응답 가드, 표결 우회 차단을 포함한 결정론적 증거 기반 완료 게이트, 위험도 기반 읽기 전용 독립 감사관, 팩트 증류 핸드오프, 명령어 없는 완전 자율 거버넌스(`smart` 모드)를 통합합니다.
 
-## 번들 구성요소 (v0.1.1)
+## 번들 구성요소 (v0.1.2)
 
 | 구성요소 | 개수 | 상세 |
 | --- | :---: | --- |
@@ -27,7 +27,7 @@
 
 ### Layer 2: 결정론적 증거 기반 완료 게이트
 
-- 즉시 로드 MCP 서버(`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.1.1"`)가 `mcp_hstack_gate_verify_completion` (`verify_completion`) 도구를 노출합니다.
+- 즉시 로드 MCP 서버(`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.1.2"`)가 `mcp_hstack_gate_verify_completion` (`verify_completion`) 도구를 노출합니다.
 - `PreToolUse` (`scripts/pre-tool-gate.mjs`)가 `^mcp_hstack_.*$` 호출을 가로채 `decision: "auto_approve"`를 반환하고, 한국어 `toolSummary`와 은닉 `_session` 정보(`conversationId`, `transcriptPath`, `cwd`)를 주입합니다.
 - `scripts/governance/fact-ledger.mjs`와 `scripts/governance/decide-gate.mjs`는 보고된 `modified_files`, `inspected_files`, `verification_runs`, `unverified_scope`, `self_assessment`를 트랜스크립트 열람·수정·실행·사전검토·표결 원장과 Git 작업 트리(`git status --porcelain`, `git diff --numstat`)에 결정론적으로 대조합니다. `PreToolUse` `deny`로 거부된 쓰기 호출이나 `ERROR`·`FAILED`로 실패한 쓰기 호출은 `turnWrittenFiles`, `turnCodeWrittenFiles`, `fileEditCounts`에 편입하지 않습니다.
 - `run_command`뿐 아니라 `mcp_agy-fast_fast_run_checks`(검증 실행)와 `mcp_agy-fast_fast_apply_edits`·`mcp_agy-fast_apply_edits`(파일 수정) 같은 외부 MCP 도구도 원장에서 직접 인식합니다.
@@ -191,10 +191,11 @@ node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 
 `test/verify-live.mjs`는 전역 플러그인 간섭을 차단하기 위해 격리된 임시 `HOME`과 앱 데이터 디렉터리에서 실행되며 종료 시 임시 로그를 자동 정리합니다.
 
-### 실측 기준선 요약 (v0.1.1)
+### 실측 기준선 및 릴리즈 노트 (v0.1.2)
 
-- 단위·통합 테스트: `node --test test/*.test.mjs` — **74 스위트 / 277 테스트 통과 (`fail 0`)** (분석기, 영어 요청 면제, 트랜스크립트 훅, 팩트 원장 및 거부 쓰기 배제·`challenger`/`worker` 추적·5MB 중앙값 `18.18ms` `<= 100ms`, 완료 게이트 `R1`~`R9`·`E1`~`E11`, 자율 프롬프트 라우터·파괴적 편집 서킷브레이커·삽질 감지기, 위험 분류 및 독립 감사, 핸드오프 저장소 및 MCP stdio 왕복, `audit-report.mjs` `[1]`~`[8]` 전수 검증).
+- 단위·통합 테스트: `node --test test/*.test.mjs` — **149 스위트 / 760 테스트 통과 (`fail 0`)** (`v0.1.2` 거버넌스 상태 머신 하드닝, 셸 검증 문법·래퍼·환경 동등성, 추적/미추적 스냅샷 fail-closed 정밀화, 세션 락 회수 하드닝, 분석기, 영어 요청 면제, 트랜스크립트 훅, 팩트 원장, 완료 게이트 `R1`~`R9`·`E1`~`E11`, 자율 프롬프트 라우터·서킷브레이커·삽질 감지기, 위험 분류 및 독립 감사, 핸드오프 저장소 및 MCP stdio 왕복, `audit-report.mjs` `[1]`~`[8]` 전수 검증).
 - 엄격 플러그인 검증: `agy plugin validate --strict --json .` 종료 코드 `0`, `"findings": []`, `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.
-- 격리 거버넌스 실전 검증(`test/verify-live.mjs`, `L1`~`L15`, `gemini-4-neon-xhigh`): 기존 `L1`~`L11`에 더해 명령어 없는 서킷브레이커 보안 삭제 차단(`L12`), Silent-on-Green 무마찰 최적화(`L13`), 자율 프롬프트 설계 반론(`L14`), 삽질 감지 자가치유 위임(`L15`)까지 `hookcaller` 패닉 `0`건·가중 사고 한글비 `100.00%` 확인.
+- 격리 거버넌스 실전 검증(`test/verify-live.mjs`, `L1`–`L16`, `gemini-4-neon-xhigh`, `v0.1.2` `L1`·`L3`·`L5`·`L16` 재실측): `4/4 pass`, `drifted: 0`, `hookcaller` 패닉 `0`건(셸 전용 편집 Stop 게이트 `L16` 포함).
+- **알려진 제약(Known Limitation):** 외부 npm 의존성이 없는 Node.js 18+ 환경에서 OS `flock` 바이너리가 없는 플랫폼(Windows 또는 `flock` 미설치 환경)은 커널 `flock` 대신 inode 검증 `.reclaim` 가드 파일 기반 대체 회수 경로로 폴백합니다.
 
 릴리스 절차는 [배포 가이드](docs/PUBLISHING.md)에서 확인할 수 있으며 라이선스는 [MIT 라이선스](LICENSE)를 따릅니다.

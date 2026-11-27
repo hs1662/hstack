@@ -2,9 +2,9 @@
 
 [한국어](README.ko.md)
 
-`hstack` (v0.1.1) is an Antigravity CLI governance plugin built on Node.js 18+ ESM with zero npm dependencies. It combines a Korean-native thinking, UI, and response guard, a deterministic evidence-grounded completion gate with preflight vote-bypass enforcement, risk-tiered independent code auditing, fact-distilled cross-session handoff, and zero-command autonomous governance (`smart` mode) in one plugin.
+`hstack` (v0.1.2) is an Antigravity CLI governance plugin built on Node.js 18+ ESM with zero npm dependencies. It combines a Korean-native thinking, UI, and response guard, a deterministic evidence-grounded completion gate with preflight vote-bypass enforcement, risk-tiered independent code auditing, fact-distilled cross-session handoff, and zero-command autonomous governance (`smart` mode) in one plugin.
 
-## Bundled components (v0.1.1)
+## Bundled components (v0.1.2)
 
 | Component | Count | Details |
 | --- | :---: | --- |
@@ -27,7 +27,7 @@
 
 ### Layer 2: deterministic evidence-grounded completion gate
 
-- Eager MCP server (`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.1.1"`) exposes `mcp_hstack_gate_verify_completion` (`verify_completion`) without requiring schema discovery turns.
+- Eager MCP server (`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.1.2"`) exposes `mcp_hstack_gate_verify_completion` (`verify_completion`) without requiring schema discovery turns.
 - `PreToolUse` (`scripts/pre-tool-gate.mjs`) intercepts `^mcp_hstack_.*$` calls to return `decision: "auto_approve"`, set a Korean `toolSummary`, and inject hidden `_session` metadata (`conversationId`, `transcriptPath`, `cwd`) stripped before schema validation.
 - `scripts/governance/fact-ledger.mjs` and `scripts/governance/decide-gate.mjs` cross-check claimed `modified_files`, `inspected_files`, `verification_runs`, `unverified_scope`, and `self_assessment` against transcript read/write/execution/preflight/vote history and Git working tree state (`git status --porcelain`, `git diff --numstat`). Denied write calls (`PreToolUse` `deny`) and failed write tool steps (`ERROR`/`FAILED`) are excluded from `turnWrittenFiles`, `turnCodeWrittenFiles`, and `fileEditCounts`.
 - External MCP verification tools such as `mcp_agy-fast_fast_run_checks` (and `mcp_agy-fast_fast_apply_edits` / `mcp_agy-fast_apply_edits` for writes) are recognized directly in the ledger alongside `run_command`.
@@ -191,10 +191,11 @@ node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 
 `test/verify-live.mjs` executes each scenario in an isolated temporary `HOME` and app-data directory so global plugins cannot interfere and cleans up temporary logs on exit.
 
-### Measured baseline (v0.1.1)
+### Measured baseline and release notes (v0.1.2)
 
-- Unit and integration suite: `node --test test/*.test.mjs` — **74 suites / 277 tests pass (`fail 0`)**, covering analyzer, English-request exemptions, transcript hooks, fact ledger (including denied-write exclusion, `challenger`/`worker` tracking, `turnPreflightChallenges`, `turnUserVotes`, and 5MB median scan `<= 100ms`), completion gate (`R1` through `R9`, `E1` through `E11`), autonomous prompt routing, destructive-edit circuit breaker, thrashing detector, risk classification and independent audit, handoff store and MCP stdio roundtrip, and `audit-report.mjs` (`[1]`–`[8]`).
+- Unit and integration suite: `node --test test/*.test.mjs` — **149 suites / 760 tests pass (`fail 0`)**, covering `v0.1.2` governance state-machine hardening, shell verification grammar/wrapper/env parity, tracked vs. untracked snapshot fail-closed accuracy, session lock stale-reclaim hardening, analyzer, English-request exemptions, transcript hooks, fact ledger, completion gate (`R1` through `R9`, `E1` through `E11`), autonomous prompt routing, destructive-edit circuit breaker, thrashing detector, risk classification and independent audit, handoff store and MCP stdio roundtrip, and `audit-report.mjs` (`[1]`–`[8]`).
 - Strict manifest validation: `agy plugin validate --strict --json .` exits `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.
-- Isolated live governance suite (`test/verify-live.mjs`, `L1`–`L15` on `gemini-4-neon-xhigh`): covers `L1`–`L11` core/preflight/audit/handoff scenarios plus zero-command autonomous circuit-breaker security removal (`L12`), Silent-on-Green safe optimization (`L13`), autonomous prompt design challenge (`L14`), and thrashing self-healing delegation (`L15`), all with `hookcaller` panics `0` and weighted Korean thinking `100.00%`.
+- Isolated live governance suite (`test/verify-live.mjs`, `L1`–`L16` on `gemini-4-neon-xhigh`, re-verified `L1`, `L3`, `L5`, `L16` at `v0.1.2`): `4/4 pass`, `drifted: 0`, `hookcaller` panics `0` (covering shell-only edit Stop gate `L16` alongside `L1`–`L15`).
+- **Known limitation:** Under Node.js 18+ with zero external dependencies, hosts without an OS `flock` binary (such as Windows or minimal environments missing `flock`) safely fall back to an inode-verified `.reclaim` guard file rather than kernel `flock` during stale session lock reclamation.
 
 See [Publishing guide](docs/PUBLISHING.md) for releases and [MIT License](LICENSE) for licensing.
