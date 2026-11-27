@@ -1,13 +1,13 @@
 import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
 const localTypes = new Set(["ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "tmpfs", "apfs", "hfs"]);
-const cloud = /^(?:Dropbox|OneDrive|Google Drive|GoogleDrive|iCloud Drive|iCloudDrive|Mobile Documents|CloudStorage|Box Sync|Box Drive|Nextcloud|ownCloud)(?:$|[ (‐-])/i;
+const cloud = /^(?:Dropbox|OneDrive|Google Drive|GoogleDrive|iCloud Drive|iCloudDrive|Mobile Documents|CloudStorage|Box|Nextcloud|ownCloud)(?:$|[ (-])/i;
 const unsupported = (message, cause) => Object.assign(new Error(message, { cause }), { code: "ERR_UNSUPPORTED_FS" });
 
 function checkName(path) {
@@ -32,8 +32,15 @@ async function probeLocalType(path) {
   if (process.platform === "darwin") {
     // Darwin's df filters the statfs result for this specific path (-T),
     // returning nonzero on a mismatch. Do not parse human-readable columns.
-    await exec("/bin/df", ["-T", "apfs,hfs", path], { timeout: 3000 });
-    return "darwin-local";
+    for (const type of ["apfs", "hfs"]) {
+      try {
+        await exec("/bin/df", ["-T", type, path], { timeout: 3000 });
+        return type;
+      } catch (err) {
+        if (err.code !== 1) throw err;
+      }
+    }
+    throw unsupported(`Unsupported filesystem at ${path}`);
   }
   if (process.platform !== "linux") throw unsupported("Unsupported POSIX filesystem probe");
   const mounts = await readFile("/proc/self/mountinfo", "utf8");
@@ -68,7 +75,7 @@ export async function assertLocalFs(path, { probeFs = probeLocalType } = {}) {
     const canonical = resolve(ancestor, ...absolute.slice(existing.length).split("/").filter(Boolean));
     checkName(canonical);
     const type = await probeFs(ancestor);
-    if (!(localTypes.has(type) || (probeFs === probeLocalType && type === "darwin-local"))) {
+    if (!localTypes.has(type)) {
       throw unsupported(`Unsupported filesystem ${String(type)} at ${ancestor}`);
     }
     return canonical;
@@ -129,8 +136,7 @@ export async function initializeRoot(root, repo, options) {
   const state = await assertLocalFs(root, options);
   if (resolve(root) === join(resolve(repo), ".hstack", "graph") ||
       state === join(repository, ".hstack", "graph")) {
-    if (state !== join(repository, ".hstack", "graph") ||
-        basename(dirname(state)) !== ".hstack") throw unsupported("Refusing redirected .hstack/graph");
+    if (state !== join(repository, ".hstack", "graph")) throw unsupported("Refusing redirected .hstack/graph");
     await registerFallback(repository, options);
   }
   await mkdir(state, { recursive: true, mode: 0o700 });

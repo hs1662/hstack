@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import {
-  access, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile,
+  access, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile,
 } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,7 @@ const recovery = { code: "ERR_LOCK_RECOVERY_REQUIRED", status: "held" };
 async function sandbox(t) {
   const dir = await mkdtemp(join(tmpdir(), "graph-lock-"));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  return dir;
+  return realpath(dir);
 }
 
 test("init rejects an unverified repository or state mount before creating state", async (t) => {
@@ -188,3 +188,48 @@ for (const cause of ["SIGKILL", "reused PID"]) {
     assert.equal(await readFile(join(root, "count"), "utf8"), "6");
   });
 }
+
+test("a suspended reaper cannot retire the generation that replaced its observation", { timeout: 15_000 }, async (t) => {
+  const root = await sandbox(t);
+  const { withLock } = await lock();
+  const dir = join(root, "lock");
+  await mkdir(dir);
+  await writeFile(join(dir, "owner.json"), JSON.stringify(fixtureOwner()));
+  // Freeze the child *after* its liveness verdict, at its first recovery write.
+  // Fault injection stays in this process; production has no scheduler hooks.
+  const source = `
+    import fs from "node:fs/promises";
+    import { once } from "node:events";
+    import { syncBuiltinESMExports } from "node:module";
+    let paused = false;
+    for (const name of ["mkdir", "rename"]) {
+      const actual = fs[name];
+      fs[name] = async (...args) => {
+        if (!paused && (args[0] !== process.argv[1] + "/lock" || name === "rename")) {
+          paused = true;
+          const resume = once(process, "message"); process.send("paused"); await resume;
+        }
+        return actual(...args);
+      };
+    }
+    syncBuiltinESMExports();
+    const { withLock } = await import(${JSON.stringify(lockModule)});
+    try { await withLock(process.argv[1], () => { throw new Error("entered"); }); }
+    catch (e) { process.send(e.code ?? e.message); }
+    process.disconnect();
+  `;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", source, root],
+    { stdio: ["ignore", "ignore", "inherit", "ipc"], timeout: 12_000, killSignal: "SIGKILL" });
+  t.after(() => { if (child.exitCode === null && !child.signalCode) child.kill("SIGKILL"); });
+  assert.equal((await once(child, "message"))[0], "paused");
+  // Let a different process finish recovery, then install an unverifiable successor.
+  await withLock(root, () => {});
+  await mkdir(dir);
+  const bytes = JSON.stringify({ ...fixtureOwner(), host: "foreign", lockToken: "replacement" });
+  await writeFile(join(dir, "owner.json"), bytes);
+  const result = once(child, "message");
+  child.send("continue");
+  assert.equal((await result)[0], recovery.code);
+  assert.equal(await readFile(join(dir, "owner.json"), "utf8"), bytes);
+  assert.equal((await readdir(join(root, "graveyard"))).length, 1);
+});
