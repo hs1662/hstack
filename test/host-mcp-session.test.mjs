@@ -88,3 +88,9 @@ test("session: altered, wrong-tool and expired contexts refuse; abandoned privat
   assert.equal(readdirSync(store).length, 1);
   assert.equal(JSON.stringify([...rejected, stale]).includes(abandoned), false);
 });
+
+test("packaged Claude mcp.json does not clobber host-injected CLAUDE_PLUGIN_DATA with a literal placeholder", () => {
+  const mcpConfig = JSON.parse(readFileSync(join(PLUGIN_ROOT, ".claude-plugin", "mcp.json"), "utf8"));
+  const env = mcpConfig?.mcpServers?.gate?.env ?? {};
+  assert.equal(Object.hasOwn(env, "CLAUDE_PLUGIN_DATA"), false);
+});

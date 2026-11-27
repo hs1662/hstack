@@ -144,3 +144,19 @@ test("Claude uses its actual transcript.jsonl even when an Agy sibling exists", 
   const bash = echo("PreToolUse", { transcript_path: actual, tool_name: "Bash", tool_input: { command: "pwd" } });
   assert.equal(bash.hookSpecificOutput.permissionDecision, "deny");
 });
+
+test("registered Claude PreToolUse enforces 2-strike retry cap for drifted UI tools across turns", () => {
+  const uiPath = join(dir, "ui-retry.jsonl");
+  const uiCall = { question: "Should we continue?", options: ["Yes", "No"] };
+  writeFileSync(uiPath, [
+    { type: "user", message: { role: "user", content: "질문에 답해 줘" } },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "u1", name: "AskUserQuestion", input: { questions: [uiCall] } }] } },
+    { type: "user", toolDenialKind: "hook", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "u1", is_error: true, content: "denied" }] } },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "u2", name: "AskUserQuestion", input: { questions: [uiCall] } }] } },
+    { type: "user", toolDenialKind: "hook", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "u2", is_error: true, content: "denied" }] } },
+  ].map(v => JSON.stringify(v)).join("\n") + "\n");
+  const blockedFirst = echo("PreToolUse", { transcript_path: uiPath, tool_name: "TodoWrite", tool_input: { todos: [{ content: "English item", status: "pending" }] } });
+  assert.equal(blockedFirst.hookSpecificOutput?.permissionDecision, "deny");
+  const capped = echo("PreToolUse", { transcript_path: uiPath, tool_name: "AskUserQuestion", tool_input: { questions: [uiCall] } });
+  assert.equal(capped.hookSpecificOutput?.permissionDecision, undefined);
+});

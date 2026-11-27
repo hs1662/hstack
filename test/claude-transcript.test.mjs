@@ -206,3 +206,53 @@ test("MCP rejects a claimed test run when the Claude transcript only records its
   assert.equal(reply.result.isError, false);
   assert.equal(reply.result.content[0].text.startsWith(VERDICT_HEADERS.REJECT_NEUTRAL), true, reply.result.content[0].text);
 });
+
+test("Claude UI tools and AskUserQuestion votes are preserved for pre-tool retry cap and vote tracking", (t) => {
+  const { path, cwd } = transcript(t, [
+    user(korean),
+    assistant(call("toolu-todo", "TodoWrite", { todos: [{ content: "Check files", status: "in_progress" }] })),
+    user([result("toolu-todo", "tool call denied by pre-tool hook", true)], { toolDenialKind: "hook" }),
+    assistant(call("toolu-todo2", "TodoWrite", { todos: [{ content: "Check again", status: "in_progress" }] })),
+    user([result("toolu-todo2", "tool call denied by pre-tool hook", true)], { toolDenialKind: "hook" }),
+    assistant(call("toolu-ask", "AskUserQuestion", { questions: [{ question: "진행할까요?", options: [{ label: "Continue", description: "Proceed with edit" }] }] })),
+    user([result("toolu-ask", 'User has answered your questions: "진행할까요?"="예"')], { toolUseResult: { answers: { "진행할까요?": "예" } } }),
+    assistant(call("toolu-ask-raw", "AskUserQuestion", { questions: [{ question: "다시 확인할까요?", options: ["예", "아니오"] }] })),
+    user([result("toolu-ask-raw", 'User has answered your questions: "다시 확인할까요?"="계속"')]),
+    assistant(call("toolu-ask-empty", "AskUserQuestion", { questions: [{ question: "취소할까요?", options: ["예", "아니오"] }] })),
+    user([result("toolu-ask-empty", "User rejected the question")]),
+    assistant(call("toolu-task-create", "TaskCreate", { subject: "수정 반영" })),
+    assistant(call("toolu-task-update", "TaskUpdate", { title: "검증 완료" })),
+  ]);
+
+  const { ledger, steps } = readFactLedgerAndSteps(path, cwd);
+  const calls = steps.filter((s) => s.type === "PLANNER_RESPONSE").flatMap((s) => s.toolCalls);
+  assert.deepEqual(calls.map((c) => c.name), [
+    "todo_write",
+    "todo_write",
+    "ask_question",
+    "ask_question",
+    "ask_question",
+    "task_create",
+    "task_update",
+  ]);
+  assert.equal(calls[0].args.todos[0].content, "Check files");
+  assert.equal(calls[2].args.questions[0].question, "진행할까요?");
+  assert.deepEqual(calls[2].args.questions[0].options, ["Continue", "Proceed with edit"]);
+  assert.deepEqual(ledger.turnUserVotes.map((v) => v.answered), [true, true, false]);
+  assert.equal(ledger.turnUserVotes[2].errored, true);
+});
+
+test("Claude PowerShell execution is recorded as non-verification shell activity so Stop triggers shell-write gate", (t) => {
+  const { cwd, path } = transcript(t, [
+    user(korean),
+    assistant(call("toolu-ps", "PowerShell", { command: "node --test" })),
+    user([result("toolu-ps", bashOk)]),
+    assistant(call("toolu-ps2", "PowerShell", { command: "Set-Content src/app.mjs 'x'" })),
+    user([result("toolu-ps2", "ok")]),
+    assistant(text("작업을 완료했습니다.")),
+  ]);
+
+  const ledger = readTurnLedger(path, cwd);
+  assert.equal(ledger.turnExecutions.length, 2);
+  assert.deepEqual(ledger.turnExecutions.map((e) => [e.kind, e.passed]), [["other", true], ["other", true]]);
+});
