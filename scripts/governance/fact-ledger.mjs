@@ -667,48 +667,96 @@ const INLINE_CODE_FLAG_RE = {
   tsx: /^(?:-[A-Za-z]*[ep]|--eval|--print)/,
 };
 
+const SHELL_SAFE_SHORT_FLAGS = new Set(["a", "c", "e", "o", "u", "v", "x"]);
+const SHELL_SAFE_LONG_NAMED_OPTIONS = new Set(["allexport", "errexit", "nounset", "pipefail", "verbose", "xtrace"]);
+
 // The inline body of an interpreter given code on its command line, or null for a script or a plain run.
 // A shell `-c` body is shell, so it is returned for classification; any other language returns "" (never verification).
 function inlineInterpreterBody(bin, args) {
   if (SHELL_INTERPRETERS.has(bin)) {
     let inline = false;
     let pipefail = false;
+    let allexport = false;
     let noexec = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][euxvn]*o$/.test(arg)) {
-        if (arg.includes("n")) {
-          noexec = arg[0] === "-";
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aeuxv]*o$/.test(arg)) {
+        if (arg === "-O" || arg === "+O") {
+          return "";
         }
-        if (args[i + 1] === "pipefail") {
-          pipefail = arg[0] === "-";
-        } else if (args[i + 1] === "noexec") {
-          noexec = arg[0] === "-";
+        const enable = arg[0] === "-";
+        for (let k = 1; k < arg.length - 1; k += 1) {
+          if (arg[k] === "n") noexec = enable;
+          else if (arg[k] === "a") allexport = enable;
+        }
+        const optName = args[i + 1];
+        if (optName === "pipefail") {
+          pipefail = enable;
+        } else if (optName === "allexport") {
+          allexport = enable;
+        } else if (optName === "noexec") {
+          noexec = enable;
+        } else if (!SHELL_SAFE_LONG_NAMED_OPTIONS.has(optName)) {
+          return "";
         }
         i += 1;
       } else if (/^[-+][A-Za-z]+$/.test(arg)) {
-        if (arg.includes("n")) {
-          noexec = arg[0] === "-";
-        }
-        inline ||= arg[0] === "-" && arg.includes("c");
-      } else if (/^-[A-Za-z]*c/.test(arg)) {
-        const prefixFlags = arg.slice(1, arg.indexOf("c"));
-        if (prefixFlags.includes("n")) {
-          noexec = true;
+        const enable = arg[0] === "-";
+        let cIdx = -1;
+        for (let k = 1; k < arg.length; k += 1) {
+          const ch = arg[k];
+          if (ch === "n") {
+            noexec = enable;
+            continue;
+          }
+          if (ch === "c" && enable) {
+            inline = true;
+            cIdx = k;
+            break;
+          }
+          if (!SHELL_SAFE_SHORT_FLAGS.has(ch)) {
+            return "";
+          }
+          if (ch === "a") {
+            allexport = enable;
+          }
         }
         if (noexec) {
           return "";
         }
-        // Words after the body become $0, $1…, which the body may run; only a body with nothing after it counts.
-        const body = i === args.length - 1 ? arg.slice(arg.indexOf("c") + 1) : "";
-        return pipefail && body ? `set -o pipefail && ${body}` : body;
-      } else if (!arg.startsWith("--") || arg === "--") {
+        if (cIdx !== -1 && cIdx < arg.length - 1) {
+          const body = i === args.length - 1 ? arg.slice(cIdx + 1) : "";
+          if (!body) return "";
+          const prefixes = [];
+          if (pipefail) prefixes.push("set -o pipefail");
+          if (allexport) prefixes.push("set -o allexport");
+          return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
+        }
+      } else if (arg.startsWith("-")) {
+        if (arg === "--") {
+          if (noexec) {
+            return "";
+          }
+          const body = i + 1 === args.length - 1 ? args[i + 1] : "";
+          if (!inline) return null;
+          if (!body) return "";
+          const prefixes = [];
+          if (pipefail) prefixes.push("set -o pipefail");
+          if (allexport) prefixes.push("set -o allexport");
+          return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
+        }
+        return "";
+      } else {
         if (noexec) {
           return "";
         }
-        const bodyIdx = arg === "--" ? i + 1 : i;
-        const body = bodyIdx === args.length - 1 ? args[bodyIdx] : "";
-        return inline ? (pipefail && body ? `set -o pipefail && ${body}` : body) : null;
+        const body = i === args.length - 1 ? arg : "";
+        if (!inline) return null;
+        if (!body) return "";
+        const prefixes = [];
+        if (pipefail) prefixes.push("set -o pipefail");
+        if (allexport) prefixes.push("set -o allexport");
+        return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
       }
     }
     if (noexec) {
@@ -1069,8 +1117,8 @@ function classifySingleSegment(segment) {
 // input redirects, escapes. `$`, backticks and backslashes inside double quotes still expand, so they fail too.
 const GRAMMAR_METACHARS = new Set(["(", ")", "{", "}", "!", "$", "`", "|", "&", "<", ">", "\\", ";"]);
 const PIPE_FILTERS = new Set(["tail", "head", "grep"]);
-const SET_FLAG_RE = /^[-+](?:[euxv]*o|[euxv]+)$/;
-const SET_OPTIONS = new Set(["pipefail", "errexit", "nounset", "xtrace"]);
+const SET_FLAG_RE = /^[-+](?:[aeuxv]*o|[aeuxv]+)$/;
+const SET_OPTIONS = new Set(["pipefail", "errexit", "nounset", "xtrace", "allexport"]);
 
 // Lexes `cmd [&& cmd]… [| cmd]` into { words, redirects, raw, op } commands, or null on any other syntax. A
 // redirect is kept only as `2>&1`/`1>&2` or `[12]>[>] /dev/null|x.log|x.out|x.txt`; a trailing `;` or newline ends the line.
@@ -1221,6 +1269,18 @@ export function extractPytestCommandInfo(segment) {
     return null;
   }
   const baseBin = posix.basename(toPosix(tokens[idx]));
+function computeOuterShellContextKey(tokens, idx, baseBin) {
+  const outerHead = [];
+  for (let i = 0; i < idx; i += 1) {
+    const t = tokens[i];
+    if (typeof t === "string" && t.startsWith("PYTEST_ADDOPTS=")) {
+      continue;
+    }
+    outerHead.push(t);
+  }
+  return JSON.stringify({ outerHead, baseBin });
+}
+
   if (SHELL_INTERPRETERS.has(baseBin)) {
     const body = inlineInterpreterBody(baseBin, tokens.slice(idx + 1));
     if (body === "") {
@@ -1231,6 +1291,7 @@ export function extractPytestCommandInfo(segment) {
         isPytest: false,
         shellBody: body,
         bin: baseBin,
+        outerContextKey: computeOuterShellContextKey(tokens, idx, baseBin),
         envPytestAddopts: prefix.envPytestAddopts,
         envPytestCleared: prefix.envPytestCleared,
         chdirs: prefix.chdirs,
@@ -1327,8 +1388,20 @@ function shellScriptArg(args) {
   return "";
 }
 
+const ENV_VAR_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 function isSafeAssign(tok) {
   return ENV_ASSIGN_RE.test(tok) && !isExecHijackAssign(tok);
+}
+
+function isSafeExportArg(tok) {
+  if (ENV_ASSIGN_RE.test(tok)) {
+    return !isExecHijackAssign(tok);
+  }
+  if (ENV_VAR_NAME_RE.test(tok)) {
+    return !isExecHijackAssign(`${tok}=x`);
+  }
+  return false;
 }
 
 function isValidSetCommandArgs(args) {
@@ -1379,7 +1452,7 @@ function extractSetCommandArgs(words) {
 // cd/pushd/popd, `set` with errexit/nounset/xtrace/pipefail only, safe assignments or exports, or a read-only command.
 function isPrefixCommand({ words, raw }) {
   const [bin, ...args] = words;
-  if (words.every(isSafeAssign) || (bin === "export" && args.length > 0 && args.every(isSafeAssign))) {
+  if (words.every(isSafeAssign) || (bin === "export" && args.length > 0 && args.every(isSafeExportArg))) {
     return true;
   }
   if (bin === "cd" || bin === "pushd" || bin === "popd") {
@@ -1714,7 +1787,7 @@ function isChainPrepCommand({ words, redirects }) {
   return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
 }
 
-export function extractChainPrepSignature(segment) {
+export function extractChainPrepInfo(segment) {
   if (typeof segment !== "string" || segment.trim().length === 0) {
     return null;
   }
@@ -1731,12 +1804,20 @@ export function extractChainPrepSignature(segment) {
   if (idx === -1 || idx >= parsed.words.length) {
     return null;
   }
-  const dirParts = prefix.chdirs.map((dir) => posix.normalize(toPosix(dir)));
-  if (prefix.chdirOpaque) {
-    dirParts.push("$opaque");
-  }
+  const dirs = prefix.chdirs.map((dir) => posix.normalize(toPosix(dir)));
+  const argv = ["npm", ...parsed.words.slice(idx + 1)];
+  const dirParts = prefix.chdirOpaque ? [...dirs, "$opaque"] : dirs;
   const prefixTag = dirParts.length > 0 ? `@wrapperDir(${dirParts.join("->")}) ` : "";
-  return `${prefixTag}${["npm", ...parsed.words.slice(idx + 1)].join(" ")}`;
+  return {
+    sig: `${prefixTag}${argv.join(" ")}`,
+    dirs,
+    argv,
+    opaque: Boolean(prefix.chdirOpaque),
+  };
+}
+
+export function extractChainPrepSignature(segment) {
+  return extractChainPrepInfo(segment)?.sig ?? null;
 }
 
 export function commandMatchesExpectedTokens(commandLine, expectedTokens) {
@@ -3518,30 +3599,46 @@ function isMissingFsError(err) {
   return err?.code === "ENOENT" || err?.code === "ENOTDIR";
 }
 
-export function statSnapshotFile(gitRoot, relPath) {
+export function statSnapshotFile(gitRoot, relPath, { fsOps = null } = {}) {
+  const _lstatSync = fsOps?.lstatSync ?? lstatSync;
+  const _readlinkSync = fsOps?.readlinkSync ?? readlinkSync;
+  const _openSync = fsOps?.openSync ?? openSync;
+  const _fstatSync = fsOps?.fstatSync ?? fstatSync;
+  const _readSync = fsOps?.readSync ?? readSync;
+  const _closeSync = fsOps?.closeSync ?? closeSync;
+  const fullPath = join(gitRoot, relPath);
+  let st;
+  try {
+    st = _lstatSync(fullPath);
+  } catch (err) {
+    return isMissingFsError(err) ? null : SNAPSHOT_UNREADABLE_SIGNATURE;
+  }
   let fd = -1;
   try {
-    const fullPath = join(gitRoot, relPath);
-    const st = lstatSync(fullPath);
     const modeSig = (st.mode & 0o170000) | (st.mode & 0o111);
     if (st.isSymbolicLink()) {
-      return [st.mtimeMs, st.size, modeSig, readlinkSync(fullPath)];
+      return [st.mtimeMs, st.size, modeSig, _readlinkSync(fullPath)];
     }
     if (!st.isFile()) {
       return SNAPSHOT_UNREADABLE_SIGNATURE;
     }
     if (st.size <= MAX_SNAPSHOT_HASH_BYTES) {
       const flags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
-      fd = openSync(fullPath, flags);
-      const fstBefore = fstatSync(fd);
-      if (!fstBefore.isFile() || fstBefore.size > MAX_SNAPSHOT_HASH_BYTES) {
+      fd = _openSync(fullPath, flags);
+      const fstBefore = _fstatSync(fd);
+      if (
+        !fstBefore.isFile() ||
+        fstBefore.size > MAX_SNAPSHOT_HASH_BYTES ||
+        (Number.isFinite(st.dev) && Number.isFinite(fstBefore.dev) && fstBefore.dev !== st.dev) ||
+        (Number.isFinite(st.ino) && Number.isFinite(fstBefore.ino) && fstBefore.ino !== st.ino)
+      ) {
         return SNAPSHOT_UNREADABLE_SIGNATURE;
       }
       const chunk = Buffer.allocUnsafe(SNAPSHOT_READ_CHUNK_BYTES);
       const hasher = createHash("sha1");
       let total = 0;
       while (total <= MAX_SNAPSHOT_HASH_BYTES) {
-        const n = readSync(fd, chunk, 0, Math.min(SNAPSHOT_READ_CHUNK_BYTES, MAX_SNAPSHOT_HASH_BYTES + 1 - total), null);
+        const n = _readSync(fd, chunk, 0, Math.min(SNAPSHOT_READ_CHUNK_BYTES, MAX_SNAPSHOT_HASH_BYTES + 1 - total), null);
         if (n <= 0) {
           break;
         }
@@ -3551,14 +3648,16 @@ export function statSnapshotFile(gitRoot, relPath) {
         }
         hasher.update(chunk.subarray(0, n));
       }
-      const fstAfter = fstatSync(fd);
+      const fstAfter = _fstatSync(fd);
       if (
         !fstAfter.isFile() ||
         total !== fstBefore.size ||
         total !== fstAfter.size ||
         fstBefore.size !== fstAfter.size ||
         fstBefore.mtimeMs !== fstAfter.mtimeMs ||
-        fstBefore.ctimeMs !== fstAfter.ctimeMs
+        fstBefore.ctimeMs !== fstAfter.ctimeMs ||
+        (Number.isFinite(fstBefore.dev) && Number.isFinite(fstAfter.dev) && fstAfter.dev !== fstBefore.dev) ||
+        (Number.isFinite(fstBefore.ino) && Number.isFinite(fstAfter.ino) && fstAfter.ino !== fstBefore.ino)
       ) {
         return SNAPSHOT_UNREADABLE_SIGNATURE;
       }
@@ -3566,12 +3665,12 @@ export function statSnapshotFile(gitRoot, relPath) {
       return [fstAfter.mtimeMs, fstAfter.size, (fstAfter.mode & 0o170000) | (fstAfter.mode & 0o111), digest];
     }
     return [st.mtimeMs, st.size, modeSig];
-  } catch (err) {
-    return isMissingFsError(err) ? null : SNAPSHOT_UNREADABLE_SIGNATURE;
+  } catch {
+    return SNAPSHOT_UNREADABLE_SIGNATURE;
   } finally {
     if (fd !== -1) {
       try {
-        closeSync(fd);
+        _closeSync(fd);
       } catch {
       }
     }

@@ -1,7 +1,7 @@
 // Shared fixtures for the domain test files (node --test runs each file in its own process).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { after, afterEach, beforeEach } from "node:test";
@@ -66,26 +66,63 @@ function readOwnerFile(lockDir) {
 
 export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS } = {}) {
   const sharedDir = `${lockDir}.shared`;
+  const reclaimDir = `${lockDir}.reclaim`;
   const sharedEntry = join(sharedDir, String(process.pid));
+
+  const safeMtimeMs = (p) => {
+    try {
+      return statSync(p).mtimeMs;
+    } catch {
+      return 0;
+    }
+  };
 
   const isLiveHolder = () => {
     const raw = readOwnerFile(lockDir);
     if (raw === null) {
-      try {
-        return Date.now() - statSync(lockDir).mtimeMs < 1_000;
-      } catch {
-        return false;
-      }
+      return safeMtimeMs(lockDir) > 0 && Date.now() - safeMtimeMs(lockDir) < 1_000;
     }
     const pid = Number.parseInt(raw.split(":")[0], 10);
     if (!(pid > 0)) {
-      try {
-        return Date.now() - statSync(lockDir).mtimeMs < Math.min(1_000, staleMs);
-      } catch {
-        return false;
-      }
+      return safeMtimeMs(lockDir) > 0 && Date.now() - safeMtimeMs(lockDir) < Math.min(1_000, staleMs);
     }
     return isLivePid(pid);
+  };
+
+  const reclaimStaleLock = () => {
+    try {
+      mkdirSync(reclaimDir);
+    } catch (err) {
+      if (err.code === "EEXIST") {
+        const rOwner = readOwnerFile(reclaimDir);
+        const rPid = rOwner ? Number.parseInt(rOwner.split(":")[0], 10) : Number.NaN;
+        const rLive = rPid > 0 ? isLivePid(rPid) : Date.now() - safeMtimeMs(reclaimDir) < 1_000;
+        if (!rLive) {
+          try {
+            const trash = `${reclaimDir}.trash-${process.pid}-${Date.now()}-${++lockOwnerSeq}`;
+            renameSync(reclaimDir, trash);
+            rmSync(trash, { recursive: true, force: true });
+          } catch {
+          }
+        }
+        return false;
+      }
+      return false;
+    }
+    try {
+      writeFileSync(join(reclaimDir, "pid"), `${process.pid}:${++lockOwnerSeq}`);
+      if (!isLiveHolder()) {
+        const trash = `${lockDir}.dead-${process.pid}-${Date.now()}-${++lockOwnerSeq}`;
+        renameSync(lockDir, trash);
+        rmSync(trash, { recursive: true, force: true });
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    } finally {
+      rmSync(reclaimDir, { recursive: true, force: true });
+    }
   };
 
   const tryTake = () => {
@@ -100,14 +137,7 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
         throw err;
       }
     }
-    try {
-      const deadOwner = readOwnerFile(lockDir);
-      if (!isLiveHolder() && readOwnerFile(lockDir) === deadOwner) {
-        rmSync(lockDir, { recursive: true, force: true });
-      }
-    } catch {
-      // The holder released it between our checks.
-    }
+    reclaimStaleLock();
     return false;
   };
 
@@ -164,7 +194,22 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
 
   const releaseExclusive = (ownerToken) => {
     if (readOwnerFile(lockDir) === ownerToken) {
-      rmSync(lockDir, { recursive: true, force: true });
+      try {
+        const trash = `${lockDir}.rel-${process.pid}-${Date.now()}-${++lockOwnerSeq}`;
+        renameSync(lockDir, trash);
+        rmSync(trash, { recursive: true, force: true });
+      } catch {
+      }
+    }
+  };
+
+  const holdReclaimLockForTest = (fn) => {
+    mkdirSync(reclaimDir);
+    writeFileSync(join(reclaimDir, "pid"), `${process.pid}:${++lockOwnerSeq}`);
+    try {
+      return fn();
+    } finally {
+      rmSync(reclaimDir, { recursive: true, force: true });
     }
   };
 
@@ -172,6 +217,8 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
     sharedDir,
     isLiveHolder,
     tryTake,
+    reclaimStaleLock,
+    holdReclaimLockForTest,
     takeShared,
     releaseShared,
     otherSharedHolders,

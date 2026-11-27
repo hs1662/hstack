@@ -7311,7 +7311,7 @@ describe("H24 OMH round-20 regressions (F1-F9)", () => {
     }
   });
 
-  it("R20-F5: never treats two opaque wrapper prep directories (env -C $A vs env -C $B) as equivalent", () => {
+  it("R20-F5: never treats two opaque wrapper prep directories (env -C ~ vs env -C -) as equivalent", () => {
     const repo = makeRepo();
     const txPath = join(createTempDir("hstack-p10-r20-f5-"), "t.jsonl");
     writeFileSync(
@@ -7320,15 +7320,15 @@ describe("H24 OMH round-20 regressions (F1-F9)", () => {
         { step_index: 0, type: "USER_INPUT", content: "불투명 준비 서명 비동등 테스트" },
         { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
         { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
-        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "env -C $A npm ci && pytest", Cwd: repo } }] },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "env -C ~ npm ci && pytest", Cwd: repo } }] },
         { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: "1 failed" },
-        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "env -C $B npm ci && pytest", Cwd: repo } }] },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "env -C - npm ci && pytest", Cwd: repo } }] },
         { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
       ]),
     );
     const gl = readGitLedger(repo);
     const dec = decideGate(
-      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: "env -C $B npm ci && pytest", outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
+      { modified_files: ["app.mjs"], inspected_files: [], verification_runs: [{ command: "env -C - npm ci && pytest", outcome: "pass" }], unverified_scope: [], self_assessment: "ok." },
       { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
     );
     assert.equal(dec.verdict, "REJECT");
