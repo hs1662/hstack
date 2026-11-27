@@ -22,6 +22,22 @@ const node = (id, fields = {}) => ({
 const graph = (nodes, limits) => ({ schemaVersion: 1, nodes, ...(limits && { limits }) });
 const write = (id, writeScope, dependsOn = []) => node(id, { kind: 'write', writeScope, dependsOn });
 
+test('flaky diagnostics keep their own bounded budget through admission and readmission', async () => {
+  const { compileGraph } = await admission();
+  const nodes = [node('verify', {kind:'verify', flaky:true})];
+  const first = compileGraph(graph(nodes));
+  assert.equal(first.limits.maxFlakyDiagnostics, 1);
+  for (const maxFlakyDiagnostics of [0,1,2]) {
+    const plan = compileGraph(graph(first.nodes, {...first.limits,maxFlakyDiagnostics}));
+    assert.equal(plan.nodes[0].flaky,true);
+    assert.equal(plan.limits.maxFlakyDiagnostics,maxFlakyDiagnostics);
+  }
+  for (const maxFlakyDiagnostics of [-1, 3, 1.5]) {
+    assert.throws(() => compileGraph(graph(nodes,{maxFlakyDiagnostics})), {code:'ERR_GRAPH_LIMIT'});
+  }
+  assert.throws(() => compileGraph(graph([node('bad',{flaky:'yes'})])), {code:'ERR_GRAPH_SCHEMA'});
+});
+
 test('three independent 5-minute reads recommend parallel work, unlike a chain', async () => {
   const { compileGraph } = await admission();
   const parallel = compileGraph(graph([node('c'), node('a'), node('b')]));

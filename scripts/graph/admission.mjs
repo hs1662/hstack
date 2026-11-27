@@ -4,7 +4,7 @@ import { graphError, immutable, isRecord, nonempty, normalizeGateCommand,
 const defaults = Object.freeze({
   maxNodes: 256, maxWidth: 64, maxDepth: 64, readConcurrency: 6,
   minParallelFraction: 0.65, maxEdgeDensity: 1.2, minEstimatedMinutes: 15, minIndependent: 3,
-  maxInfraRetries: 3,
+  maxInfraRetries: 3, maxFlakyDiagnostics: 1,
 });
 const optionalLimits = ['maxPins', 'maxAttempts'];
 const limitError = message => graphError('ERR_GRAPH_LIMIT', message);
@@ -21,12 +21,13 @@ function normalizeLimits(input = {}) {
   for (const key of ['maxNodes', 'maxWidth', 'maxDepth', 'readConcurrency', 'minEstimatedMinutes', 'minIndependent']) {
     if (!Number.isSafeInteger(limits[key]) || limits[key] < 1) throw limitError(`${key} must be a positive safe integer`);
   }
-  for (const key of ['maxInfraRetries', ...optionalLimits]) {
+  for (const key of ['maxInfraRetries', 'maxFlakyDiagnostics', ...optionalLimits]) {
     if (Object.hasOwn(limits, key) && (!Number.isSafeInteger(limits[key]) || limits[key] < 0)) {
       throw limitError(`${key} must be a nonnegative safe integer`);
     }
   }
   if (limits.readConcurrency > 16) throw limitError('readConcurrency must not exceed 16');
+  if (limits.maxFlakyDiagnostics > 2) throw limitError('maxFlakyDiagnostics must not exceed 2');
   if (limits.maxNodes > 1024) throw limitError('maxNodes must not exceed 1024');
   for (const key of ['minParallelFraction', 'maxEdgeDensity']) {
     if (!Number.isFinite(limits[key]) || limits[key] < 0) throw limitError(`${key} must be finite and nonnegative`);
@@ -67,8 +68,10 @@ function normalizeNode(input) {
   }
   const required = Object.hasOwn(input, 'required') ? input.required : true;
   if (typeof required !== 'boolean') throw schemaError(`${id}.required must be a boolean`);
+  if (Object.hasOwn(input, 'flaky') && typeof input.flaky !== 'boolean') throw schemaError(`${id}.flaky must be a boolean`);
   return {
     id, kind, required, dependsOn, writeScope, readScope: pathSet(input.readScope ?? [], `${id}.readScope`),
+    ...(input.flaky === true && {flaky: true}),
     estimatedMinutes: safeInteger(input.estimatedMinutes ?? 1, `${id}.estimatedMinutes`, 1),
     priority: safeInteger(input.priority ?? 0, `${id}.priority`, Number.MIN_SAFE_INTEGER),
     prompt: nonempty(input.prompt ?? '', `${id}.prompt`),
@@ -214,6 +217,7 @@ function coalesce(ordered, ancestry) {
       ...node, dependsOn, coalescedFrom: group.map(member => member.id),
       ...gateCommands.values().next().value,
       required: group.some(member => member.required),
+      ...(group.some(member => member.flaky) && {flaky:true}),
       ...(Object.keys(volatility).length > 0 && { volatility }),
       readScope: uniqueSorted(group.flatMap(member => member.readScope)),
       writeScope: uniqueSorted(group.flatMap(member => member.writeScope)),
