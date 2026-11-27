@@ -5126,3 +5126,456 @@ describe("H18 OMH gpt-6.2-astra round-14 regressions (P1 F1-F5, P2 F6-F7)", () =
     assert.equal(gl.gitRoot, fastRoot);
   });
 });
+
+describe("H19 OMH gpt-6.2-astra round-15 regressions (P1 F1-F9, P2 F10-F12)", () => {
+  it("R15-F1: separates literal backslash exec directory from nested slash directory on POSIX", () => {
+    const parent = createTempDir("p10-r15-f1-");
+    const repo = makeRepo();
+    const bsDir = join(repo, "dir\\sub");
+    const slashDir = join(repo, "dir", "sub");
+    mkdirSync(bsDir, { recursive: true });
+    mkdirSync(slashDir, { recursive: true });
+    const txPath = join(parent, "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 수정" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: bsDir } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", error: "fail", content: FAIL_OUTPUT },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: slashDir } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "확인 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R15-F2: searches past .git boundary to locate ancestor pytest config outside nested child repo", () => {
+    const outer = createTempDir("p10-r15-f2-");
+    writeFileSync(join(outer, "pytest.ini"), "[pytest]\naddopts = --collect-only\npython_files = check_*.py\n");
+    const childRepo = join(outer, "child");
+    mkdirSync(childRepo, { recursive: true });
+    writeFileSync(join(childRepo, "app.mjs"), "export const v = 1;\n");
+    git(childRepo, ["init", "-q"]);
+    git(childRepo, ["config", "user.email", "t@example.com"]);
+    git(childRepo, ["config", "user.name", "T"]);
+    git(childRepo, ["add", "."]);
+    git(childRepo, ["commit", "-qm", "init"]);
+
+    const txPath = join(createTempDir("p10-r15-f2-tx-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(childRepo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: childRepo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+      ]),
+    );
+    const gl = readGitLedger(childRepo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: childRepo, ledger: readFactLedger(txPath, childRepo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R15-F3: keeps dry-run addopts active when CLI passes --rootdir or unrelated -o flags while honoring -o addopts=", () => {
+    const check = (cmd) => {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+      const txPath = join(createTempDir("hstack-p10-r15-f3-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+    };
+
+    for (const dryCmd of ["pytest --rootdir=.", "pytest -o log_cli=true"]) {
+      const dec = check(dryCmd);
+      assert.equal(dec.verdict, "REJECT", dryCmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${dryCmd}: ${dec.blockedRules.join(",")}`);
+    }
+    const decOverride = check('pytest -o addopts=""');
+    assert.equal(decOverride.verdict, "PASS", decOverride.blockedRules.join(","));
+  });
+
+  it("R15-F4: applies pytest dry-run config check to path-qualified virtualenv pytest runners", () => {
+    for (const cmd of ["./.venv/bin/pytest", ".venv/bin/python3 -m pytest"]) {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+      const txPath = join(createTempDir("hstack-p10-r15-f4-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: cmd, Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "2 tests collected" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: cmd, outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", cmd);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${cmd}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R15-F5: fails closed on R2 when pytest pyproject.toml configuration is unparseable or uncertain", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pyproject.toml"), 'tool.pytest.ini_options.addopts = """\n--collect-only\n"""\n');
+    const txPath = join(createTempDir("hstack-p10-r15-f5-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), dec.blockedRules.join(","));
+  });
+
+  it("R15-F6: keeps collection failures from dry-run pytest configs in R3 even when another verification passes", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pytest.ini"), "[pytest]\naddopts = --collect-only\n");
+    const txPath = join(createTempDir("hstack-p10-r15-f6-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "ImportError during collection" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: PASS_OUTPUT },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "node --test 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R15-F7: detects intermediate ancestor test infrastructure between cwd and gitRoot in monorepos", () => {
+    const repo = createTempDir("hstack-p10-r15-f7-");
+    git(repo, ["init", "-q"]);
+    git(repo, ["config", "user.email", "t@example.com"]);
+    git(repo, ["config", "user.name", "T"]);
+    const pkgDir = join(repo, "packages", "pkgA");
+    const srcDir = join(pkgDir, "src");
+    mkdirSync(srcDir, { recursive: true });
+    writeFileSync(join(pkgDir, ".pytest.ini"), "[pytest]\ntestpaths = unit\n");
+    writeFileSync(join(srcDir, "mod.py"), "x = 1\n");
+    git(repo, ["add", "."]);
+    git(repo, ["commit", "-qm", "init"]);
+
+    const infra = detectTestInfrastructure(srcDir, repo);
+    assert.equal(infra.hasTestSuite, true, JSON.stringify(infra));
+  });
+
+  it("R15-F8: recognizes pytest.toml and .pytest.toml as top-priority pytest configs in R2 and detectTestInfrastructure", () => {
+    for (const tomlName of ["pytest.toml", ".pytest.toml"]) {
+      const repo = createTempDir(`hstack-p10-r15-f8-${tomlName}-`);
+      git(repo, ["init", "-q"]);
+      git(repo, ["config", "user.email", "t@example.com"]);
+      git(repo, ["config", "user.name", "T"]);
+      writeFileSync(join(repo, tomlName), '[pytest]\naddopts = "--collect-only"\n');
+      writeFileSync(join(repo, "app.mjs"), "export const v = 1;\n");
+      git(repo, ["add", "."]);
+      git(repo, ["commit", "-qm", "init"]);
+
+      const infra = detectTestInfrastructure(repo, repo);
+      assert.equal(infra.hasTestSuite, true, tomlName);
+
+      // Even if a lower-priority pytest.ini exists with normal addopts, pytest.toml overrides it
+      writeFileSync(join(repo, "pytest.ini"), '[pytest]\naddopts = "-q"\n');
+      const txPath = join(createTempDir("hstack-p10-r15-f8-tx-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "수정 후 검증" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "DONE", content: "1 test collected" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      const dec = decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "pytest", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: infra, auditEscalation: "off" },
+      );
+      assert.equal(dec.verdict, "REJECT", tomlName);
+      assert.ok(dec.blockedRules.includes("R2_STALE_VERIFICATION"), `${tomlName}: ${dec.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R15-F9: preserves literal leading/trailing quotes inside decoded path targets during R3 resolution", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pyproject.toml"), '[tool.pytest.ini_options]\ntestpaths = ["unit"]\n');
+    const txPath = join(createTempDir("hstack-p10-r15-f9-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 수정" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: 'pytest "\'unit/test_a.py"', Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"), dec.blockedRules.join(","));
+  });
+
+  it("R15-F10: scopes root testpaths to root invocation while allowing subdirectory full reruns", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pyproject.toml"), '[tool.pytest.ini_options]\ntestpaths = ["unit"]\n');
+    const pkgDir = join(repo, "packages", "other");
+    mkdirSync(pkgDir, { recursive: true });
+
+    const txSub = join(createTempDir("hstack-p10-r15-f10-sub-"), "t.jsonl");
+    writeFileSync(
+      txSub,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "하위 패키지 테스트" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest test_foo.py", Cwd: pkgDir } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: pkgDir } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const decSub = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "하위 패키지 전체 pytest 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txSub, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decSub.verdict, "PASS", decSub.blockedRules.join(","));
+
+    const txRoot = join(createTempDir("hstack-p10-r15-f10-root-"), "t.jsonl");
+    writeFileSync(
+      txRoot,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "루트 테스트" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 3;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest packages/other/test_foo.py", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const decRoot = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "루트 pytest 통과.",
+      },
+      { cwd: repo, ledger: readFactLedger(txRoot, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decRoot.verdict, "REJECT");
+    assert.ok(decRoot.blockedRules.includes("R3_CONCEALED_FAILURE"));
+  });
+
+  it("R15-F11: supports string array addopts in TOML for quiet flags while rejecting collection-only array addopts", () => {
+    const runWithToml = (tomlBody) => {
+      const repo = makeRepo();
+      writeFileSync(join(repo, "pyproject.toml"), tomlBody);
+      const txPath = join(createTempDir("hstack-p10-r15-f11-"), "t.jsonl");
+      writeFileSync(
+        txPath,
+        toJsonl([
+          { step_index: 0, type: "USER_INPUT", content: "테스트 수정" },
+          { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+          { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+          { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest tests/test_a.py", Cwd: repo } }] },
+          { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+          { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+          { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+        ]),
+      );
+      const gl = readGitLedger(repo);
+      return decideGate(
+        {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "pytest", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "pytest 완료.",
+        },
+        { cwd: repo, ledger: readFactLedger(txPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+      );
+    };
+
+    const decQuiet = runWithToml('[tool.pytest.ini_options]\naddopts = [\n  "-q",\n  "-v",\n]\n');
+    assert.equal(decQuiet.verdict, "PASS", decQuiet.blockedRules.join(","));
+
+    const decDry = runWithToml('[tool.pytest.ini_options]\naddopts = ["--collect-only"]\n');
+    assert.equal(decDry.verdict, "REJECT");
+    assert.ok(decDry.blockedRules.includes("R2_STALE_VERIFICATION"));
+  });
+
+  it("R15-F12: catches uncommitted post-gate shell doc edit in Stop while preserving E1 doc-only exemption on re-gate", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "README.md"), "# initial\n");
+    git(repo, ["add", "README.md"]);
+    git(repo, ["commit", "-q", "-m", "add readme"]);
+
+    const resBlocked = runTurnOnRepo(repo, "p10-r15-f12-dirty-doc", [
+      { write: "README.md", content: "# edited before gate\n" },
+      {
+        gate: {
+          modified_files: ["README.md"],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "문서 수정 완료.",
+        },
+      },
+      {
+        cmd: "echo post >> README.md",
+        output: "ok",
+        effect: (r) => writeFileSync(join(r, "README.md"), "# edited dirty AFTER gate without commit\n"),
+      },
+    ]);
+    assert.equal(resBlocked.verdicts[0], VERDICT_HEADERS.PASS);
+    assertGateBlocked(resBlocked.out);
+
+    const repo2 = makeRepo();
+    writeFileSync(join(repo2, "README.md"), "# initial\n");
+    git(repo2, ["add", "README.md"]);
+    git(repo2, ["commit", "-q", "-m", "add readme"]);
+
+    const resRegate = runTurnOnRepo(repo2, "p10-r15-f12-dirty-doc-regate", [
+      { write: "README.md", content: "# edited before gate\n" },
+      {
+        gate: {
+          modified_files: ["README.md"],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "1차 문서 검증 완료.",
+        },
+      },
+      {
+        cmd: "echo post >> README.md",
+        output: "ok",
+        effect: (r) => writeFileSync(join(r, "README.md"), "# edited dirty AFTER gate without commit\n"),
+      },
+      {
+        gate: {
+          modified_files: ["README.md"],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "추가 수정 문서 재검증 완료.",
+        },
+      },
+    ]);
+    assert.equal(resRegate.verdicts[0], VERDICT_HEADERS.PASS);
+    assert.equal(resRegate.verdicts[1], VERDICT_HEADERS.PASS, resRegate.verdicts[1]);
+    assert.deepEqual(resRegate.out, {});
+  });
+});
