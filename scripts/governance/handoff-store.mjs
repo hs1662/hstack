@@ -490,9 +490,17 @@ export function claimAutonomyTurnFlag({
 }
 
 // One working-tree snapshot per conversation, valid only for the turn that recorded it.
-export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot, dataDir = resolvePluginDataDir() } = {}) {
+export function saveTurnSnapshot({
+  conversationId,
+  turnStartStepIndex,
+  afterStepIndex = null,
+  snapshot,
+  dataDir = resolvePluginDataDir(),
+} = {}) {
   const filePath = resolveSessionStatePath(conversationId, dataDir);
-  if (!filePath || !snapshot || !Number.isFinite(turnStartStepIndex)) {
+  const hasStep = Number.isFinite(turnStartStepIndex);
+  const hasAfter = !hasStep && Number.isFinite(afterStepIndex);
+  if (!filePath || !snapshot || (!hasStep && !hasAfter)) {
     return false;
   }
   try {
@@ -503,7 +511,8 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
         conversationId,
         updatedAt: new Date().toISOString(),
         turnSnapshot: {
-          turnStartStepIndex,
+          turnStartStepIndex: hasStep ? turnStartStepIndex : null,
+          ...(hasAfter ? { afterStepIndex } : {}),
           gitRoot: snapshot.gitRoot,
           head: snapshot.head,
           files: snapshot.files,
@@ -581,17 +590,47 @@ function toNullProtoRecord(raw) {
 }
 
 export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir = resolvePluginDataDir() } = {}) {
-  const snap = readSessionState(conversationId, dataDir)?.turnSnapshot;
+  let snap = readSessionState(conversationId, dataDir)?.turnSnapshot;
   if (
     !snap ||
     typeof snap !== "object" ||
-    snap.turnStartStepIndex !== turnStartStepIndex ||
     typeof snap.gitRoot !== "string" ||
     !snap.files ||
     typeof snap.files !== "object" ||
     Array.isArray(snap.files)
   ) {
     return null;
+  }
+  if (snap.turnStartStepIndex !== turnStartStepIndex) {
+    const canBind =
+      snap.turnStartStepIndex === null &&
+      Number.isFinite(snap.afterStepIndex) &&
+      Number.isFinite(turnStartStepIndex) &&
+      turnStartStepIndex > snap.afterStepIndex;
+    if (!canBind) {
+      return null;
+    }
+    const filePath = resolveSessionStatePath(conversationId, dataDir);
+    if (filePath) {
+      try {
+        withSessionLock(filePath, () => {
+          const prev = readSessionState(conversationId, dataDir);
+          const cur = prev?.turnSnapshot;
+          if (
+            cur &&
+            cur.turnStartStepIndex === null &&
+            cur.afterStepIndex === snap.afterStepIndex &&
+            cur.capturedAtMs === snap.capturedAtMs
+          ) {
+            const bound = { ...cur, turnStartStepIndex };
+            delete bound.afterStepIndex;
+            atomicWriteJson(filePath, { ...prev, turnSnapshot: bound });
+            snap = bound;
+          }
+        });
+      } catch {
+      }
+    }
   }
 
   const headOf = (raw) => (typeof raw?.head === "string" ? raw.head : null);

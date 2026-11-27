@@ -7,7 +7,12 @@ import {
   KOREAN_THINKING_ANCHOR_MESSAGE,
   PROMPT_ROUTE_SYSTEM_MESSAGE,
 } from "./governance/constants.mjs";
-import { detectSessionRoleFromUserInput, readTurnLedger, snapshotWorkingTree } from "./governance/fact-ledger.mjs";
+import {
+  detectSessionRoleFromUserInput,
+  readFactLedgerAndSteps,
+  readTurnLedger,
+  snapshotWorkingTree,
+} from "./governance/fact-ledger.mjs";
 import {
   claimAutonomyTurnFlag,
   readSessionState,
@@ -77,13 +82,32 @@ export function handlePreInvocation(stdinText, options = {}) {
   const transcriptPath = pickPreferredTranscriptPath(payload.transcriptPath ?? payload.transcript_path);
   const effectiveCid = resolveEffectiveConversationKey(conversationId, cwd);
 
-  const ledger =
-    options?.ledger ??
-    (transcriptPath ? readTurnLedger(transcriptPath, cwd, "") : null);
+  const isClaude = payload.host === "claude-code";
+  const claudeLoaded =
+    !options?.ledger && isClaude && transcriptPath ? readFactLedgerAndSteps(transcriptPath, cwd, "") : null;
+  const ledger = options?.ledger ?? claudeLoaded?.ledger ?? (transcriptPath ? readTurnLedger(transcriptPath, cwd, "") : null);
   const turnStartStepIndex = ledger?.transcriptAvailable ? ledger.turnStartStepIndex : 0;
 
   // Turn-start baseline so Stop can see files that shell commands change during this turn.
-  if (cwd && ledger?.transcriptAvailable) {
+  if (cwd && isClaude) {
+    const lastStep = claudeLoaded?.steps?.at(-1);
+    const alreadyRecordedPrompt =
+      ledger?.transcriptAvailable &&
+      lastStep?.type === "USER_INPUT" &&
+      ledger.turnExecutions.length === 0 &&
+      ledger.turnWrittenFiles.size === 0;
+    saveTurnSnapshot(
+      alreadyRecordedPrompt
+        ? { conversationId: effectiveCid, turnStartStepIndex, snapshot: snapshotWorkingTree(cwd), dataDir }
+        : {
+            conversationId: effectiveCid,
+            turnStartStepIndex: null,
+            afterStepIndex: ledger?.transcriptAvailable ? turnStartStepIndex : -1,
+            snapshot: snapshotWorkingTree(cwd),
+            dataDir,
+          },
+    );
+  } else if (cwd && ledger?.transcriptAvailable) {
     saveTurnSnapshot({ conversationId: effectiveCid, turnStartStepIndex, snapshot: snapshotWorkingTree(cwd), dataDir });
   }
 

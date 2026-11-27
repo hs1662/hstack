@@ -52,11 +52,48 @@ function userText(content) {
   return text.trim() || content.some((block) => block.type !== "text") ? { text } : null;
 }
 
+const CLAUDE_ANSWER_PAIR_RE = /"[^"\n]+"\s*=\s*"([^"\n]+)"/g;
+const CLAUDE_REJECTED_TEXT_RE = /^(?:Error:|Tool error:|Failed to|Cancelled|Canceled|User cancelled|User canceled|User rejected|Rejected|Dismissed|No answer|Aborted|Timeout)/i;
+const MAX_UI_ITEMS = 32;
+
+function clipText(value, limit = TEXT_CHARS) {
+  return typeof value === "string" ? value.slice(0, limit) : "";
+}
+
+function normalizeQuestionOptions(rawOptions) {
+  if (!Array.isArray(rawOptions)) return [];
+  const out = [];
+  for (const opt of rawOptions.slice(0, MAX_UI_ITEMS)) {
+    if (typeof opt === "string") {
+      if (opt.trim()) out.push(clipText(opt));
+    } else if (object(opt)) {
+      if (typeof opt.label === "string" && opt.label.trim()) out.push(clipText(opt.label));
+      if (typeof opt.description === "string" && opt.description.trim()) out.push(clipText(opt.description));
+    }
+  }
+  return out;
+}
+
+function normalizeAskQuestionAnswers(content, hostResult) {
+  const trimmed = content.trim();
+  if (CLAUDE_REJECTED_TEXT_RE.test(trimmed)) return content;
+  if (/^A\d+\s*:/m.test(trimmed)) return content;
+  if (object(hostResult?.answers)) {
+    const answers = Object.values(hostResult.answers).filter((v) => typeof v === "string" && v.trim().length > 0);
+    if (answers.length > 0) return answers.map((v, i) => `A${i + 1}: ${v.trim()}`).join("\n");
+  }
+  if (/^User has answered your questions:/i.test(trimmed)) {
+    const answers = [...trimmed.matchAll(CLAUDE_ANSWER_PAIR_RE)].map((m) => m[1].trim()).filter(Boolean);
+    if (answers.length > 0) return answers.map((v, i) => `A${i + 1}: ${v}`).join("\n");
+  }
+  return content;
+}
+
 function toolCall(block) {
   if (block?.type !== "tool_use" || typeof block.id !== "string" || !block.id || block.id.length > 256 ||
       !object(block.input)) return null;
   const normalized = normalizeClaudeTool(block.name, block.input);
-  if (!normalized || block.name === "PowerShell") return null;
+  if (!normalized) return null;
   const { name, args: nativeArgs } = normalized;
   let args;
   switch (name) {
@@ -66,15 +103,44 @@ function toolCall(block) {
       args = { Path: typeof nativeArgs.Path === "string" && nativeArgs.Path.length <= 4096 ? nativeArgs.Path : "" };
       break;
     case "run_command":
-      args = { command: typeof nativeArgs.CommandLine === "string" && nativeArgs.CommandLine.length <= TEXT_CHARS ? nativeArgs.CommandLine : "" };
+      // Preserve PowerShell as a non-verification shell execution so Stop shell-write checks still engage.
+      args = { command: block.name === "PowerShell" ? "powershell" :
+        typeof nativeArgs.CommandLine === "string" && nativeArgs.CommandLine.length <= TEXT_CHARS ? nativeArgs.CommandLine : "" };
       break;
     case GATE_TOOL_NAME:
       args = { toolSummary: "" };
       break;
     case "invoke_subagent":
-      args = { TypeName: typeof nativeArgs.TypeName === "string" ? nativeArgs.TypeName.slice(0, 256) : "",
-        Prompt: typeof nativeArgs.Prompt === "string" ? nativeArgs.Prompt.slice(0, TEXT_CHARS) : "" };
+      args = { TypeName: clipText(nativeArgs.TypeName, 256), Prompt: clipText(nativeArgs.Prompt) };
       break;
+    case "todo_write": {
+      const list = Array.isArray(block.input.todos) ? block.input.todos.slice(0, MAX_BLOCKS) : [];
+      args = {
+        todos: list.filter(object).map((item) => ({
+          ...(typeof item.content === "string" ? { content: clipText(item.content) } : {}),
+          ...(typeof item.title === "string" ? { title: clipText(item.title) } : {}),
+          ...(typeof item.subject === "string" ? { subject: clipText(item.subject) } : {}),
+        })),
+      };
+      break;
+    }
+    case "task_create":
+    case "task_update":
+      args = {
+        ...(typeof block.input.subject === "string" ? { subject: clipText(block.input.subject) } : {}),
+        ...(typeof block.input.title === "string" ? { title: clipText(block.input.title) } : {}),
+      };
+      break;
+    case "ask_question": {
+      const qs = Array.isArray(block.input.questions) ? block.input.questions.slice(0, MAX_UI_ITEMS) : [];
+      args = {
+        questions: qs.filter(object).map((q) => ({
+          ...(typeof q.question === "string" ? { question: clipText(q.question) } : {}),
+          options: normalizeQuestionOptions(q.options),
+        })),
+      };
+      break;
+    }
     default:
       return null;
   }
@@ -92,8 +158,9 @@ function toolResult(block, row, call) {
   if (!failed && (row.isMeta || row.isCompactSummary || row.isVisibleInTranscriptOnly)) return null;
   if (!failed && (call.detached || hostResult?.backgroundTaskId || hostResult?.backgroundedByUser)) return null;
   const payload = block.content;
-  const content = typeof payload === "string" ? payload :
+  const rawContent = typeof payload === "string" ? payload :
     Array.isArray(payload) && payload.length <= MAX_BLOCKS ? blockText(payload, "text", "text") : "";
+  const content = !failed && call.name === "ask_question" ? normalizeAskQuestionAnswers(rawContent, hostResult) : rawContent;
   const readMedia = call.name === "read_file" && Array.isArray(payload) && payload.length <= MAX_BLOCKS &&
     payload.some((item) => item?.type === "image" || item?.type === "document");
   if (!failed && call.name !== "read_file" && Array.isArray(payload) && payload.some((item) => item?.type !== "text")) return null;
