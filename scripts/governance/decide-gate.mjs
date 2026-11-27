@@ -360,6 +360,7 @@ function parseIniTestpaths(text, targetSections) {
   let foundKey = false;
   let hasCollectionOverride = false;
   let hasDryRunAddopts = false;
+  let uncertain = false;
   const collected = [];
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
@@ -397,11 +398,17 @@ function parseIniTestpaths(text, targetSections) {
           }
         }
         const addoptsTokens = splitQuotedWhitespace(rawAddopts);
-        if (!addoptsTokens || addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
+        if (!addoptsTokens) {
           hasCollectionOverride = true;
-        }
-        if (!addoptsTokens || addoptsTokens.some((tok) => isPytestDryRunToken(tok))) {
           hasDryRunAddopts = true;
+          uncertain = true;
+        } else {
+          if (addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
+            hasCollectionOverride = true;
+          }
+          if (addoptsTokens.some((tok) => isPytestDryRunToken(tok))) {
+            hasDryRunAddopts = true;
+          }
         }
       }
     }
@@ -411,7 +418,7 @@ function parseIniTestpaths(text, targetSections) {
       const firstVal = keyMatch[1].replace(/\s+[#;].*$/, "").trim();
       if (firstVal) {
         const splitFirst = shlexSplitTestpaths(firstVal);
-        if (!splitFirst) return { restricted: true, paths: [], hasDryRunAddopts };
+        if (!splitFirst) return { restricted: true, paths: [], hasDryRunAddopts, uncertain: true };
         collected.push(...splitFirst);
       }
       for (let j = i + 1; j < lines.length; j += 1) {
@@ -423,7 +430,7 @@ function parseIniTestpaths(text, targetSections) {
         if (/^[ \t]+/.test(nextLine) && !nextTrimmed.startsWith("[") && !nextTrimmed.includes("=")) {
           const clean = nextTrimmed.replace(/\s+[#;].*$/, "").trim();
           const splitNext = shlexSplitTestpaths(clean);
-          if (!splitNext) return { restricted: true, paths: [], hasDryRunAddopts };
+          if (!splitNext) return { restricted: true, paths: [], hasDryRunAddopts, uncertain: true };
           collected.push(...splitNext);
           i = j;
         } else {
@@ -436,9 +443,11 @@ function parseIniTestpaths(text, targetSections) {
     return null;
   }
   if (hasCollectionOverride) {
-    return { restricted: true, paths: [], hasDryRunAddopts };
+    return { restricted: true, paths: [], hasDryRunAddopts, uncertain };
   }
-  return foundKey ? { restricted: true, paths: collected, hasDryRunAddopts } : { restricted: false, paths: [], hasDryRunAddopts };
+  return foundKey
+    ? { restricted: true, paths: collected, hasDryRunAddopts, uncertain }
+    : { restricted: false, paths: [], hasDryRunAddopts, uncertain };
 }
 
 function shlexSplitTestpaths(rawValue) {
@@ -640,12 +649,19 @@ function evaluatePytestIniSection(sectBody, targetTablePath) {
   const addoptsKeyPresent = /(?:^|\n)[ \t]*(?:addopts|"addopts"|'addopts')[ \t]*=/.test(sectBody);
   let hasCollectionOverride = false;
   let hasDryRunAddopts = false;
+  let addoptsUnparseable = false;
   if (addoptsKeyPresent) {
-    if (!addoptsTokens || addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
+    if (!addoptsTokens) {
       hasCollectionOverride = true;
-    }
-    if (!addoptsTokens || addoptsTokens.some((tok) => isPytestDryRunToken(tok))) {
       hasDryRunAddopts = true;
+      addoptsUnparseable = true;
+    } else {
+      if (addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
+        hasCollectionOverride = true;
+      }
+      if (addoptsTokens.some((tok) => isPytestDryRunToken(tok))) {
+        hasDryRunAddopts = true;
+      }
     }
   }
   const keyRe = /(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*([^\n]*)/;
@@ -655,11 +671,11 @@ function evaluatePytestIniSection(sectBody, targetTablePath) {
       restricted: hasCollectionOverride,
       paths: [],
       hasDryRunAddopts,
-      uncertain: hasCollectionOverride && !hasDryRunAddopts,
+      uncertain: addoptsUnparseable,
     };
   }
   if (hasCollectionOverride) {
-    return { restricted: true, paths: [], hasDryRunAddopts, uncertain: !hasDryRunAddopts };
+    return { restricted: true, paths: [], hasDryRunAddopts, uncertain: addoptsUnparseable };
   }
   const rhsTrim = keyMatch[1].trim();
   if (rhsTrim.startsWith("[")) {
@@ -668,7 +684,7 @@ function evaluatePytestIniSection(sectBody, targetTablePath) {
     if (arrBody !== null) {
       const paths = parseTomlStringArray(arrBody);
       return paths
-        ? { restricted: true, paths, hasDryRunAddopts, uncertain: false }
+        ? { restricted: true, paths, hasDryRunAddopts, uncertain: addoptsUnparseable }
         : { restricted: true, paths: [], hasDryRunAddopts, uncertain: true };
     }
     return { restricted: true, paths: [], hasDryRunAddopts, uncertain: true };
@@ -677,7 +693,7 @@ function evaluatePytestIniSection(sectBody, targetTablePath) {
   if (dec && !rhsTrim.slice(dec.nextIdx).trim()) {
     const split = shlexSplitTestpaths(dec.value);
     return split
-      ? { restricted: true, paths: split, hasDryRunAddopts, uncertain: false }
+      ? { restricted: true, paths: split, hasDryRunAddopts, uncertain: addoptsUnparseable }
       : { restricted: true, paths: [], hasDryRunAddopts, uncertain: true };
   }
   return { restricted: true, paths: [], hasDryRunAddopts, uncertain: true };
@@ -786,23 +802,37 @@ function readPytestTomlFile(filePath, targetTablePath, configDir) {
   try {
     const text = readFileSync(filePath, "utf8");
     const parsedToml = parsePytestToml(text, targetTablePath);
-    if (parsedToml.failClosed || parsedToml.hasCollectionOverride) {
+    if (parsedToml.failClosed) {
       return {
         restricted: true,
         paths: [],
-        hasDryRunAddopts: Boolean(parsedToml.hasDryRunAddopts),
-        uncertain: !parsedToml.hasDryRunAddopts,
+        hasDryRunAddopts: false,
+        uncertain: true,
         configDir,
       };
     }
-    if (parsedToml.iniSectionBody !== null) {
-      const evaluated = evaluatePytestIniSection(parsedToml.iniSectionBody, targetTablePath);
-      return { ...evaluated, configDir };
+    const evaluated =
+      parsedToml.iniSectionBody !== null
+        ? evaluatePytestIniSection(parsedToml.iniSectionBody, targetTablePath)
+        : parsedToml.hasCollectionOverride
+          ? { restricted: true, paths: [], hasDryRunAddopts: Boolean(parsedToml.hasDryRunAddopts), uncertain: false }
+          : null;
+    if (!evaluated) {
+      return null;
     }
+    if (parsedToml.hasCollectionOverride) {
+      return {
+        restricted: true,
+        paths: [],
+        hasDryRunAddopts: Boolean(evaluated.hasDryRunAddopts || parsedToml.hasDryRunAddopts),
+        uncertain: Boolean(evaluated.uncertain),
+        configDir,
+      };
+    }
+    return { ...evaluated, configDir };
   } catch {
     return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir };
   }
-  return null;
 }
 
 function readPytestConfigInDir(dir) {
@@ -825,7 +855,7 @@ function readPytestConfigInDir(dir) {
     try {
       const parsed = parseIniTestpaths(readFileSync(pytestIniPath, "utf8"), new Set(["pytest"]));
       return parsed
-        ? { ...parsed, uncertain: Boolean(parsed.restricted && parsed.paths.length === 0 && !parsed.hasDryRunAddopts), configDir: dir }
+        ? { ...parsed, uncertain: Boolean(parsed.uncertain), configDir: dir }
         : { restricted: false, paths: [], hasDryRunAddopts: false, uncertain: false, configDir: dir };
     } catch {
       return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir: dir };
@@ -849,7 +879,7 @@ function readPytestConfigInDir(dir) {
     try {
       const parsed = parseIniTestpaths(readFileSync(cfgPath, "utf8"), sections);
       if (parsed) {
-        return { ...parsed, uncertain: Boolean(parsed.restricted && parsed.paths.length === 0 && !parsed.hasDryRunAddopts), configDir: dir };
+        return { ...parsed, uncertain: Boolean(parsed.uncertain), configDir: dir };
       }
     } catch {
       return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir: dir };
@@ -896,7 +926,7 @@ function readPytestConfigFile(rawPath, execDir) {
     const sections = baseName === "setup.cfg" ? new Set(["tool:pytest"]) : new Set(["pytest"]);
     const parsed = parseIniTestpaths(readFileSync(resolvedPath, "utf8"), sections);
     return parsed
-      ? { ...parsed, uncertain: Boolean(parsed.restricted && parsed.paths.length === 0 && !parsed.hasDryRunAddopts), configDir }
+      ? { ...parsed, uncertain: Boolean(parsed.uncertain), configDir }
       : { restricted: false, paths: [], hasDryRunAddopts: false, uncertain: false, configDir };
   } catch {
     return { restricted: true, paths: [], hasDryRunAddopts: false, uncertain: true, configDir };
@@ -1069,8 +1099,10 @@ function resolvePytestConfigForCommand(tokens, endIdx, execDir) {
     const hasUnsafeInOverride = !overrideTokens || overrideTokens.some((t) => isPytestAddoptsUnsafeToken(t));
     return {
       ...baseConfig,
+      restricted: Boolean(baseConfig.restricted || hasUnsafeInOverride),
+      paths: hasUnsafeInOverride ? [] : baseConfig.paths,
       hasDryRunAddopts: hasDryRunInOverride,
-      uncertain: Boolean(baseConfig.uncertain || hasUnsafeInOverride),
+      uncertain: Boolean(baseConfig.uncertain || !overrideTokens),
     };
   }
   return baseConfig;

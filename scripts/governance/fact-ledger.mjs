@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
-import { dirname, join, posix, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
 import {
   extractLinePrefixType,
   findLastLine,
@@ -3551,15 +3551,32 @@ function scanTestInfraDir(dir, indicators) {
   }
 }
 
+function resolveNormalizedPath(dir) {
+  try {
+    return realpathSync(dir);
+  } catch {
+    return resolve(dir);
+  }
+}
+
 function addAncestorDirs(roots, dir, stopRoot = "") {
   if (typeof dir !== "string" || dir.trim().length === 0) {
     return;
   }
-  let cur = resolve(dir);
-  const stop = typeof stopRoot === "string" && stopRoot.trim().length > 0 ? resolve(stopRoot) : "";
+  const curResolved = resolveNormalizedPath(dir);
+  roots.add(curResolved);
+  const stop = typeof stopRoot === "string" && stopRoot.trim().length > 0 ? resolveNormalizedPath(stopRoot) : "";
+  if (!stop) {
+    return;
+  }
+  const relFromStop = relative(stop, curResolved);
+  if (relFromStop.startsWith("..") || isAbsolute(relFromStop)) {
+    return;
+  }
+  let cur = curResolved;
   for (let depth = 0; depth < 32; depth += 1) {
     roots.add(cur);
-    if (stop && cur === stop) {
+    if (cur === stop) {
       break;
     }
     const parent = dirname(cur);
@@ -3567,9 +3584,6 @@ function addAncestorDirs(roots, dir, stopRoot = "") {
       break;
     }
     cur = parent;
-    if (!stop) {
-      break;
-    }
   }
 }
 
