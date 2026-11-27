@@ -26,6 +26,7 @@ const WRITES_DISGUISED_AS_CHECKS = [
   `python3 -c"open('app.mjs','w').write('x')"`,
   `bash -c "node --version > app.mjs"`,
   `bash -c"node --version > app.mjs"`,
+  `bash -c"npm test"`,
   `node -e"require('fs').writeFileSync('app.mjs','x')"`,
   "npm test > src/auth/token.mjs",
 ];
@@ -67,7 +68,7 @@ describe("F1/F2 a write disguised as a check earns no verification credit", () =
       "node --test 2>/dev/null",
       "npm test 2>&1",
       `bash -c "npm test"`,
-      `bash -c"npm test"`,
+      `bash -ce "npm test"`,
       "python -m pytest -q",
       "python3 -mpytest",
       "pytest -q",

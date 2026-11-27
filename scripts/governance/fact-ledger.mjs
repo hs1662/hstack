@@ -670,6 +670,14 @@ const INLINE_CODE_FLAG_RE = {
 const SHELL_SAFE_SHORT_FLAGS = new Set(["a", "c", "e", "l", "o", "u", "v", "x"]);
 const SHELL_SAFE_LONG_NAMED_OPTIONS = new Set(["allexport", "errexit", "nounset", "pipefail", "verbose", "xtrace"]);
 
+function buildShellBody(body, pipefail, allexport) {
+  if (!body) return "";
+  const prefixes = [];
+  if (pipefail) prefixes.push("set -o pipefail");
+  if (allexport) prefixes.push("set -o allexport");
+  return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
+}
+
 // The inline body of an interpreter given code on its command line, or null for a script or a plain run.
 // A shell `-c` body is shell, so it is returned for classification; any other language returns "" (never verification).
 function inlineInterpreterBody(bin, args) {
@@ -680,14 +688,21 @@ function inlineInterpreterBody(bin, args) {
     let noexec = false;
     for (let i = 0; i < args.length; i += 1) {
       const arg = args[i];
-      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aeluxv]*o$/.test(arg)) {
+      if (SHELL_OPTION_FLAGS_WITH_ARG.has(arg) || /^[-+][aceluxvn]*o$/.test(arg)) {
         if (arg === "-O" || arg === "+O") {
           return "";
         }
         const enable = arg[0] === "-";
         for (let k = 1; k < arg.length - 1; k += 1) {
-          if (arg[k] === "n") noexec = enable;
-          else if (arg[k] === "a") allexport = enable;
+          const ch = arg[k];
+          if (ch === "n") noexec = enable;
+          else if (ch === "a") allexport = enable;
+          else if (ch === "c") {
+            if (!enable) return "";
+            inline = true;
+          } else if (!SHELL_SAFE_SHORT_FLAGS.has(ch)) {
+            return "";
+          }
         }
         const optName = args[i + 1];
         if (optName === "pipefail") {
@@ -700,19 +715,18 @@ function inlineInterpreterBody(bin, args) {
           return "";
         }
         i += 1;
-      } else if (/^-[A-Za-z]*c/.test(arg) || /^[-+][A-Za-z]+$/.test(arg)) {
+      } else if (/^[-+][A-Za-z]+$/.test(arg)) {
         const enable = arg[0] === "-";
-        let cIdx = -1;
         for (let k = 1; k < arg.length; k += 1) {
           const ch = arg[k];
           if (ch === "n") {
             noexec = enable;
             continue;
           }
-          if (ch === "c" && enable) {
+          if (ch === "c") {
+            if (!enable) return "";
             inline = true;
-            cIdx = k;
-            break;
+            continue;
           }
           if (!SHELL_SAFE_SHORT_FLAGS.has(ch)) {
             return "";
@@ -721,42 +735,16 @@ function inlineInterpreterBody(bin, args) {
             allexport = enable;
           }
         }
-        if (noexec) {
-          return "";
-        }
-        if (cIdx !== -1 && cIdx < arg.length - 1) {
-          const body = i === args.length - 1 ? arg.slice(cIdx + 1) : "";
-          if (!body) return "";
-          const prefixes = [];
-          if (pipefail) prefixes.push("set -o pipefail");
-          if (allexport) prefixes.push("set -o allexport");
-          return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
-        }
-      } else if (arg.startsWith("-")) {
-        if (arg === "--") {
-          if (noexec) {
-            return "";
-          }
-          const body = i + 1 === args.length - 1 ? args[i + 1] : "";
-          if (!inline) return null;
-          if (!body) return "";
-          const prefixes = [];
-          if (pipefail) prefixes.push("set -o pipefail");
-          if (allexport) prefixes.push("set -o allexport");
-          return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
-        }
+      } else if (arg === "--") {
+        if (noexec) return "";
+        const body = i + 1 === args.length - 1 ? args[i + 1] : "";
+        return inline ? buildShellBody(body, pipefail, allexport) : null;
+      } else if (arg.startsWith("-") || arg.startsWith("+")) {
         return "";
       } else {
-        if (noexec) {
-          return "";
-        }
+        if (noexec) return "";
         const body = i === args.length - 1 ? arg : "";
-        if (!inline) return null;
-        if (!body) return "";
-        const prefixes = [];
-        if (pipefail) prefixes.push("set -o pipefail");
-        if (allexport) prefixes.push("set -o allexport");
-        return prefixes.length > 0 ? `${prefixes.join(" && ")} && ${body}` : body;
+        return inline ? buildShellBody(body, pipefail, allexport) : null;
       }
     }
     if (noexec) {
@@ -1095,7 +1083,7 @@ function classifySingleSegment(segment) {
     return "other";
   }
 
-  if (baseBin === "export" && tokens.slice(idx + 1).some((tok) => isExecHijackAssign(tok))) {
+  if (baseBin === "export" && tokens.slice(idx + 1).some((tok) => !isSafeExportArg(tok))) {
     return "other";
   }
   if (READ_ONLY_BINARIES.has(baseBin) || SHELL_NEUTRAL_BUILTINS.has(baseBin)) {
@@ -1269,7 +1257,7 @@ export function extractPytestCommandInfo(segment) {
     return null;
   }
   const baseBin = posix.basename(toPosix(tokens[idx]));
-function computeOuterShellContextKey(tokens, idx, baseBin) {
+function computeOuterShellContextKey(tokens, idx) {
   const outerHead = [];
   for (let i = 0; i < idx; i += 1) {
     const t = tokens[i];
@@ -1278,7 +1266,10 @@ function computeOuterShellContextKey(tokens, idx, baseBin) {
     }
     outerHead.push(t);
   }
-  return JSON.stringify({ outerHead, baseBin });
+  const rawBin = tokens[idx] ?? "";
+  const invokeArgs = tokens.slice(idx + 1);
+  const shellInvokeFlags = invokeArgs.length > 0 ? invokeArgs.slice(0, -1) : [];
+  return JSON.stringify({ outerHead, rawBin, shellInvokeFlags });
 }
 
   if (SHELL_INTERPRETERS.has(baseBin)) {
@@ -1291,7 +1282,8 @@ function computeOuterShellContextKey(tokens, idx, baseBin) {
         isPytest: false,
         shellBody: body,
         bin: baseBin,
-        outerContextKey: computeOuterShellContextKey(tokens, idx, baseBin),
+        rawBin: tokens[idx],
+        outerContextKey: computeOuterShellContextKey(tokens, idx),
         envPytestAddopts: prefix.envPytestAddopts,
         envPytestCleared: prefix.envPytestCleared,
         chdirs: prefix.chdirs,
@@ -1423,48 +1415,59 @@ function isValidSetCommandArgs(args) {
   return true;
 }
 
-function extractSetCommandArgs(words) {
-  if (words[0] === "set") {
-    return words.slice(1);
-  }
-  if (words[0] !== "command") {
+export function unwrapShellBuiltin(words) {
+  if (!Array.isArray(words) || words.length === 0) {
     return null;
   }
-  let idx = 1;
-  while (idx < words.length) {
-    const arg = words[idx];
-    if (arg === "--") {
-      idx += 1;
+  let idx = 0;
+  if (words[0] === "command") {
+    idx = 1;
+    while (idx < words.length) {
+      const arg = words[idx];
+      if (arg === "--") {
+        idx += 1;
+        break;
+      }
+      if (arg === "-p") {
+        idx += 1;
+        continue;
+      }
+      if (arg.startsWith("-")) {
+        return null;
+      }
       break;
     }
-    if (arg === "-p") {
-      idx += 1;
-      continue;
-    }
-    if (arg.startsWith("-")) {
-      return null;
-    }
-    break;
   }
-  return words[idx] === "set" ? words.slice(idx + 1) : null;
+  if (idx >= words.length) {
+    return null;
+  }
+  return { builtin: words[idx], args: words.slice(idx + 1) };
 }
 
-// cd/pushd/popd, `set` with errexit/nounset/xtrace/pipefail only, safe assignments or exports, or a read-only command.
+function extractSetCommandArgs(words) {
+  const u = unwrapShellBuiltin(words);
+  return u?.builtin === "set" ? u.args : null;
+}
+
+// cd/pushd/popd, `set` with errexit/nounset/xtrace/pipefail/allexport only, safe assignments or exports, or a read-only command.
 function isPrefixCommand({ words, raw }) {
   const [bin, ...args] = words;
-  if (words.every(isSafeAssign) || (bin === "export" && args.length > 0 && args.every(isSafeExportArg))) {
+  if (words.every(isSafeAssign)) {
     return true;
+  }
+  const u = unwrapShellBuiltin(words);
+  if (u?.builtin === "export") {
+    return u.args.length > 0 && u.args.every(isSafeExportArg);
+  }
+  if (u?.builtin === "set") {
+    // `set -n` (noexec) would skip the runner and exit 0, so only these flags pass.
+    return isValidSetCommandArgs(u.args);
   }
   if (bin === "cd" || bin === "pushd" || bin === "popd") {
     return args.length <= 1;
   }
-  const setArgs = extractSetCommandArgs(words);
-  if (setArgs !== null) {
-    // `set -n` (noexec) would skip the runner and exit 0, so only these flags pass.
-    return isValidSetCommandArgs(setArgs);
-  }
   const innerIdx = skipCommandPrefix(words);
-  if (innerIdx !== -1 && words[innerIdx] === "set") {
+  if (innerIdx !== -1 && (words[innerIdx] === "set" || words[innerIdx] === "export")) {
     return false;
   }
   return bin !== "export" && classifySingleSegment(raw) === "read_only";
@@ -1805,12 +1808,17 @@ export function extractChainPrepInfo(segment) {
     return null;
   }
   const dirs = prefix.chdirs.map((dir) => posix.normalize(toPosix(dir)));
-  const argv = ["npm", ...parsed.words.slice(idx + 1)];
+  const rawBin = parsed.words[idx];
+  const prefixTokens = parsed.words.slice(0, idx);
+  const argv = [rawBin, ...parsed.words.slice(idx + 1)];
+  const legacyArgv = ["npm", ...parsed.words.slice(idx + 1)];
   const dirParts = prefix.chdirOpaque ? [...dirs, "$opaque"] : dirs;
   const prefixTag = dirParts.length > 0 ? `@wrapperDir(${dirParts.join("->")}) ` : "";
   return {
-    sig: `${prefixTag}${argv.join(" ")}`,
+    sig: `${prefixTag}${legacyArgv.join(" ")}`,
     dirs,
+    rawBin,
+    prefixTokens,
     argv,
     opaque: Boolean(prefix.chdirOpaque),
   };
@@ -3616,8 +3624,21 @@ export function statSnapshotFile(gitRoot, relPath, { fsOps = null } = {}) {
   let fd = -1;
   try {
     const modeSig = (st.mode & 0o170000) | (st.mode & 0o111);
+    const samePathIdentity = (a, b) =>
+      (!Number.isFinite(a.dev) || !Number.isFinite(b.dev) || a.dev === b.dev) &&
+      (!Number.isFinite(a.ino) || !Number.isFinite(b.ino) || a.ino === b.ino);
     if (st.isSymbolicLink()) {
-      return [st.mtimeMs, st.size, modeSig, _readlinkSync(fullPath)];
+      const target = _readlinkSync(fullPath);
+      const stAfter = _lstatSync(fullPath);
+      if (
+        !stAfter.isSymbolicLink() ||
+        stAfter.mtimeMs !== st.mtimeMs ||
+        stAfter.size !== st.size ||
+        !samePathIdentity(st, stAfter)
+      ) {
+        return SNAPSHOT_UNREADABLE_SIGNATURE;
+      }
+      return [st.mtimeMs, st.size, modeSig, target];
     }
     if (!st.isFile()) {
       return SNAPSHOT_UNREADABLE_SIGNATURE;
@@ -3626,12 +3647,7 @@ export function statSnapshotFile(gitRoot, relPath, { fsOps = null } = {}) {
       const flags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
       fd = _openSync(fullPath, flags);
       const fstBefore = _fstatSync(fd);
-      if (
-        !fstBefore.isFile() ||
-        fstBefore.size > MAX_SNAPSHOT_HASH_BYTES ||
-        (Number.isFinite(st.dev) && Number.isFinite(fstBefore.dev) && fstBefore.dev !== st.dev) ||
-        (Number.isFinite(st.ino) && Number.isFinite(fstBefore.ino) && fstBefore.ino !== st.ino)
-      ) {
+      if (!fstBefore.isFile() || fstBefore.size > MAX_SNAPSHOT_HASH_BYTES || !samePathIdentity(st, fstBefore)) {
         return SNAPSHOT_UNREADABLE_SIGNATURE;
       }
       const chunk = Buffer.allocUnsafe(SNAPSHOT_READ_CHUNK_BYTES);
@@ -3656,13 +3672,25 @@ export function statSnapshotFile(gitRoot, relPath, { fsOps = null } = {}) {
         fstBefore.size !== fstAfter.size ||
         fstBefore.mtimeMs !== fstAfter.mtimeMs ||
         fstBefore.ctimeMs !== fstAfter.ctimeMs ||
-        (Number.isFinite(fstBefore.dev) && Number.isFinite(fstAfter.dev) && fstAfter.dev !== fstBefore.dev) ||
-        (Number.isFinite(fstBefore.ino) && Number.isFinite(fstAfter.ino) && fstAfter.ino !== fstBefore.ino)
+        !samePathIdentity(fstBefore, fstAfter)
+      ) {
+        return SNAPSHOT_UNREADABLE_SIGNATURE;
+      }
+      const stPathAfter = _lstatSync(fullPath);
+      if (
+        !stPathAfter.isFile() ||
+        !samePathIdentity(fstAfter, stPathAfter) ||
+        stPathAfter.mtimeMs !== fstAfter.mtimeMs ||
+        stPathAfter.size !== fstAfter.size
       ) {
         return SNAPSHOT_UNREADABLE_SIGNATURE;
       }
       const digest = hasher.digest("hex");
       return [fstAfter.mtimeMs, fstAfter.size, (fstAfter.mode & 0o170000) | (fstAfter.mode & 0o111), digest];
+    }
+    const stPathAfter = _lstatSync(fullPath);
+    if (!stPathAfter.isFile() || !samePathIdentity(st, stPathAfter) || stPathAfter.mtimeMs !== st.mtimeMs || stPathAfter.size !== st.size) {
+      return SNAPSHOT_UNREADABLE_SIGNATURE;
     }
     return [st.mtimeMs, st.size, modeSig];
   } catch {

@@ -67,6 +67,7 @@ function readOwnerFile(lockDir) {
 export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS } = {}) {
   const sharedDir = `${lockDir}.shared`;
   const reclaimDir = `${lockDir}.reclaim`;
+  const flockFile = `${lockDir}.flock`;
   const sharedEntry = join(sharedDir, String(process.pid));
 
   const safeMtimeMs = (p) => {
@@ -75,6 +76,12 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
     } catch {
       return 0;
     }
+  };
+
+  const hasOsFlockSupport = () => {
+    if (process.platform === "win32") return false;
+    const probe = spawnSync("flock", ["--version"], { stdio: "ignore", timeout: 2000 });
+    return !probe.error && probe.status === 0;
   };
 
   const isLiveHolder = () => {
@@ -89,7 +96,47 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
     return isLivePid(pid);
   };
 
+  const reclaimBodyUnderLock = () => {
+    const ownerBefore = readOwnerFile(lockDir);
+    if (!isLiveHolder() && readOwnerFile(lockDir) === ownerBefore) {
+      const trash = `${lockDir}.dead-${process.pid}-${Date.now()}-${++lockOwnerSeq}`;
+      renameSync(lockDir, trash);
+      rmSync(trash, { recursive: true, force: true });
+      return true;
+    }
+    return false;
+  };
+
   const reclaimStaleLock = () => {
+    if (process.platform !== "win32") {
+      const res = spawnSync(
+        "flock",
+        [
+          "-n",
+          flockFile,
+          process.execPath,
+          "-e",
+          [
+            'const fs = require("node:fs");',
+            'const path = require("node:path");',
+            'const lockDir = process.argv[1];',
+            'let raw = null; try { raw = fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim(); } catch {}',
+            'if (raw === null) { try { if (Date.now() - fs.statSync(lockDir).mtimeMs < 1000) process.exit(1); } catch { process.exit(1); } }',
+            'else { const pid = Number.parseInt(raw.split(":")[0], 10); if (pid > 0) { try { process.kill(pid, 0); process.exit(1); } catch (e) { if (e.code === "EPERM") process.exit(1); } } }',
+            'let raw2 = null; try { raw2 = fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim(); } catch {}',
+            'if (raw2 !== raw) process.exit(1);',
+            'const trash = `${lockDir}.dead-${process.pid}-${Date.now()}`;',
+            'fs.renameSync(lockDir, trash);',
+            'fs.rmSync(trash, { recursive: true, force: true });',
+          ].join("\n"),
+          lockDir,
+        ],
+        { stdio: "ignore", timeout: 5000 },
+      );
+      if (!res.error) {
+        return res.status === 0;
+      }
+    }
     try {
       mkdirSync(reclaimDir);
     } catch (err) {
@@ -97,7 +144,7 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
         const rOwner = readOwnerFile(reclaimDir);
         const rPid = rOwner ? Number.parseInt(rOwner.split(":")[0], 10) : Number.NaN;
         const rLive = rPid > 0 ? isLivePid(rPid) : Date.now() - safeMtimeMs(reclaimDir) < 1_000;
-        if (!rLive) {
+        if (!rLive && readOwnerFile(reclaimDir) === rOwner) {
           try {
             const trash = `${reclaimDir}.trash-${process.pid}-${Date.now()}-${++lockOwnerSeq}`;
             renameSync(reclaimDir, trash);
@@ -111,13 +158,7 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
     }
     try {
       writeFileSync(join(reclaimDir, "pid"), `${process.pid}:${++lockOwnerSeq}`);
-      if (!isLiveHolder()) {
-        const trash = `${lockDir}.dead-${process.pid}-${Date.now()}-${++lockOwnerSeq}`;
-        renameSync(lockDir, trash);
-        rmSync(trash, { recursive: true, force: true });
-        return true;
-      }
-      return false;
+      return reclaimBodyUnderLock();
     } catch {
       return false;
     } finally {
@@ -213,12 +254,24 @@ export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS }
     }
   };
 
+  const testReclaimAgainstLiveSwap = () => {
+    reclaimStaleLock();
+    const liveToken = tryTake();
+    if (!liveToken) return false;
+    const second = reclaimStaleLock();
+    const owner = readOwnerFile(lockDir);
+    releaseExclusive(liveToken);
+    return second === false && owner === liveToken;
+  };
+
   return {
     sharedDir,
+    hasOsFlockSupport,
     isLiveHolder,
     tryTake,
     reclaimStaleLock,
     holdReclaimLockForTest,
+    testReclaimAgainstLiveSwap,
     takeShared,
     releaseShared,
     otherSharedHolders,

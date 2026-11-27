@@ -1,7 +1,10 @@
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  fstatSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -100,25 +103,62 @@ function isSessionLockStale(lockPath) {
   return Date.now() - st.mtimeMs > SESSION_LOCK_STALE_MS;
 }
 
-// Reclaimers serialize on a guard file and re-check under it, so a lock recreated after the
-// stale check is never moved away. Only the rename winner deletes the stale file.
-// Returns false when another process holds the guard, so the caller waits instead of spinning.
+// Reclaimers serialize with an OS kernel flock when available (auto-released on crash/SIGKILL),
+// falling back to an inode-verified guard file on non-POSIX hosts.
 function reclaimStaleSessionLock(lockPath) {
+  if (process.platform !== "win32") {
+    const res = spawnSync(
+      "flock",
+      [
+        "-n",
+        `${lockPath}.flock`,
+        process.execPath,
+        "-e",
+        [
+          'const fs = require("node:fs");',
+          'const lockPath = process.argv[1];',
+          'let st; try { st = fs.statSync(lockPath); } catch { process.exit(0); }',
+          'let pid = null; try { pid = JSON.parse(fs.readFileSync(lockPath, "utf8"))?.pid ?? null; } catch {}',
+          'let dead = false;',
+          'if (typeof pid === "number") { try { process.kill(pid, 0); } catch (e) { dead = e?.code === "ESRCH"; } }',
+          `else { dead = Date.now() - st.mtimeMs > ${SESSION_LOCK_STALE_MS}; }`,
+          'if (!dead) process.exit(0);',
+          'try {',
+          '  const st2 = fs.statSync(lockPath);',
+          '  if (st2.dev === st.dev && st2.ino === st.ino) {',
+          '    const stale = `${lockPath}.stale.${process.pid}.${Date.now()}`;',
+          '    fs.renameSync(lockPath, stale);',
+          '    fs.unlinkSync(stale);',
+          '  }',
+          '} catch {}',
+        ].join("\n"),
+        lockPath,
+      ],
+      { stdio: "ignore", timeout: 5000 },
+    );
+    return !res.error && res.status === 0;
+  }
   const guardPath = `${lockPath}.reclaim`;
+  const guardNonce = randomBytes(8).toString("hex");
   let guard;
   try {
     guard = openSync(guardPath, "wx");
   } catch {
-    // shortcut: a reclaimer that dies inside this microsecond section leaves the guard until it ages out, then removal is unguarded; upgrade to pid-checked guards if that crash shows up.
     try {
-      if (Date.now() - statSync(guardPath).mtimeMs > SESSION_LOCK_STALE_MS) {
-        unlinkSync(guardPath);
+      const gst = lstatSync(guardPath);
+      if (Date.now() - gst.mtimeMs > SESSION_LOCK_STALE_MS) {
+        const trash = `${guardPath}.stale.${process.pid}.${randomBytes(4).toString("hex")}`;
+        renameSync(guardPath, trash);
+        unlinkSync(trash);
       }
     } catch {
     }
     return false;
   }
+  let guardFstat = null;
   try {
+    writeSync(guard, JSON.stringify({ pid: process.pid, nonce: guardNonce }));
+    guardFstat = fstatSync(guard);
     if (isSessionLockStale(lockPath)) {
       const stalePath = `${lockPath}.stale.${process.pid}.${randomBytes(4).toString("hex")}`;
       renameSync(lockPath, stalePath);
@@ -128,7 +168,9 @@ function reclaimStaleSessionLock(lockPath) {
   } finally {
     closeSync(guard);
     try {
-      unlinkSync(guardPath);
+      if (guardFstat && lstatSync(guardPath).ino === guardFstat.ino) {
+        unlinkSync(guardPath);
+      }
     } catch {
     }
   }

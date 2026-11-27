@@ -8,7 +8,7 @@ import {
   REGISTER_COPY,
   RISK_REASON_LABELS,
 } from "./constants.mjs";
-import { classifyCommand, extractChainPrepInfo, extractPytestCommandInfo, hasPytestNonExecFlag, normalizeWorkspacePath, readRegularFileBounded, splitShellSegments } from "./fact-ledger.mjs";
+import { classifyCommand, extractChainPrepInfo, extractPytestCommandInfo, hasPytestNonExecFlag, normalizeWorkspacePath, readRegularFileBounded, splitShellSegments, unwrapShellBuiltin } from "./fact-ledger.mjs";
 import { detectHedges } from "./hedge-detector.mjs";
 import { classifyRisk } from "./risk-classifier.mjs";
 
@@ -237,13 +237,14 @@ function extractVerificationEntries(
       }
       continue;
     }
+    const unwrapped = unwrapShellBuiltin(segTokens);
     const nextAllexport = parseSetAllexportUpdate(segTokens);
     if (nextAllexport !== null) {
       allexport = nextAllexport;
       continue;
     }
-    if (segTokens && segTokens.length > 0 && segTokens[0] === "export") {
-      for (const tok of segTokens.slice(1)) {
+    if (unwrapped?.builtin === "export") {
+      for (const tok of unwrapped.args) {
         if (tok === "PYTEST_ADDOPTS") {
           chainEnvPytestExported = true;
           chainEnvPytestAddopts = localPytestAddopts ?? chainEnvPytestAddopts;
@@ -269,26 +270,29 @@ function extractVerificationEntries(
           }
         }
       }
-    } else if (segTokens && segTokens.length > 0 && segTokens[0] === "unset") {
-      if (unsetClearsVar(segTokens.slice(1), "PYTEST_ADDOPTS")) {
+      continue;
+    } else if (unwrapped?.builtin === "unset") {
+      if (unsetClearsVar(unwrapped.args, "PYTEST_ADDOPTS")) {
         chainEnvPytestExported = false;
         chainEnvPytestAddopts = null;
         chainEnvPytestOpaque = false;
         localPytestAddopts = null;
         localPytestOpaque = false;
       }
-      for (const tok of segTokens.slice(1)) {
+      for (const tok of unwrapped.args) {
         if (!tok.startsWith("-") && /^[A-Za-z_][A-Za-z0-9_]*$/.test(tok)) {
           exportedOtherEnv.delete(tok);
           localOtherEnv.delete(tok);
         }
       }
+      continue;
     } else if (segTokens && segTokens.length > 0 && segTokens.every((t) => ENV_ASSIGNMENT_RE.test(t))) {
       for (const tok of segTokens) {
         if (tok.startsWith("PYTEST_ADDOPTS=")) {
           localPytestAddopts = tok.slice("PYTEST_ADDOPTS=".length);
           localPytestOpaque = /[$`]/.test(rawTrimmed);
           if (chainEnvPytestExported || allexport) {
+            chainEnvPytestExported = true;
             chainEnvPytestAddopts = localPytestAddopts;
             chainEnvPytestOpaque = localPytestOpaque;
           }
@@ -309,7 +313,7 @@ function extractVerificationEntries(
     const prepInfo = extractChainPrepInfo(seg);
     if (prepInfo) {
       prepPrefixes.push(`${state.dir}::${prepInfo.sig}`);
-      prepItems.push({ dir: state.dir, dirs: prepInfo.dirs, argv: prepInfo.argv, opaque: prepInfo.opaque });
+      prepItems.push({ dir: state.dir, dirs: prepInfo.dirs, prefixTokens: prepInfo.prefixTokens, argv: prepInfo.argv, opaque: prepInfo.opaque });
       continue;
     }
     if (classifyCommand(norm) === "verification") {
@@ -1594,7 +1598,7 @@ function isVerificationEntryEffective(entry, baseExecCwd, depth = 0) {
       initialEnvPytestAddopts: rawEnv,
       initialEnvPytestOpaque: envOpaque,
       initialEnvPytestExported: rawEnv !== null || envOpaque,
-      initialAllexport: Boolean(entry.allexport),
+      initialAllexport: false,
       initialOtherEnv: entry.otherEnvMap,
       initialOtherEnvOpaque: Boolean(entry.otherEnvOpaque),
     });
@@ -1652,7 +1656,7 @@ function droppedTokenIndexes(failed, passed) {
 
 const PYTEST_DISPLAY_ONLY_SHORT_RE = /^-[vqs]+$/;
 const PYTEST_DISPLAY_ONLY_LONG_RE =
-  /^--(?:verbose|quiet|no-header|no-summary|show-capture=(?:no|stdout|stderr|log|all)|tb=(?:auto|long|short|line|native|no)|color=(?:yes|no|auto)|code-highlight=(?:yes|no)|durations=\d+|durations-min=\d+(?:\.\d+)?)$/;
+  /^--(?:verbose|quiet|no-header|no-summary|show-capture=(?:no|stdout|stderr|log|all)|tb=(?:auto|long|short|line|native|no)|color=(?:yes|no|auto)|code-highlight=(?:yes|no)|durations=\d+)$/;
 
 function isSafeDisplayOnlyPytestToken(tok) {
   return typeof tok === "string" && (PYTEST_DISPLAY_ONLY_SHORT_RE.test(tok) || PYTEST_DISPLAY_ONLY_LONG_RE.test(tok));
@@ -1681,6 +1685,9 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "", { failedEntry = n
   if (!failedMeta || !passedMeta) {
     return false;
   }
+  if (failedEntry?.otherEnvOpaque || passedEntry?.otherEnvOpaque || (failedEntry?.otherEnvKey ?? "") !== (passedEntry?.otherEnvKey ?? "")) {
+    return false;
+  }
   const failedPyInfo = extractPytestCommandInfo(failedSeg);
   const passedPyInfo = extractPytestCommandInfo(passedSeg);
   if (failedPyInfo?.chdirOpaque || passedPyInfo?.chdirOpaque) {
@@ -1691,9 +1698,6 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "", { failedEntry = n
       return false;
     }
     if (failedPyInfo.bin !== passedPyInfo.bin || failedPyInfo.outerContextKey !== passedPyInfo.outerContextKey) {
-      return false;
-    }
-    if (failedEntry?.otherEnvOpaque || passedEntry?.otherEnvOpaque || (failedEntry?.otherEnvKey ?? "") !== (passedEntry?.otherEnvKey ?? "")) {
       return false;
     }
     const expandShell = (info, entry) => {
@@ -1707,7 +1711,7 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "", { failedEntry = n
         initialEnvPytestAddopts: rawEnv,
         initialEnvPytestOpaque: envOpaque,
         initialEnvPytestExported: rawEnv !== null || envOpaque,
-        initialAllexport: Boolean(entry?.allexport),
+        initialAllexport: false,
         initialOtherEnv: entry?.otherEnvMap,
         initialOtherEnvOpaque: Boolean(entry?.otherEnvOpaque),
       });
@@ -1820,25 +1824,19 @@ function resolveEntryExecDir(entryDir, baseCwd) {
   return resolveExecDirStep(baseCwd || ".", entryDir, { preserveSpaces: true });
 }
 
+function strArrayEqual(a, b) {
+  const arrA = Array.isArray(a) ? a : [];
+  const arrB = Array.isArray(b) ? b : [];
+  return arrA.length === arrB.length && arrA.every((v, idx) => v === arrB[idx]);
+}
+
 function prepItemsEqual(failedItems, passedItems) {
-  if (!Array.isArray(failedItems) || failedItems.length === 0) {
-    return true;
-  }
-  if (failedItems.some((p) => p.opaque) || (Array.isArray(passedItems) && passedItems.some((p) => p.opaque))) {
-    return false;
-  }
   if (!Array.isArray(passedItems) || failedItems.length !== passedItems.length) {
     return false;
   }
   return failedItems.every((f, i) => {
     const p = passedItems[i];
-    return (
-      f.dir === p.dir &&
-      f.dirs.length === p.dirs.length &&
-      f.dirs.every((d, j) => d === p.dirs[j]) &&
-      f.argv.length === p.argv.length &&
-      f.argv.every((a, j) => a === p.argv[j])
-    );
+    return f.dir === p.dir && strArrayEqual(f.dirs, p.dirs) && strArrayEqual(f.prefixTokens, p.prefixTokens) && strArrayEqual(f.argv, p.argv);
   });
 }
 
@@ -1846,8 +1844,13 @@ function entriesMatchForResolution(failedEntry, passedEntry, baseCwd = "", depth
   if (failedEntry.dir !== passedEntry.dir) {
     return false;
   }
-  if (Array.isArray(failedEntry.prepItems) && failedEntry.prepItems.length > 0) {
-    if (!prepItemsEqual(failedEntry.prepItems, passedEntry.prepItems)) {
+  const failedPreps = Array.isArray(failedEntry.prepItems) ? failedEntry.prepItems : [];
+  const passedPreps = Array.isArray(passedEntry.prepItems) ? passedEntry.prepItems : [];
+  if (failedPreps.some((p) => p.opaque) || passedPreps.some((p) => p.opaque)) {
+    return false;
+  }
+  if (failedPreps.length > 0) {
+    if (!prepItemsEqual(failedPreps, passedPreps)) {
       return false;
     }
   } else if (failedEntry.prepKey && passedEntry.prepKey !== failedEntry.prepKey) {

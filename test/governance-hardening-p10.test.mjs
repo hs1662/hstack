@@ -7088,17 +7088,19 @@ describe("H23 OMH round-19 regressions (F1-F14)", () => {
   });
 
   it("R19-F8: treats persistent unreadable file signature as changed (fail-closed) in mergeShellWrittenFiles", () => {
-    const repo = makeRepo();
-    if (process.platform === "win32") return;
-    unlinkSync(join(repo, "app.mjs"));
-    execFileSync("mkfifo", [join(repo, "app.mjs")]);
-    const sig = statSnapshotFile(repo, "app.mjs");
-    assert.equal(typeof sig, "string", "unreadable special file must return sentinel string instead of null");
+    withCpuLock(() => {
+      const repo = makeRepo();
+      if (process.platform === "win32") return;
+      unlinkSync(join(repo, "app.mjs"));
+      execFileSync("mkfifo", [join(repo, "app.mjs")]);
+      const sig = statSnapshotFile(repo, "app.mjs");
+      assert.equal(typeof sig, "string", "unreadable special file must return sentinel string instead of null");
 
-    const res = runTurnOnRepo(repo, "p10-r19-f8-unreadable", [
-      { cmd: "echo ok", output: "ok" },
-    ]);
-    assertGateBlocked(res.out);
+      const res = runTurnOnRepo(repo, "p10-r19-f8-unreadable", [
+        { cmd: "echo ok", output: "ok" },
+      ]);
+      assertGateBlocked(res.out);
+    });
   });
 
   it("R19-F9: propagates standalone reassignment to already-exported PYTEST_ADDOPTS within shell chain", () => {
