@@ -160,3 +160,68 @@ test("registered Claude PreToolUse enforces 2-strike retry cap for drifted UI to
   const capped = echo("PreToolUse", { transcript_path: uiPath, tool_name: "AskUserQuestion", tool_input: { questions: [uiCall] } });
   assert.equal(capped.hookSpecificOutput?.permissionDecision, undefined);
 });
+
+test("Claude UserPromptSubmit binds turn-start snapshot for non-mutating and denied shells, and rejects stale turns", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const repo = mkdtempSync(join(tmpdir(), "hstack-claude-snap-"));
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "t@e.com"], { cwd: repo });
+    writeFileSync(join(repo, "app.mjs"), "export const x = 1;\n");
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-q", "-m", "init"], { cwd: repo });
+
+    const trPath = join(dir, "snap-cid.jsonl");
+    const runHook = (event, extra) => JSON.parse(execFileSync(
+      process.execPath,
+      [join(root, "scripts/hooks/claude.mjs"), event],
+      {
+        cwd: repo,
+        env: { ...process.env, CLAUDE_PLUGIN_ROOT: root, CLAUDE_PLUGIN_DATA: dir, PLUGIN_DATA: dir },
+        input: JSON.stringify({ session_id: "snap-cid", transcript_path: trPath, cwd: repo, hook_event_name: event, ...extra }),
+        encoding: "utf8",
+      },
+    ));
+
+    // Turn 1: UserPromptSubmit runs before the first prompt lands in transcript.jsonl.
+    runHook("UserPromptSubmit", { prompt: "상태만 확인해 줘" });
+    writeFileSync(trPath, [
+      { type: "file-history-snapshot", messageId: "p1", snapshot: {} },
+      { type: "user", message: { role: "user", content: "상태만 확인해 줘" } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "ls -la; sed -n 1p app.mjs" } }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "b1", content: "app.mjs" }] } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "b1d", name: "Bash", input: { command: "touch denied.txt" } }] } },
+      { type: "user", toolDenialKind: "hook", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "b1d", is_error: true, content: "denied" }] } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "파일을 확인했고 변경은 없습니다." }] } },
+    ].map(v => JSON.stringify(v)).join("\n") + "\n");
+    assert.deepEqual(runHook("Stop", { stop_hook_active: false }), {});
+
+    // Turn 2: UserPromptSubmit runs while Turn 1 is the latest transcript turn; a shell edit must still block.
+    runHook("UserPromptSubmit", { prompt: "app.mjs를 고쳐 줘" });
+    const turn2 = [
+      ...readFileSync(trPath, "utf8").trim().split("\n").map(JSON.parse),
+      { type: "user", message: { role: "user", content: "app.mjs를 고쳐 줘" } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "b2", name: "Bash", input: { command: "sed -i 's/1/2/' app.mjs" } }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "b2", content: "ok" }] } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "값을 수정했습니다." }] } },
+    ];
+    writeFileSync(join(repo, "app.mjs"), "export const x = 2;\n");
+    writeFileSync(trPath, turn2.map(v => JSON.stringify(v)).join("\n") + "\n");
+    assert.equal(runHook("Stop", { stop_hook_active: false }).decision, "block");
+
+    // Turn 3: A new user turn without a fresh UserPromptSubmit cannot reuse Turn 2's bound snapshot.
+    execFileSync("git", ["checkout", "--", "app.mjs"], { cwd: repo });
+    const turn3 = [
+      ...turn2,
+      { type: "user", message: { role: "user", content: "새 턴에서 확인해 줘" } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "b3", name: "Bash", input: { command: "node -e 'process.exit(0)'" } }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "b3", content: "ok" }] } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "새 턴 확인을 마쳤습니다." }] } },
+    ];
+    writeFileSync(trPath, turn3.map(v => JSON.stringify(v)).join("\n") + "\n");
+    assert.equal(runHook("Stop", { stop_hook_active: false }).decision, "block");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
