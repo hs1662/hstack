@@ -8,8 +8,8 @@ import { describe, it } from "node:test";
 import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
-import { classifyCommand, commandMatchesExpectedTokens, extractChainPrepSignature, inferExecutionFailure, listCommittedPaths, readFactLedger, readGitLedger, readNumstatSinceHead, readSessionRole, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
-import { mergeShellWrittenFiles, resolveSessionStatePath, saveGateSnapshot, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
+import { classifyCommand, commandMatchesExpectedTokens, detectTestInfrastructure, extractChainPrepSignature, extractToolPaths, inferExecutionFailure, listCommittedPaths, readFactLedger, readGitLedger, readNumstatSinceHead, readSessionRole, resolveGitRootFast, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
+import { computeWorkspaceKey, loadHandoffSnapshot, mergeShellWrittenFiles, resolveEffectiveConversationKey, resolveSessionStatePath, saveGateSnapshot, saveHandoffSnapshot, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
 import { classifyRisk } from "../scripts/governance/risk-classifier.mjs";
 import { readTranscriptSteps } from "../scripts/hook-io.mjs";
 import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
@@ -4300,46 +4300,11 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
   });
 
   it("R12-F4: preserves literal backslashes inside double quotes in R3 and R5 per POSIX rules", () => {
-    const repo = makeRepo();
-    const decR3 = decideGate(
-      {
-        modified_files: ["app.mjs"],
-        inspected_files: [],
-        verification_runs: [{ command: 'pytest "tests/test_a.py"', outcome: "pass" }],
-        unverified_scope: [],
-        self_assessment: "테스트 통과.",
-      },
-      {
-        cwd: repo,
-        ledger: {
-          transcriptAvailable: true,
-          sessionRole: "main",
-          turnStartStepIndex: 0,
-          sessionReadFiles: new Set(),
-          turnWrittenFiles: new Set(["app.mjs"]),
-          turnCodeWrittenFiles: new Set(["app.mjs"]),
-          turnCommittedFiles: new Set(),
-          turnInspectedFiles: new Set(),
-          turnFailedCommands: [],
-          turnGateAttempts: [],
-          turnSubagentAudits: [],
-          turnPreflightChallenges: [],
-          turnUserVotes: [],
-          turnExecutions: [
-            { kind: "verification", command: 'pytest "tests/test_\\a.py"', status: "ERROR", passed: false, stepIndex: 1, execCwd: repo },
-            { kind: "verification", command: 'pytest "tests/test_a.py"', status: "DONE", passed: true, stepIndex: 2, execCwd: repo },
-          ],
-          lastWriteStepIndex: 0,
-          lastCodeWriteStepIndex: 0,
-          hasActiveVerification: true,
-          hasFailingTestCommand: false,
-        },
-        testInfra: { hasTestSuite: true },
-        auditEscalation: "off",
-      },
-    );
+    const decR3 = runPytestGate({}, 'pytest "tests/test_\\a.py"', 'pytest "tests/test_a.py"');
     assert.equal(decR3.verdict, "REJECT");
     assert.ok(decR3.blockedRules.includes("R3_CONCEALED_FAILURE"), decR3.blockedRules.join(","));
+
+    const repo = makeRepo();
 
     const trR5 = join(createTempDir("hstack-p10-r12-f4-"), "t.jsonl");
     writeFileSync(
@@ -4606,5 +4571,306 @@ describe("H16 OMH gpt-6.2-astra round-12 regressions (P1 F1-F5, P2 F6-F10)", () 
       config: { sensitivePatterns: ["[^/]+secret/token[\\]x]*\\.txt"] },
     });
     assert.equal(resSafe.tier, "TIER_1");
+  });
+});
+
+describe("H17 OMH gpt-6.2-astra round-13 regressions (P1 F1-F7, P2 F8-F9)", () => {
+  const runPytestWithFiles = (filesMap, failCmd, passCmd) => {
+    const repo = makeRepo();
+    for (const [rel, body] of Object.entries(filesMap)) {
+      writeFileSync(join(repo, rel), body);
+    }
+    const transcriptPath = join(createTempDir("hstack-p10-r13-py-"), "t.jsonl");
+    writeFileSync(
+      transcriptPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 수정" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const v = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: failCmd, Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: passCmd, Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    return decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: passCmd, outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "확인 완료.",
+      },
+      { cwd: repo, ledger: readFactLedger(transcriptPath, repo, gl.gitRoot), gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+  };
+
+  it("R13-F1: classifies POSIX literal backslashes in double quotes as verification in lexVerificationChain while blocking dangerous escapes", () => {
+    assert.equal(classifyCommand('pytest "tests/test_\\a.py"'), "verification");
+    assert.equal(classifyCommand('pytest "tests/test_\\"a.py"'), "other");
+    assert.equal(classifyCommand('pytest "tests/test_\\\\a.py"'), "other");
+    assert.equal(classifyCommand('pytest "tests/test_\\$x.py"'), "other");
+    assert.equal(classifyCommand('pytest "tests/test_\\`id\\`.py"'), "other");
+
+    const decR3 = runPytestWithFiles({}, 'pytest "tests/test_\\a.py"', 'pytest "tests/test_a.py"');
+    assert.equal(decR3.verdict, "REJECT");
+    assert.ok(decR3.blockedRules.includes("R3_CONCEALED_FAILURE"), decR3.blockedRules.join(","));
+  });
+
+  it("R13-F2: checks dotted pytest key paths before skipping multiline TOML strings while allowing unrelated tool multiline strings", () => {
+    const decBad = runPytestWithFiles(
+      {
+        "pyproject.toml": [
+          'tool.pytest.ini_options.testpaths = """',
+          "unit",
+          '"""',
+          "",
+        ].join("\n"),
+      },
+      "pytest integration/test_x.py",
+      "pytest",
+    );
+    assert.equal(decBad.verdict, "REJECT");
+    assert.ok(decBad.blockedRules.includes("R3_CONCEALED_FAILURE"), decBad.blockedRules.join(","));
+
+    const decGood = runPytestWithFiles(
+      {
+        "pyproject.toml": [
+          'tool.ruff.description = """',
+          "multiline ruff description",
+          '"""',
+          "",
+        ].join("\n"),
+      },
+      "pytest tests/test_a.py",
+      "pytest",
+    );
+    assert.equal(decGood.verdict, "PASS", decGood.blockedRules.join(","));
+  });
+
+  it("R13-F3: captures multiline INI addopts continuation lines that contain equals signs", () => {
+    const dec1 = runPytestWithFiles(
+      {
+        "pytest.ini": [
+          "[pytest]",
+          "addopts =",
+          "  --ignore-glob=integration/*",
+          "",
+        ].join("\n"),
+      },
+      "pytest integration/test_x.py",
+      "pytest",
+    );
+    assert.equal(dec1.verdict, "REJECT");
+    assert.ok(dec1.blockedRules.includes("R3_CONCEALED_FAILURE"), dec1.blockedRules.join(","));
+
+    const dec2 = runPytestWithFiles(
+      {
+        "pytest.ini": [
+          "[pytest]",
+          "addopts =",
+          "  -o testpaths=unit",
+          "",
+        ].join("\n"),
+      },
+      "pytest integration/test_x.py",
+      "pytest",
+    );
+    assert.equal(dec2.verdict, "REJECT");
+    assert.ok(dec2.blockedRules.includes("R3_CONCEALED_FAILURE"), dec2.blockedRules.join(","));
+  });
+
+  it("R13-F4: restricts pytest widening short options to a safe allowlist while allowing exact reruns and safe clusters", () => {
+    for (const flag of ["-lcmy.ini", "-lotestpaths=unit", "-abc"]) {
+      const decReject = runPytestWithFiles({}, `pytest ${flag} tests/test_a.py`, `pytest ${flag}`);
+      assert.equal(decReject.verdict, "REJECT", `flag=${flag} must fail closed`);
+      assert.ok(decReject.blockedRules.includes("R3_CONCEALED_FAILURE"), `flag=${flag}`);
+
+      const decSame = runPytestWithFiles({}, `pytest ${flag} tests/test_a.py`, `pytest ${flag} tests/test_a.py`);
+      assert.equal(decSame.verdict, "PASS", `exact rerun with ${flag} must pass`);
+    }
+
+    for (const safeFlag of ["-l", "-vq", "-vx", "-vqsxl"]) {
+      const decSafe = runPytestWithFiles({}, `pytest ${safeFlag} tests/test_a.py`, `pytest ${safeFlag}`);
+      assert.equal(decSafe.verdict, "PASS", `safe flag=${safeFlag}: ${decSafe.blockedRules.join(",")}`);
+    }
+  });
+
+  it("R13-F5: preserves trailing spaces in detectTestInfrastructure so neighbor testless dir never relaxes R2", () => {
+    const parent = createTempDir("p10-r13-f5-");
+    const spacedRepo = join(parent, "repo ");
+    const plainRepo = join(parent, "repo");
+
+    mkdirSync(join(spacedRepo, "test"), { recursive: true });
+    writeFileSync(join(spacedRepo, "package.json"), '{"scripts":{"test":"node --test"}}\n');
+    writeFileSync(join(spacedRepo, "test", "a.test.mjs"), "import 'node:test';\n");
+    writeFileSync(join(spacedRepo, "app.mjs"), "export const a = 1;\n");
+    git(spacedRepo, ["init", "-q"]);
+    git(spacedRepo, ["config", "user.name", "t"]);
+    git(spacedRepo, ["config", "user.email", "t@example.com"]);
+    git(spacedRepo, ["add", "."]);
+    git(spacedRepo, ["commit", "-q", "-m", "init"]);
+
+    mkdirSync(plainRepo, { recursive: true });
+    writeFileSync(join(plainRepo, "app.mjs"), "export const b = 1;\n");
+
+    const infra = detectTestInfrastructure(spacedRepo, spacedRepo);
+    assert.equal(infra.hasTestSuite, true);
+
+    const txPath = join(parent, "tx.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "app.mjs 수정해줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(spacedRepo, "app.mjs"), Content: "export const a = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ]),
+    );
+    const server = createMcpServerHandler({ dataDir: DATA_DIR, register: "neutral" });
+    const gateCall = {
+      name: GATE_TOOL_NAME,
+      args: {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "node --test", outcome: "not_applicable", reason_if_na: "테스트 없음" }],
+        unverified_scope: ["실행 검증 미실시"],
+        self_assessment: "수정 완료.",
+      },
+    };
+    const pre = handlePreToolGate(
+      JSON.stringify({ hookEventName: "PreToolUse", conversationId: "p10-r13-f5-cid", cwd: spacedRepo, transcriptPath: txPath, toolCall: gateCall }),
+      { dataDir: DATA_DIR, skipAuditLog: true },
+    );
+    const out = server({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: { name: "verify_completion", arguments: { ...gateCall.args, ...pre.overwrite } },
+    });
+    const text = out.result.content[0].text;
+    assert.ok(text.includes(VERDICT_HEADERS.REJECT_NEUTRAL), text);
+    assert.ok(text.includes("검증 실행 증빙이 누락"), text);
+  });
+
+  it("R13-F6: separates computeWorkspaceKey, anon session keys, and saved handoffs across trailing-space workspaces", () => {
+    const parent = createTempDir("p10-r13-f6-");
+    const spacedRepo = join(parent, "ws ");
+    const plainRepo = join(parent, "ws");
+    mkdirSync(spacedRepo, { recursive: true });
+    mkdirSync(plainRepo, { recursive: true });
+
+    assert.notEqual(computeWorkspaceKey(spacedRepo), computeWorkspaceKey(plainRepo));
+    assert.notEqual(resolveEffectiveConversationKey("", spacedRepo), resolveEffectiveConversationKey("", plainRepo));
+
+    const dataDir = createTempDir("p10-r13-f6-data-");
+    saveHandoffSnapshot({
+      cwd: spacedRepo,
+      gitRoot: spacedRepo,
+      conversationId: "cid-spaced",
+      dataDir,
+      objective: "공백 있는 저장소 목표",
+      verifiedFacts: ["공백 저장소 팩트"],
+      remainingTasks: ["남은 작업 A"],
+    });
+    saveHandoffSnapshot({
+      cwd: plainRepo,
+      gitRoot: plainRepo,
+      conversationId: "cid-plain",
+      dataDir,
+      objective: "공백 없는 저장소 목표",
+      verifiedFacts: ["공백 없는 팩트"],
+      remainingTasks: ["남은 작업 B"],
+    });
+
+    const loadedSpaced = loadHandoffSnapshot({ cwd: spacedRepo, gitRoot: spacedRepo, dataDir });
+    const loadedPlain = loadHandoffSnapshot({ cwd: plainRepo, gitRoot: plainRepo, dataDir });
+    assert.equal(loadedSpaced.snapshot.objective, "공백 있는 저장소 목표");
+    assert.equal(loadedPlain.snapshot.objective, "공백 없는 저장소 목표");
+  });
+
+  it("R13-F7: preserves trailing spaces in extractToolPaths so read_file matches R1 inspected_files accurately", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "app.mjs "), "export const spaced = true;\n");
+    const txPath = join(createTempDir("p10-r13-f7-"), "t.jsonl");
+    writeFileSync(
+      txPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "공백 파일 확인" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "read_file", args: { Path: join(repo, "app.mjs ") } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const ledger = readFactLedger(txPath, repo, gl.gitRoot);
+    assert.equal(ledger.sessionReadFiles.has("app.mjs "), true);
+    assert.equal(ledger.sessionReadFiles.has("app.mjs"), false);
+
+    const decWrong = decideGate(
+      { modified_files: [], inspected_files: ["app.mjs"], verification_runs: [], unverified_scope: [], self_assessment: "확인" },
+      { cwd: repo, ledger, gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decWrong.verdict, "REJECT");
+    assert.ok(decWrong.blockedRules.includes("R1_UNREAD_INSPECTED"));
+
+    const decRight = decideGate(
+      { modified_files: [], inspected_files: ["app.mjs "], verification_runs: [], unverified_scope: [], self_assessment: "확인" },
+      { cwd: repo, ledger, gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(decRight.verdict, "PASS", decRight.blockedRules.join(","));
+  });
+
+  it("R13-F8: detects post-gate doc revert commit via sinceGate even when net turn diff against baseline is empty", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "README.md"), "# state A\n");
+    git(repo, ["add", "README.md"]);
+    git(repo, ["commit", "-q", "-m", "state A"]);
+
+    const res = runTurnOnRepo(repo, "p10-r13-f8-doc-revert", [
+      {
+        cmd: "echo B > README.md && git commit -am state-B",
+        output: "ok",
+        effect: (r) => {
+          writeFileSync(join(r, "README.md"), "# state B\n");
+          git(r, ["commit", "-qam", "state-B"]);
+        },
+      },
+      {
+        gate: {
+          modified_files: ["README.md"],
+          inspected_files: [],
+          verification_runs: [],
+          unverified_scope: [],
+          self_assessment: "문서 B 변경 검증.",
+        },
+      },
+      {
+        cmd: "echo A > README.md && git commit -am revert-A",
+        output: "ok",
+        effect: (r) => {
+          writeFileSync(join(r, "README.md"), "# state A\n");
+          git(r, ["commit", "-qam", "revert-A"]);
+        },
+      },
+    ]);
+    assert.equal(res.verdicts[0], VERDICT_HEADERS.PASS, res.verdicts[0]);
+    assertGateBlocked(res.out);
+  });
+
+  it("R13-F9: strips only one trailing line ending in readGitLedger so gitRoot ending with newline is preserved", () => {
+    const parent = createTempDir("p10-r13-f9-");
+    const nlRepo = join(parent, "repo\n");
+    mkdirSync(nlRepo, { recursive: true });
+    writeFileSync(join(nlRepo, "app.mjs"), "export const x = 1;\n");
+    git(nlRepo, ["init", "-q"]);
+    git(nlRepo, ["config", "user.name", "t"]);
+    git(nlRepo, ["config", "user.email", "t@example.com"]);
+    git(nlRepo, ["add", "."]);
+    git(nlRepo, ["commit", "-q", "-m", "init"]);
+
+    const fastRoot = resolveGitRootFast(nlRepo);
+    const gl = readGitLedger(nlRepo);
+    assert.equal(gl.gitAvailable, true);
+    assert.equal(gl.gitRoot, fastRoot);
   });
 });
