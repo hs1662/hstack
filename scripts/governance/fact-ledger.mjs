@@ -256,7 +256,7 @@ const VERDICT_HEADER_ENTRIES = [
   [VERDICT_HEADERS.SKIPPED_NO_SESSION, "SKIPPED_NO_SESSION"],
 ];
 
-const TEST_INFRA_EXACT_FILES = ["pytest.ini", ".pytest.ini", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile"];
+const TEST_INFRA_EXACT_FILES = ["pytest.toml", ".pytest.toml", "pytest.ini", ".pytest.ini", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile"];
 const TEST_INFRA_CONFIG_PREFIXES = ["vitest.config.", "jest.config."];
 
 function toPosix(rawPath) {
@@ -3551,12 +3551,32 @@ function scanTestInfraDir(dir, indicators) {
   }
 }
 
+function addAncestorDirs(roots, dir, stopRoot = "") {
+  if (typeof dir !== "string" || dir.trim().length === 0) {
+    return;
+  }
+  let cur = resolve(dir);
+  const stop = typeof stopRoot === "string" && stopRoot.trim().length > 0 ? resolve(stopRoot) : "";
+  for (let depth = 0; depth < 32; depth += 1) {
+    roots.add(cur);
+    if (stop && cur === stop) {
+      break;
+    }
+    const parent = dirname(cur);
+    if (parent === cur) {
+      break;
+    }
+    cur = parent;
+    if (!stop) {
+      break;
+    }
+  }
+}
+
 export function detectTestInfrastructure(cwd, gitRoot = null) {
   const indicators = new Set();
   const roots = new Set();
-  if (typeof cwd === "string" && cwd.trim().length > 0) {
-    roots.add(cwd);
-  }
+  addAncestorDirs(roots, cwd, gitRoot);
   if (typeof gitRoot === "string" && gitRoot.trim().length > 0) {
     roots.add(gitRoot);
   }

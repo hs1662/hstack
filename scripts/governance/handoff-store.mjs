@@ -611,19 +611,36 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
 
   const postGateHandledDocs = new Set();
-  if (postGateShell.length > 0 && activeGate && sinceGate.size > 0) {
+  if (postGateShell.length > 0 && activeGate) {
     if (!(ledger.turnCommittedFiles instanceof Set)) {
       ledger.turnCommittedFiles = new Set();
     }
-    for (const relPath of sinceGate) {
-      ledger.turnCommittedFiles.add(relPath);
+    const gateDocCandidates = new Set(sinceGate);
+    for (const relPath of Object.keys(current.docFiles ?? {})) {
+      gateDocCandidates.add(relPath);
+    }
+    for (const relPath of Object.keys(activeGate.docFiles ?? {})) {
+      gateDocCandidates.add(relPath);
+    }
+    for (const relPath of dirtyFiles) {
+      if (isExemptDocOrAssetPath(relPath)) {
+        gateDocCandidates.add(relPath);
+      }
+    }
+    for (const relPath of gateDocCandidates) {
+      const inSinceGate = sinceGate.has(relPath);
+      if (inSinceGate) {
+        ledger.turnCommittedFiles.add(relPath);
+      }
       if (!isExemptDocOrAssetPath(relPath)) {
         continue;
       }
       const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
       const gateDoc = activeGate?.docFiles?.[relPath];
       const hasDefinitePostGateDocChange =
-        gateDoc !== undefined ? !sameFileSignature(gateDoc, nowDoc) : true;
+        gateDoc !== undefined
+          ? !sameFileSignature(gateDoc, nowDoc)
+          : inSinceGate || (!activeGate.docFilesTruncated && nowDoc !== undefined);
       if (hasDefinitePostGateDocChange) {
         ledger.turnWrittenFiles.add(relPath);
         ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
