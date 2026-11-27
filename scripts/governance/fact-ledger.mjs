@@ -812,13 +812,32 @@ function lexVerificationChain(line) {
   for (let i = 0; i < line.length; i += 1) {
     const ch = line[i];
     if (ch === "'" || ch === '"') {
-      const endQuote = line.indexOf(ch, i + 1);
-      const inner = endQuote === -1 ? null : line.slice(i + 1, endQuote);
-      if (inner === null || (ch === '"' && /[$`\\]/.test(inner))) {
+      let inner = "";
+      let closed = false;
+      for (let j = i + 1; j < line.length; j += 1) {
+        const innerCh = line[j];
+        if (ch === '"' && (innerCh === "$" || innerCh === "`")) {
+          return null;
+        }
+        if (ch === '"' && innerCh === "\\") {
+          const nextCh = j + 1 < line.length ? line[j + 1] : "";
+          if (!nextCh || nextCh === '"' || nextCh === "\\" || nextCh === "$" || nextCh === "`" || nextCh === "\n") {
+            return null;
+          }
+          inner += innerCh;
+          continue;
+        }
+        if (innerCh === ch) {
+          word = (word ?? "") + inner;
+          i = j;
+          closed = true;
+          break;
+        }
+        inner += innerCh;
+      }
+      if (!closed) {
         return null;
       }
-      word = (word ?? "") + inner;
-      i = endQuote;
     } else if (ch === " " || ch === "\t") {
       flush();
     } else if (ch === ">" || (word === null && /[12]/.test(ch) && line[i + 1] === ">")) {
@@ -1684,23 +1703,23 @@ export function extractToolPaths(call, cwd = "", gitRoot = "") {
   };
 
   if (READ_TOOL_NAMES.has(name)) {
-    const raw = pickString(args, ["Path", "path", "AbsolutePath", "absolute_path", "file_path"]);
+    const raw = pickRawPathString(args, ["Path", "path", "AbsolutePath", "absolute_path", "file_path"]);
     pushNorm(readPaths, raw);
   } else if (name === "mcp_agy-fast_fast_apply_edits" || name === "mcp_agy-fast_apply_edits") {
-    const baseCwd = pickString(args, ["cwd"]) || cwd;
+    const baseCwd = pickRawPathString(args, ["cwd"]) || cwd;
     for (const rawEdit of asArray(args.edits) ?? []) {
       const edit = asObject(rawEdit);
       if (!edit) {
         continue;
       }
-      const raw = pickString(edit, ["path", "Path"]);
+      const raw = pickRawPathString(edit, ["path", "Path"]);
       pushNorm(writePaths, raw, baseCwd);
       if (edit.create !== undefined) {
         pushNorm(readPaths, raw, baseCwd);
       }
     }
   } else if (WRITE_TOOL_NAMES.has(name)) {
-    const raw = pickString(args, ["Path", "path", "TargetFile", "target_file", "AbsolutePath", "absolute_path"]);
+    const raw = pickRawPathString(args, ["Path", "path", "TargetFile", "target_file", "AbsolutePath", "absolute_path"]);
     pushNorm(writePaths, raw);
     if (CREATE_AS_READ_TOOL_NAMES.has(name)) {
       pushNorm(readPaths, raw);
@@ -3349,7 +3368,7 @@ export function readGitLedger(cwd) {
       timeout: remainingTimeout(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-    }).replace(/[\r\n]+$/, "");
+    }).replace(/\r?\n$/, "");
     if (!gitRoot) {
       return empty;
     }
@@ -3518,10 +3537,10 @@ export function detectTestInfrastructure(cwd, gitRoot = null) {
   const indicators = new Set();
   const roots = new Set();
   if (typeof cwd === "string" && cwd.trim().length > 0) {
-    roots.add(cwd.trim());
+    roots.add(cwd);
   }
   if (typeof gitRoot === "string" && gitRoot.trim().length > 0) {
-    roots.add(gitRoot.trim());
+    roots.add(gitRoot);
   }
   for (const root of roots) {
     scanTestInfraDir(root, indicators);

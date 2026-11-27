@@ -367,7 +367,7 @@ function parseIniTestpaths(text, targetSections) {
           if (!nextTrimmed || nextTrimmed.startsWith("#") || nextTrimmed.startsWith(";")) {
             continue;
           }
-          if (/^[ \t]+/.test(nextLine) && !nextTrimmed.startsWith("[") && !nextTrimmed.includes("=")) {
+          if (/^[ \t]+/.test(nextLine) && !nextTrimmed.startsWith("[")) {
             rawAddopts += ` ${nextTrimmed.replace(/\s+[#;].*$/, "").trim()}`;
             i = j;
           } else {
@@ -375,7 +375,7 @@ function parseIniTestpaths(text, targetSections) {
           }
         }
         const addoptsTokens = splitQuotedWhitespace(rawAddopts);
-        if (!addoptsTokens || addoptsTokens.some((tok) => !tok.startsWith("-") || /^(?:-[kmp]|--ignore|--deselect|-c|-o)/.test(tok) || isPytestDiscoveryOverrideToken(tok))) {
+        if (!addoptsTokens || addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
           hasCollectionOverride = true;
         }
       }
@@ -584,19 +584,19 @@ function parsePytestPyprojectToml(text) {
     const wasInMultiline = inMultilineQuote !== null;
     inMultilineQuote = nextMultiline;
     const t = codeOnly.trim();
-    if (wasInMultiline || nextMultiline !== null) {
+    if (wasInMultiline) {
       if (inIniOptions && sawTriple) {
         return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
       }
       continue;
     }
-    if (inIniOptions && sawTriple) {
+    if (inIniOptions && (sawTriple || nextMultiline !== null)) {
       return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
     }
     if (!t) {
       continue;
     }
-    if (iniBracketDepth === 0 && t.startsWith("[")) {
+    if (nextMultiline === null && iniBracketDepth === 0 && t.startsWith("[")) {
       const closeIdx = t.startsWith("[[") ? t.indexOf("]]") : t.indexOf("]");
       if (closeIdx === -1) {
         return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
@@ -626,7 +626,7 @@ function parsePytestPyprojectToml(text) {
       }
       continue;
     }
-    if (inIniOptions) {
+    if (nextMultiline === null && inIniOptions) {
       iniLines.push(codeOnly);
       iniBracketDepth = Math.max(0, iniBracketDepth + bracketDepthDelta);
     }
@@ -648,7 +648,7 @@ function parsePytestPyprojectToml(text) {
           currentTable[1] === "pytest" &&
           currentTable[2] === "ini_options" &&
           keySegs.length === 1;
-        if (!isDirectIniOption) {
+        if (!isDirectIniOption || nextMultiline !== null) {
           return { failClosed: true, iniSectionBody: null, hasCollectionOverride: true };
         }
         const optKey = keySegs[0];
@@ -658,7 +658,7 @@ function parsePytestPyprojectToml(text) {
           const rhs = t.slice(eqPos + 1).trim();
           const dec = decodeTomlStringToken(rhs, 0);
           const addoptsTokens = dec ? splitQuotedWhitespace(dec.value) : null;
-          if (!addoptsTokens || addoptsTokens.some((tok) => !tok.startsWith("-") || /^(?:-[kmp]|--ignore|--deselect|-c|-o)/.test(tok) || isPytestDiscoveryOverrideToken(tok))) {
+          if (!addoptsTokens || addoptsTokens.some((tok) => isPytestAddoptsUnsafeToken(tok))) {
             hasCollectionOverride = true;
           }
         }
@@ -886,11 +886,28 @@ function runnerPrefixLength(tokens) {
   return prefix ? { kind: "all", prefix, end: start + prefix.length } : null;
 }
 
-const PYTEST_DISCOVERY_OVERRIDE_FLAG_RE =
-  /^(?:--config-file|--config|--override-ini|--rootdir|--confcutdir|--pyargs|--noconftest|--import-mode|--ignore|--ignore-glob|--deselect)(?:=|$)|^-(?:[vqsx]*[cop]|k=|m=)|^-[cop]/;
+const PYTEST_DISCOVERY_OVERRIDE_LONG_RE =
+  /^--(?:config-file|config|override-ini|rootdir|confcutdir|pyargs|noconftest|import-mode|ignore|ignore-glob|deselect|collect-only|co|continue-on-collection-errors|doctest-modules|doctest-glob|doctest-ignore-import-errors)(?:=|$)/;
+const PYTEST_SAFE_SHORT_FLAG_CLUSTER_RE = /^-[vqsxl]+$/;
+const PYTEST_ADDOPTS_DISALLOWED_LONG_RE = /^--(?:k|m|p|lf|ff|nf|sw|stepwise|last-failed|failed-first|new-first|markers|fixtures)(?:=|$)/;
 
 function isPytestDiscoveryOverrideToken(tok) {
-  return PYTEST_DISCOVERY_OVERRIDE_FLAG_RE.test(tok);
+  if (typeof tok !== "string" || !tok.startsWith("-")) {
+    return false;
+  }
+  if (tok.startsWith("--")) {
+    return PYTEST_DISCOVERY_OVERRIDE_LONG_RE.test(tok);
+  }
+  return !PYTEST_SAFE_SHORT_FLAG_CLUSTER_RE.test(tok);
+}
+
+function isPytestAddoptsUnsafeToken(tok) {
+  return (
+    typeof tok !== "string" ||
+    !tok.startsWith("-") ||
+    isPytestDiscoveryOverrideToken(tok) ||
+    PYTEST_ADDOPTS_DISALLOWED_LONG_RE.test(tok)
+  );
 }
 
 function droppedTokenIndexes(failed, passed) {

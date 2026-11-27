@@ -265,7 +265,7 @@ export function isExemptDocOrAssetPath(relPath) {
   if (typeof relPath !== "string" || relPath.trim().length === 0) {
     return false;
   }
-  const normalized = relPath.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  const normalized = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
   if (normalized === "docs" || normalized.startsWith("docs/")) {
     return true;
   }

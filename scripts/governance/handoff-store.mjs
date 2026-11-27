@@ -46,9 +46,9 @@ function safeRealpath(rawPath) {
     return "";
   }
   try {
-    return realpathSync(rawPath.trim());
+    return realpathSync(rawPath);
   } catch {
-    return resolve(rawPath.trim());
+    return resolve(rawPath);
   }
 }
 
@@ -610,6 +610,30 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
   const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
 
+  const postGateHandledDocs = new Set();
+  if (postGateShell.length > 0 && activeGate && sinceGate.size > 0) {
+    if (!(ledger.turnCommittedFiles instanceof Set)) {
+      ledger.turnCommittedFiles = new Set();
+    }
+    for (const relPath of sinceGate) {
+      ledger.turnCommittedFiles.add(relPath);
+      if (!isExemptDocOrAssetPath(relPath)) {
+        continue;
+      }
+      const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
+      const gateDoc = activeGate?.docFiles?.[relPath];
+      const hasDefinitePostGateDocChange =
+        gateDoc !== undefined
+          ? !sameFileSignature(gateDoc, nowDoc)
+          : !activeGate?.docFilesTruncated && nowDoc !== undefined;
+      if (hasDefinitePostGateDocChange) {
+        ledger.turnWrittenFiles.add(relPath);
+        ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+        postGateHandledDocs.add(relPath);
+      }
+    }
+  }
+
   if (sinceTurn.size > 0) {
     if (!(ledger.turnCommittedFiles instanceof Set)) {
       ledger.turnCommittedFiles = new Set();
@@ -617,20 +641,11 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     for (const relPath of sinceTurn) {
       ledger.turnCommittedFiles.add(relPath);
       if (isExemptDocOrAssetPath(relPath)) {
-        const beforeDoc = baseline.docFiles?.[relPath];
-        const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
-        const inGateRange = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
-        const gateDoc = activeGate?.docFiles?.[relPath];
-        const hasDefinitePostGateDocChange =
-          inGateRange &&
-          (gateDoc !== undefined
-            ? !sameFileSignature(gateDoc, nowDoc)
-            : !activeGate?.docFilesTruncated && nowDoc !== undefined);
-        if (hasDefinitePostGateDocChange) {
-          ledger.turnWrittenFiles.add(relPath);
-          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+        if (postGateHandledDocs.has(relPath)) {
           continue;
         }
+        const beforeDoc = baseline.docFiles?.[relPath];
+        const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
         if (beforeDoc === undefined && baseline.docFilesTruncated) {
           continue;
         }

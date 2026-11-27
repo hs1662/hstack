@@ -4750,7 +4750,7 @@ describe("H17 OMH gpt-6.2-astra round-13 regressions (P1 F1-F7, P2 F8-F9)", () =
     });
     const text = out.result.content[0].text;
     assert.ok(text.includes(VERDICT_HEADERS.REJECT_NEUTRAL), text);
-    assert.ok(text.includes("검증 실행 증빙이 누락"), text);
+    assert.ok(text.includes("실행된 검증 명령 기록이 없습니다"), text);
   });
 
   it("R13-F6: separates computeWorkspaceKey, anon session keys, and saved handoffs across trailing-space workspaces", () => {
@@ -4766,25 +4766,29 @@ describe("H17 OMH gpt-6.2-astra round-13 regressions (P1 F1-F7, P2 F8-F9)", () =
     const dataDir = createTempDir("p10-r13-f6-data-");
     saveHandoffSnapshot({
       cwd: spacedRepo,
-      gitRoot: spacedRepo,
+      gitLedger: { gitRoot: spacedRepo },
       conversationId: "cid-spaced",
       dataDir,
-      objective: "공백 있는 저장소 목표",
-      verifiedFacts: ["공백 저장소 팩트"],
-      remainingTasks: ["남은 작업 A"],
+      input: {
+        objective: "공백 있는 저장소 목표",
+        verified_facts: ["공백 저장소 팩트"],
+        remaining_tasks: ["남은 작업 A"],
+      },
     });
     saveHandoffSnapshot({
       cwd: plainRepo,
-      gitRoot: plainRepo,
+      gitLedger: { gitRoot: plainRepo },
       conversationId: "cid-plain",
       dataDir,
-      objective: "공백 없는 저장소 목표",
-      verifiedFacts: ["공백 없는 팩트"],
-      remainingTasks: ["남은 작업 B"],
+      input: {
+        objective: "공백 없는 저장소 목표",
+        verified_facts: ["공백 없는 팩트"],
+        remaining_tasks: ["남은 작업 B"],
+      },
     });
 
-    const loadedSpaced = loadHandoffSnapshot({ cwd: spacedRepo, gitRoot: spacedRepo, dataDir });
-    const loadedPlain = loadHandoffSnapshot({ cwd: plainRepo, gitRoot: plainRepo, dataDir });
+    const loadedSpaced = loadHandoffSnapshot({ cwd: spacedRepo, gitLedger: { gitRoot: spacedRepo }, dataDir });
+    const loadedPlain = loadHandoffSnapshot({ cwd: plainRepo, gitLedger: { gitRoot: plainRepo }, dataDir });
     assert.equal(loadedSpaced.snapshot.objective, "공백 있는 저장소 목표");
     assert.equal(loadedPlain.snapshot.objective, "공백 없는 저장소 목표");
   });
