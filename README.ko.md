@@ -2,9 +2,9 @@
 
 [English](README.md)
 
-`hstack` (v0.1.2)는 외부 npm 의존성이 없는 순수 Node.js 18+ ESM 기반 Antigravity CLI 통합 거버넌스 플러그인입니다. 하나의 플러그인 안에 한국어 모국어 사고·UI·응답 가드, 표결 우회 차단을 포함한 결정론적 증거 기반 완료 게이트, 위험도 기반 읽기 전용 독립 감사관, 팩트 증류 핸드오프, 명령어 없는 완전 자율 거버넌스(`smart` 모드)를 통합합니다.
+`hstack` (v0.2.0)는 외부 npm 의존성이 없는 순수 Node.js 18+ ESM 기반 거버넌스 플러그인으로, Antigravity CLI(`agy`)와 Claude Code를 함께 지원합니다. 하나의 플러그인 안에 한국어 모국어 사고·UI·응답 가드, 표결 우회 차단을 포함한 결정론적 증거 기반 완료 게이트, 위험도 기반 읽기 전용 독립 감사관, 팩트 증류 핸드오프, 명령어 없는 완전 자율 거버넌스(`smart` 모드)를 통합합니다. 호스트별 로드 방식은 [이중 호스트 지원 (v0.2.0)](#이중-호스트-지원-v020)을 보세요.
 
-## 번들 구성요소 (v0.1.2)
+## 번들 구성요소 (Agy 매니페스트)
 
 | 구성요소 | 개수 | 상세 |
 | --- | :---: | --- |
@@ -27,7 +27,7 @@
 
 ### Layer 2: 결정론적 증거 기반 완료 게이트
 
-- 즉시 로드 MCP 서버(`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.1.2"`)가 `mcp_hstack_gate_verify_completion` (`verify_completion`) 도구를 노출합니다.
+- 즉시 로드 MCP 서버(`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.2.0"`)가 `mcp_hstack_gate_verify_completion` (`verify_completion`) 도구를 노출합니다.
 - `PreToolUse` (`scripts/pre-tool-gate.mjs`)가 `^mcp_hstack_.*$` 호출을 가로채 `decision: "auto_approve"`를 반환하고, 한국어 `toolSummary`와 은닉 `_session` 정보(`conversationId`, `transcriptPath`, `cwd`)를 주입합니다.
 - `scripts/governance/fact-ledger.mjs`와 `scripts/governance/decide-gate.mjs`는 보고된 `modified_files`, `inspected_files`, `verification_runs`, `unverified_scope`, `self_assessment`를 트랜스크립트 열람·수정·실행·사전검토·표결 원장과 Git 작업 트리(`git status --porcelain`, `git diff --numstat`)에 결정론적으로 대조합니다. `PreToolUse` `deny`로 거부된 쓰기 호출이나 `ERROR`·`FAILED`로 실패한 쓰기 호출은 `turnWrittenFiles`, `turnCodeWrittenFiles`, `fileEditCounts`에 편입하지 않습니다.
 - `run_command`뿐 아니라 `mcp_agy-fast_fast_run_checks`(검증 실행)와 `mcp_agy-fast_fast_apply_edits`·`mcp_agy-fast_apply_edits`(파일 수정) 같은 외부 MCP 도구도 원장에서 직접 인식합니다.
@@ -60,6 +60,131 @@
 - 팩트 증류 컨텍스트 핸드오프(`skills/hstack-handoff/SKILL.md`, `agents/hstack-worker.md`, `scripts/governance/handoff-store.mjs`):
 	- 즉시 로드 MCP 도구 `mcp_hstack_gate_manage_handoff` (`manage_handoff`)가 작업 공간 키(`computeWorkspaceKey`) 단위로 `save`, `load`, `list`를 지원합니다. 증류된 팩트(`objective`, `verified_facts`, `failed_approaches`, `remaining_tasks`, `open_risks`)와 기계 근거(Git 브랜치·HEAD·변경 파일, 열람·수정 파일, 검증 기록)를 결합해 저장하고, 불러올 때 작업 트리 변동이 있으면 `[작업 트리 변동 감지]` 경고를 표시합니다.
 	- 컨텍스트 오염 추적(`scripts/post-invocation.mjs`의 `updateSessionPollutionState`)은 `inputTokens`, 턴 내 실패 실행 횟수, 단일 파일 반복 수정 횟수를 감시해 임계치 초과 시 완료 검증 영수증에 `[컨텍스트 열화 주의]` 안내를 덧붙입니다.
+
+## 이중 호스트 지원 (v0.2.0)
+
+하나의 트리에 매니페스트 두 벌이 있습니다. Agy는 `plugin.json`, `hooks.json`, `mcp_config.json`을 읽습니다. Claude Code는 `.claude-plugin/plugin.json`을 읽고, 이 매니페스트가 `./.claude-plugin/hooks.json`, `./.claude-plugin/mcp.json`, `./.claude-plugin/agents/`의 에이전트 파일을 명시적으로 참조합니다. 경로를 명시하면 Agy가 Claude 기본 위치인 `.mcp.json`과 `hooks/hooks.json`을 경고하지 않습니다. 위 섹션 중 Agy 도구 이름(`invoke_subagent`, `PostInvocation`, `agy -p`)이 나오는 부분은 Agy 전용입니다.
+
+### Claude Code에서 불러오기와 검증
+
+```sh
+claude plugin validate --strict --json .
+claude --plugin-dir /path/to/hstack
+```
+
+`--plugin-dir <path>`는 디렉터리나 `.zip`에서 플러그인을 그 세션에만 불러오며, 여러 번 쓸 수 있습니다(`--plugin-dir A --plugin-dir B.zip`). 설치는 하지 않습니다. 세션 안에서 `/mcp`를 실행해 `gate` 서버가 연결됐는지 확인하세요.
+
+### Claude 훅
+
+`./.claude-plugin/hooks.json`은 네 가지 이벤트를 `scripts/hooks/claude.mjs`로 보냅니다.
+
+| Claude 이벤트 | hstack 동작 |
+| --- | --- |
+| `SessionStart` | `rules/AGENTS.md`를 세션 문맥에 넣습니다. Agy의 상시 규칙 파일에 해당합니다. |
+| `UserPromptSubmit` | 프롬프트 라우터(Agy `PreInvocation`)를 실행하고 알림이 있으면 문맥에 넣습니다. |
+| `PreToolUse` | `Bash`, `PowerShell`, `Edit`, `Write`, `NotebookEdit`, `Agent`, `Task`, `TodoWrite`, `TaskCreate`, `TaskUpdate`, `AskUserQuestion`과 게이트 도구 두 개를 대상으로 합니다. 영어 UI 라벨과 게이트에 걸린 편집은 한국어 사유로 거부하고, 하위 에이전트 프롬프트에 역할 표식을 넣고, 게이트 호출에 `_hstackContext`를 붙입니다. |
+| `Stop` | 완료 게이트와 턴 종료 분석(Agy `PostInvocation`)을 실행합니다. 게이트에 걸리면 한국어 사유로 막고, 분석 알림은 `systemMessage` 하나로 전달합니다. `stop_hook_active`가 켜져 있으면 아무것도 반환하지 않아 연달아 두 번 막지 않습니다. |
+
+네이티브 도구는 게이트가 이미 아는 Agy 이름으로 바뀝니다. `Edit`, `Write`, `NotebookEdit`은 편집, `Bash`와 `PowerShell`은 `run_command`, `Agent`와 `Task`는 `invoke_subagent`, `TodoWrite`, `TaskCreate`, `TaskUpdate`, `AskUserQuestion`은 UI 도구가 됩니다. `Read`에는 훅이 없어서 트랜스크립트로만 확인합니다.
+
+### 네임스페이스 MCP와 `_hstackContext`
+
+`./.claude-plugin/mcp.json`은 `gate`를 `HSTACK_HOST=claude`, `CLAUDE_PLUGIN_DATA`와 함께 실행합니다. Claude Code는 플러그인 서버를 `plugin:<plugin>:<server>`로 묶기 때문에 도구는 `mcp__plugin_hstack_gate__verify_completion`, `mcp__plugin_hstack_gate__manage_handoff`로 보입니다. 즉시 로드(eager)되지는 않습니다.
+
+Claude Code에서는 `_session`이 도구 호출에 실리지 않습니다. `PreToolUse`는 호출자가 넣은 `_session`이나 `_hstackContext`를 버리고, 새로 만든 일회용 무작위 참조 `_hstackContext`를 붙입니다. 서버는 이 참조를 딱 한 번만 교환합니다. 발급받은 도구와 일치해야 하고, 120초 이내여야 하며, 플러그인 데이터 디렉터리 아래 소유자 전용 디렉터리에 있어야 합니다. 참조가 없거나 재사용됐거나 만료됐거나 위조됐으면 세션 없이 실행하지 않고 한국어 오류로 호출을 실패시킵니다. 훅이 호출을 자동 승인하지 않으므로 Claude의 기본 권한 규칙은 그대로 적용됩니다.
+
+### 호스트 기능 계약
+
+`scripts/host/host-adapter.mjs`는 호스트 ID `antigravity`, `claude-code`, `unknown`에 대해 `getHostCapabilities(host)`를 내보냅니다. `detectHost()`는 `HSTACK_HOST`를 먼저 보고, 그다음 Claude나 Agy 플러그인 환경 변수로 하나를 고릅니다. 결과에는 정확히 다음 키만 있습니다.
+
+| 키 | `antigravity` | `claude-code` | `unknown` |
+| --- | :---: | :---: | :---: |
+| `host` | `"antigravity"` | `"claude-code"` | `"unknown"` |
+| `spawn` | `true` | `true` | `false` |
+| `readOnlySubagent` | `true` | `true` | `false` |
+| `isolatedWrite` | `false` | `false` | `false` |
+| `cancel` | `false` | `false` | `false` |
+| `resume` | `false` | `false` | `false` |
+| `usageTelemetry` | `null` | `null` | `null` |
+
+이 값은 패키지의 기능이지 특정 세션에서 받은 권한이 아닙니다.
+
+- `readOnlySubagent`는 읽기 전용 검토 에이전트를 제공한다는 뜻입니다. Claude에서는 검토 도구를 `Read`, `Glob`, `Grep`으로 제한하고 작업자에게는 `Edit`, `Write`, `Bash`도 제공합니다. Agy에서는 역할 지시문과 `PreToolUse` 훅으로 검토 역할의 관리 대상 파일 쓰기와 명령 실행을 차단합니다.
+- 따로 지시받은 작업자는 파일 시스템 샌드박스가 아니므로 `isolatedWrite`는 `false`입니다.
+- `cancel`과 `resume`은 모든 호스트에서 `false`, `usageTelemetry`는 `null`입니다. hstack은 이 기능을 내세우지 않으며 세션 ID로 추정하지도 않습니다.
+
+### 핸드오프 보존 지정과 정리
+
+`manage_handoff`는 `save`, `load`, `list`를 유지하고 `pin`, `unpin`, `list_pinned`, `clear`를 추가합니다. 같은 API가 `scripts/governance/handoff-store.mjs`에도 있습니다.
+
+- `save`는 선택 인자 `pin_owner`를 받아 새 스냅샷을 같은 호출에서 보존 지정합니다. 반드시 남겨야 한다면 먼저 저장하고 나중에 지정하지 마세요.
+- `pin`과 `unpin`에는 구체적인 `snapshot_id`와 `pin_owner`가 필요합니다. 두 동작 모두 그 소유자의 등록 상태가 바뀌었는지 알려 줍니다. 소유자가 하나라도 남아 있으면 스냅샷은 보존됩니다.
+- `list_pinned`는 고정된 ID와 소유자 목록을 텍스트로 보여 줍니다. JavaScript API `listPinnedSnapshots`의 반환값은 정렬된 `{ snapshotId, pinOwners }` 배열입니다.
+- `clear`는 핀이 없는 스냅샷을 몇 개 삭제했는지 알려 줍니다. JavaScript API `clearHandoffSnapshots`의 반환값은 `{ workspaceKey, clearedCount }`입니다. 현재 스냅샷이 고정돼 있으면 남기고, 고정돼 있지 않으면 포인터도 지웁니다. 다른 스냅샷을 승격하지 않으며 `snapshot_id`는 받지 않습니다.
+- `pin_owner`는 `save`, `pin`, `unpin`에서만 쓸 수 있습니다. 소유자는 대소문자를 구분하는 1~128자 문자열로, ASCII 영문자나 숫자로 시작하고 ASCII 영문자, 숫자, `.`, `_`, `:`, `-`만 쓸 수 있습니다(예: `canary:run-42`). 인증 수단이 아니라 보존용 라벨입니다.
+- 보존 정책은 미지정 스냅샷 20개와 지정된 스냅샷 전부를 남깁니다. 마지막 소유자가 해제하면 그 스냅샷에는 바로 일반 보존 정책이 적용됩니다.
+- `load`는 여전히 읽기 전용 별칭 `latest`를 받으며, `pins`를 스냅샷으로 불러오지 않습니다.
+- 보존 메타데이터가 손상됐거나 읽을 수 없으면 변경 작업이 중단됩니다. 빈 집합으로 취급하지 않습니다.
+- 작업들은 워크스페이스 프로세스 간 락을 함께 쓰고 원자적 파일 교체를 사용합니다. 저장은 스냅샷, 루트, `latest` 순서로 게시한 뒤에야 정리합니다. 다만 정전까지 견디는 트랜잭션은 아니어서, `latest` 게시 전에 중단되면 고아 스냅샷이나 남은 루트가 생길 수 있습니다.
+
+### 언어 카나리아 (`languageCanary`)
+
+카나리아는 권고 전용입니다. `verify_completion` 판정을 바꾸지 않고 턴을 막지도 않습니다. `main` 세션에서 실제 사용자 턴마다 최종 응답을 표본으로 삼습니다(Agy는 `PostInvocation`, Claude Code는 `Stop`). 훅이 다시 실행돼도 사용자 턴 하나는 한 번만 셉니다. 코드 펜스, 인용 줄과 인용구, JSON·YAML 블록, 해시, 한글 뒤 짧은 영어 병기는 먼저 제거합니다. `minProseChars`보다 짧은 응답과 사용자가 영어를 명시적으로 요청한 턴은 건너뛰며 카운터도 움직이지 않습니다.
+
+| 이벤트 | 조건 |
+| --- | --- |
+| `load_failure` | **첫 유효 턴 자체가 이탈한 경우**에만 한국어 규칙 미로드를 경고하며, 연속 이탈 횟수에는 넣지 않습니다. 첫 유효 턴이 정상이었다면 이후 이탈은 처음부터 셉니다. |
+| `suspect` | 그 뒤 `kWarn`번(기본 `2`) 연속 이탈했을 때입니다. |
+| `handoff_required` | 쿨다운 밖에서 `kReset`번(기본 `3`) 연속 이탈했을 때입니다. 보존 지정된 핸드오프를 저장하고 이탈 횟수를 초기화합니다. |
+| `handoff_suppressed` | 쿨다운 중에 `kReset`에 도달했을 때입니다. 아무것도 저장하지 않습니다. |
+| `recovered` | `suspect`나 `handoff_required` 뒤에 `recoverCleanTurns`번(기본 `3`) 연속 한국어로 응답했을 때입니다. |
+
+핸드오프 뒤에는 적용 대상 턴이 `cooldownTurns`번(기본 `5`) 지나야 다시 저장할 수 있습니다. 건너뛴 턴은 쿨다운을 줄이지 않습니다.
+
+`handoff_required` 알림에는 스냅샷 ID와 소유자 `canary:<sha256(대화 ID) 앞 24자리 16진수>`가 나옵니다. 해제 방법:
+
+1. 새 세션을 열고 `manage_handoff`를 `action: "load"`와 그 `snapshot_id`로 실행합니다.
+2. 더 필요 없으면 `manage_handoff`를 `action: "unpin"`, 같은 `snapshot_id`, `canary:...` 소유자를 넣은 `pin_owner`로 실행합니다. 알림을 놓쳤다면 `list_pinned`로 찾으세요.
+
+해제하기 전까지 그 스냅샷은 보존 정책과 `clear`에서 살아남습니다.
+
+`config.json`의 `languageCanary`에서 조정합니다.
+
+```json
+{
+	"languageCanary": {
+		"kWarn": 2,
+		"kReset": 3,
+		"minProseChars": 40,
+		"recoverCleanTurns": 3,
+		"cooldownTurns": 5
+	}
+}
+```
+
+`kWarn`, `kReset`, `recoverCleanTurns`는 `1` 이상의 정수, `minProseChars`와 `cooldownTurns`는 `0` 이상의 정수여야 하고, `kWarn`은 `kReset`보다 클 수 없습니다. `minHangulRatio`(`0`~`1`)의 기본값은 분석기가 함께 쓰는 비율입니다. 값이 잘못되면 그 턴의 카나리아만 조용히 꺼지고 완료 게이트에는 영향이 없습니다.
+
+### 병합 전 대화형 체크리스트
+
+병합 전에 로그인된 세션에서 직접 실행하고 관찰한 결과를 남기세요.
+
+Claude Code(저장소 루트에서 `claude --plugin-dir .`):
+
+1. `claude plugin validate .`가 통과합니다.
+2. 세션이 `SessionStart`로 들어온 한국어 규칙을 문맥에 담고 시작합니다.
+3. `/mcp`에 `gate`가 연결됨으로 나오고 `mcp__plugin_hstack_gate__*` 도구 두 개가 보입니다.
+4. `TodoWrite`의 영어 할 일 라벨이 한국어 사유와 함께 거부됩니다.
+5. `verify_completion`을 한 번 호출합니다. Claude 기본 권한 규칙이 적용되고, 한국어 세션 오류가 아니라 게이트 판정이 돌아옵니다.
+6. 코드 파일을 고친 뒤 검사를 돌리지 않고 끝내 봅니다. `Stop`이 한국어 사유로 막고, 다음 종료는 다시 막지 않습니다.
+7. `manage_handoff`로 `pin_owner`를 넣은 `save`, `list_pinned`, `clear`, `unpin`을 차례로 실행합니다. 보존 지정된 스냅샷은 `clear` 뒤에도 남습니다.
+8. 새 세션에서 영어 요청 없이 유효 턴 네 번이 연속 이탈하는 경우를 확인합니다. 1턴에는 `load_failure`, 3턴에는 `suspect`, 4턴에는 스냅샷 ID와 `canary:` 소유자가 붙은 `handoff_required`가 나와야 합니다. 새 세션에서 그 ID를 불러온 뒤 핀을 해제합니다.
+
+Agy(`agy plugin install .` 후 새 세션):
+
+1. `agy plugin validate --strict --json .`가 `"findings": []`를 보고합니다.
+2. `mcp_hstack_gate_*` 도구가 eager이고 자동 승인됩니다.
+3. 위 7, 8단계를 `/hstack-handoff`와 Agy 도구 이름으로 반복합니다.
+4. `node ./test/verify-live.mjs`로 `L1`, `L3`, `L5`, `L16`을 다시 실행합니다.
 
 ## 설치 및 업데이트
 
@@ -191,7 +316,9 @@ node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 
 `test/verify-live.mjs`는 전역 플러그인 간섭을 차단하기 위해 격리된 임시 `HOME`과 앱 데이터 디렉터리에서 실행되며 종료 시 임시 로그를 자동 정리합니다.
 
-### 실측 기준선 및 릴리즈 노트 (v0.1.2)
+### 실측 기준선 및 릴리즈 노트 (과거 기록, v0.1.2, Agy 전용)
+
+아래 수치는 v0.1.2 시점에 Agy에서 측정한 값이며 v0.2.0 결과가 아닙니다.
 
 - 단위·통합 테스트: `node --test test/*.test.mjs` — **149 스위트 / 760 테스트 통과 (`fail 0`)** (`v0.1.2` 거버넌스 상태 머신 하드닝, 셸 검증 문법·래퍼·환경 동등성, 추적/미추적 스냅샷 fail-closed 정밀화, 세션 락 회수 하드닝, 분석기, 영어 요청 면제, 트랜스크립트 훅, 팩트 원장, 완료 게이트 `R1`~`R9`·`E1`~`E11`, 자율 프롬프트 라우터·서킷브레이커·삽질 감지기, 위험 분류 및 독립 감사, 핸드오프 저장소 및 MCP stdio 왕복, `audit-report.mjs` `[1]`~`[8]` 전수 검증).
 - 엄격 플러그인 검증: `agy plugin validate --strict --json .` 종료 코드 `0`, `"findings": []`, `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.

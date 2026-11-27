@@ -2,9 +2,9 @@
 
 [한국어](README.ko.md)
 
-`hstack` (v0.1.2) is an Antigravity CLI governance plugin built on Node.js 18+ ESM with zero npm dependencies. It combines a Korean-native thinking, UI, and response guard, a deterministic evidence-grounded completion gate with preflight vote-bypass enforcement, risk-tiered independent code auditing, fact-distilled cross-session handoff, and zero-command autonomous governance (`smart` mode) in one plugin.
+`hstack` (v0.2.0) is a governance plugin for Antigravity CLI (`agy`) and Claude Code. It's built on Node.js 18+ ESM with zero npm dependencies. It combines a Korean-native thinking, UI, and response guard, a deterministic evidence-grounded completion gate with preflight vote-bypass enforcement, risk-tiered independent code auditing, fact-distilled cross-session handoff, and zero-command autonomous governance (`smart` mode) in one plugin. See [Dual-host surface (v0.2.0)](#dual-host-surface-v020) for how each host loads it.
 
-## Bundled components (v0.1.2)
+## Bundled components (Agy manifest)
 
 | Component | Count | Details |
 | --- | :---: | --- |
@@ -27,7 +27,7 @@
 
 ### Layer 2: deterministic evidence-grounded completion gate
 
-- Eager MCP server (`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.1.2"`) exposes `mcp_hstack_gate_verify_completion` (`verify_completion`) without requiring schema discovery turns.
+- Eager MCP server (`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.2.0"`) exposes `mcp_hstack_gate_verify_completion` (`verify_completion`) without requiring schema discovery turns.
 - `PreToolUse` (`scripts/pre-tool-gate.mjs`) intercepts `^mcp_hstack_.*$` calls to return `decision: "auto_approve"`, set a Korean `toolSummary`, and inject hidden `_session` metadata (`conversationId`, `transcriptPath`, `cwd`) stripped before schema validation.
 - `scripts/governance/fact-ledger.mjs` and `scripts/governance/decide-gate.mjs` cross-check claimed `modified_files`, `inspected_files`, `verification_runs`, `unverified_scope`, and `self_assessment` against transcript read/write/execution/preflight/vote history and Git working tree state (`git status --porcelain`, `git diff --numstat`). Denied write calls (`PreToolUse` `deny`) and failed write tool steps (`ERROR`/`FAILED`) are excluded from `turnWrittenFiles`, `turnCodeWrittenFiles`, and `fileEditCounts`.
 - External MCP verification tools such as `mcp_agy-fast_fast_run_checks` (and `mcp_agy-fast_fast_apply_edits` / `mcp_agy-fast_apply_edits` for writes) are recognized directly in the ledger alongside `run_command`.
@@ -60,6 +60,131 @@
 - Fact-distilled cross-session handoff (`skills/hstack-handoff/SKILL.md`, `agents/hstack-worker.md`, `scripts/governance/handoff-store.mjs`):
 	- Eager MCP tool `mcp_hstack_gate_manage_handoff` (`manage_handoff`) supports `save`, `load`, and `list` actions per workspace key (`computeWorkspaceKey`), combining distilled facts (`objective`, `verified_facts`, `failed_approaches`, `remaining_tasks`, `open_risks`) with machine evidence (Git branch, HEAD, dirty files, read/written files, verification runs) and flagging stale working trees on load.
 	- Context pollution tracking (`updateSessionPollutionState` in `scripts/post-invocation.mjs`) monitors `inputTokens`, failed executions in turn, and repeated single-file edit churn, appending a non-blocking `[컨텍스트 열화 주의]` notice to gate receipts when thresholds trip.
+
+## Dual-host surface (v0.2.0)
+
+One tree carries two manifests. Agy reads `plugin.json`, `hooks.json`, and `mcp_config.json`. Claude Code reads `.claude-plugin/plugin.json`, which references `./.claude-plugin/hooks.json`, `./.claude-plugin/mcp.json`, and the agent files in `./.claude-plugin/agents/` explicitly. Explicit paths keep Agy from flagging Claude's default `.mcp.json` and `hooks/hooks.json` locations. Sections above that name Agy tools (`invoke_subagent`, `PostInvocation`, `agy -p`) are Agy-only.
+
+### Load and validate in Claude Code
+
+```sh
+claude plugin validate --strict --json .
+claude --plugin-dir /path/to/hstack
+```
+
+`--plugin-dir <path>` loads a plugin from a directory or `.zip` for that session only, and you can repeat it (`--plugin-dir A --plugin-dir B.zip`). Nothing is installed. Run `/mcp` inside the session to confirm that the `gate` server connected.
+
+### Claude hooks
+
+`./.claude-plugin/hooks.json` routes four events through `scripts/hooks/claude.mjs`.
+
+| Claude event | What hstack does |
+| --- | --- |
+| `SessionStart` | Adds `rules/AGENTS.md` to the session as context. This is the Claude counterpart of Agy's always-on rule file. |
+| `UserPromptSubmit` | Runs the prompt router (Agy `PreInvocation`) and adds any notice as context. |
+| `PreToolUse` | Matches `Bash`, `PowerShell`, `Edit`, `Write`, `NotebookEdit`, `Agent`, `Task`, `TodoWrite`, `TaskCreate`, `TaskUpdate`, `AskUserQuestion`, and the two gate tools. It denies English UI labels and gated edits with a Korean reason, adds role markers to subagent prompts, and attaches `_hstackContext` to gate calls. |
+| `Stop` | Runs the completion gate and the post-turn analysis (Agy `PostInvocation`). A gate failure blocks with a Korean reason, and analysis notices arrive as one `systemMessage`. When `stop_hook_active` is set it returns nothing, so it never blocks twice in a row. |
+
+Native tools map to the Agy names the gate already knows. `Edit`, `Write`, and `NotebookEdit` become edits, `Bash` and `PowerShell` become `run_command`, `Agent` and `Task` become `invoke_subagent`, and `TodoWrite`, `TaskCreate`, `TaskUpdate`, and `AskUserQuestion` become UI tools. `Read` has no hook and is seen only through the transcript.
+
+### Namespaced MCP and `_hstackContext`
+
+`./.claude-plugin/mcp.json` starts `gate` with `HSTACK_HOST=claude` and `CLAUDE_PLUGIN_DATA`. Claude Code scopes plugin servers as `plugin:<plugin>:<server>`, so the tools appear as `mcp__plugin_hstack_gate__verify_completion` and `mcp__plugin_hstack_gate__manage_handoff`. They aren't loaded eagerly.
+
+On Claude Code, `_session` never travels through the tool call. `PreToolUse` drops any caller-supplied `_session` or `_hstackContext` and attaches a fresh `_hstackContext`, a random one-use reference. The server redeems it exactly once. It has to match the tool it was issued for, be less than 120 seconds old, and sit in an owner-only directory under the plugin data directory. A missing, reused, expired, or forged reference fails the call with a Korean error instead of running it without a session. The hook doesn't auto-approve the call, so Claude's normal permission rules still apply.
+
+### Host capability contract
+
+`scripts/host/host-adapter.mjs` exports `getHostCapabilities(host)` for the host IDs `antigravity`, `claude-code`, and `unknown`. `detectHost()` picks one from `HSTACK_HOST`, then from the Claude or Agy plugin environment variables. Every result has exactly these keys:
+
+| Key | `antigravity` | `claude-code` | `unknown` |
+| --- | :---: | :---: | :---: |
+| `host` | `"antigravity"` | `"claude-code"` | `"unknown"` |
+| `spawn` | `true` | `true` | `false` |
+| `readOnlySubagent` | `true` | `true` | `false` |
+| `isolatedWrite` | `false` | `false` | `false` |
+| `cancel` | `false` | `false` | `false` |
+| `resume` | `false` | `false` | `false` |
+| `usageTelemetry` | `null` | `null` | `null` |
+
+These values describe the package, not the grants in any one session.
+
+- `readOnlySubagent` means hstack ships read-only reviewers. Claude limits their tools to `Read`, `Glob`, and `Grep`; the worker also has `Edit`, `Write`, and `Bash`. Agy uses reviewer instructions and a `PreToolUse` hook that denies managed writes and commands for those roles.
+- `isolatedWrite` is `false` because a separately prompted worker isn't a filesystem sandbox.
+- `cancel` and `resume` are `false` and `usageTelemetry` is `null` on every host. hstack doesn't claim them, and it never infers them from a session ID.
+
+### Handoff pins and cleanup
+
+`manage_handoff` keeps `save`, `load`, and `list` and adds `pin`, `unpin`, `list_pinned`, and `clear`. The same API exists in `scripts/governance/handoff-store.mjs`.
+
+- `save` takes an optional `pin_owner` and pins the new snapshot in the same call. If you need it kept, don't save first and pin later.
+- `pin` and `unpin` need a concrete `snapshot_id` and a `pin_owner`. Each reports whether that owner's membership changed. A snapshot stays pinned while any owner remains.
+- `list_pinned` reports the pinned IDs and their owners. The JavaScript API `listPinnedSnapshots` returns sorted `{ snapshotId, pinOwners }` entries; MCP renders them as text.
+- `clear` reports how many unpinned snapshots it removed. The JavaScript API `clearHandoffSnapshots` returns `{ workspaceKey, clearedCount }`. It keeps a pinned current snapshot. If the current one is unpinned, it removes the pointer and doesn't promote another snapshot. `clear` takes no `snapshot_id`.
+- `pin_owner` is only valid on `save`, `pin`, and `unpin`. Owners are case-sensitive, 1 to 128 characters, start with an ASCII letter or digit, and may contain ASCII letters, digits, `.`, `_`, `:`, and `-` (for example `canary:run-42`). They're retention labels, not credentials.
+- Retention keeps 20 unpinned snapshots plus every pinned one. Once the last owner unpins a snapshot, ordinary retention applies to it right away.
+- `load` still accepts the read-only `latest` alias and never loads `pins` as a snapshot.
+- If pin metadata is corrupt or unreadable, mutations abort. It's never read as an empty set.
+- Operations share the workspace cross-process lock and use atomic file replacement. A save publishes the snapshot, then the root, then `latest`, and only then prunes. That isn't a power-loss transaction, though. An interruption before `latest` is published can leave an orphan snapshot or a retained root.
+
+### Language canary (`languageCanary`)
+
+The canary is advisory only. It never changes a `verify_completion` verdict and never blocks a turn. It samples the final reply of each real user turn in a `main` session (Agy at `PostInvocation`, Claude Code at `Stop`). Each user turn counts at most once, even if a hook is replayed. Code fences, quoted lines and spans, JSON and YAML blocks, hashes, and short English glosses after Hangul are stripped first. Replies shorter than `minProseChars` and turns where the user explicitly asked for English are skipped and don't move any counter.
+
+| Event | When |
+| --- | --- |
+| `load_failure` | Only when the **first applicable turn** drifts. It warns that the Korean rules may not have loaded and does not start the drift count. If the first applicable turn is normal, any later drift counts normally. |
+| `suspect` | After that, `kWarn` consecutive drifting turns (default `2`). |
+| `handoff_required` | `kReset` consecutive drifting turns (default `3`), outside cooldown. hstack saves a pinned handoff and resets the drift count. |
+| `handoff_suppressed` | `kReset` reached while cooldown is active. Nothing is saved. |
+| `recovered` | `recoverCleanTurns` consecutive Korean turns (default `3`) after `suspect` or `handoff_required`. |
+
+After a handoff, `cooldownTurns` (default `5`) applicable turns must pass before another one can be saved. Skipped turns don't use up cooldown.
+
+On `handoff_required` the notice names the snapshot ID and its owner, `canary:<first 24 hex chars of sha256(conversation id)>`. To release it:
+
+1. Start a new session and run `manage_handoff` with `action: "load"` and that `snapshot_id`.
+2. When you no longer need it, run `manage_handoff` with `action: "unpin"`, the same `snapshot_id`, and `pin_owner` set to the `canary:...` owner. Use `list_pinned` if you lost the notice.
+
+Until you unpin it, the snapshot survives retention and `clear`.
+
+Tune the canary under `languageCanary` in `config.json`:
+
+```json
+{
+	"languageCanary": {
+		"kWarn": 2,
+		"kReset": 3,
+		"minProseChars": 40,
+		"recoverCleanTurns": 3,
+		"cooldownTurns": 5
+	}
+}
+```
+
+`kWarn`, `kReset`, and `recoverCleanTurns` must be integers `>= 1`. `minProseChars` and `cooldownTurns` must be integers `>= 0`, and `kWarn` can't exceed `kReset`. `minHangulRatio` (`0` to `1`) defaults to the analyzer's shared ratio. An invalid value turns the canary off quietly for that turn. The completion gate isn't affected.
+
+### Pre-merge interactive checklist
+
+Run these by hand in logged-in sessions before you merge, and record what you observe.
+
+Claude Code (`claude --plugin-dir .` from the repository root):
+
+1. `claude plugin validate .` passes.
+2. The session starts with the Korean rules from `SessionStart` in context.
+3. `/mcp` lists `gate` as connected with both `mcp__plugin_hstack_gate__*` tools.
+4. An English todo label in `TodoWrite` is denied with a Korean reason.
+5. Call `verify_completion` once. Claude's normal permission rules apply, and the call returns a gate verdict rather than the Korean session error.
+6. Edit a code file, then try to finish without running a check. `Stop` blocks with a Korean reason, and the next stop isn't blocked again.
+7. `manage_handoff` `save` with `pin_owner`, then `list_pinned`, `clear`, and `unpin`. The pinned snapshot survives `clear`.
+8. In a fresh session, observe four consecutive applicable turns that drift without a request for English: turn 1 warns `load_failure`, turn 3 warns `suspect`, and turn 4 gives `handoff_required` with a snapshot ID and `canary:` owner. Load that ID in a new session before releasing the pin.
+
+Agy (`agy plugin install .`, new session):
+
+1. `agy plugin validate --strict --json .` reports `"findings": []`.
+2. `mcp_hstack_gate_*` tools are eager and auto-approved.
+3. Repeat steps 7 and 8 above with `/hstack-handoff` and Agy's tool names.
+4. Rerun `node ./test/verify-live.mjs` for `L1`, `L3`, `L5`, and `L16`.
 
 ## Install and update
 
@@ -191,7 +316,9 @@ node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 
 `test/verify-live.mjs` executes each scenario in an isolated temporary `HOME` and app-data directory so global plugins cannot interfere and cleans up temporary logs on exit.
 
-### Measured baseline and release notes (v0.1.2)
+### Measured baseline and release notes (historical, v0.1.2, Agy only)
+
+These numbers were measured at v0.1.2 on Agy. They aren't v0.2.0 results.
 
 - Unit and integration suite: `node --test test/*.test.mjs` — **149 suites / 760 tests pass (`fail 0`)**, covering `v0.1.2` governance state-machine hardening, shell verification grammar/wrapper/env parity, tracked vs. untracked snapshot fail-closed accuracy, session lock stale-reclaim hardening, analyzer, English-request exemptions, transcript hooks, fact ledger, completion gate (`R1` through `R9`, `E1` through `E11`), autonomous prompt routing, destructive-edit circuit breaker, thrashing detector, risk classification and independent audit, handoff store and MCP stdio roundtrip, and `audit-report.mjs` (`[1]`–`[8]`).
 - Strict manifest validation: `agy plugin validate --strict --json .` exits `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`.
