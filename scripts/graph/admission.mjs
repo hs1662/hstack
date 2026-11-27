@@ -55,6 +55,9 @@ function pathSet(value, label) {
 
 function normalizeNode(input) {
   if (!isRecord(input)) throw schemaError('node must be an object');
+  if (Object.hasOwn(input, 'schemaVersion') && input.schemaVersion !== SCHEMA_VERSION) {
+    throw schemaError(`node.schemaVersion must be ${SCHEMA_VERSION}`);
+  }
   const id = nonempty(input.id, 'node.id');
   const kind = input.kind;
   if (kind === 'integrate') throw v2Error(`integration is reserved for v2: ${id}`);

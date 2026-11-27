@@ -1,3 +1,5 @@
+import { isAbsolute } from 'node:path';
+
 export const SCHEMA_VERSION = 1;
 export const V2_WRITE_ERROR = 'ERR_V2_WRITE_INTEGRATION_NOT_ENABLED';
 
@@ -52,7 +54,16 @@ const matching = pattern => (value, label) => {
 };
 const hash = matching(digest);
 const gitOid = matching(oid);
+const runId = matching(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+const casAddress = matching(/^cas:\/\/sha256\/[a-f0-9]{64}$/);
 const optional = validator => (value, label) => { if (value != null) validator(value, label); };
+const nullable = validator => (value, label) => { if (value !== null) validator(value, label); };
+const string = (value, label) => {
+  if (typeof value !== 'string') throw schemaError(`${label} must be a string`);
+};
+const absolute = (value, label) => {
+  if (typeof value !== 'string' || !isAbsolute(value) || value.includes('\0')) throw schemaError(`${label} must be an absolute path`);
+};
 const object = (value, label) => {
   if (!isRecord(value)) throw schemaError(`${label} must be an object`);
 };
@@ -66,6 +77,7 @@ const items = validator => (value, label) => {
 const oneOf = (...values) => (value, label) => {
   if (!values.includes(value)) throw schemaError(`${label} must be one of ${values.join(', ')}`);
 };
+const fields = schema => (value, label) => { object(value, label); validateFields(value, schema, label); };
 const positive = (value, label) => safeInteger(value, label, 1);
 
 export function normalizeGateCommand({ gateArgv, timeoutMs }) {
@@ -100,15 +112,17 @@ export function normalizeVolatility(value = {}) {
 }
 
 const tuple = { runId: nonempty, nodeId: nonempty, graphRev: positive, epoch: positive };
-const producer = (value, label) => { object(value, label); validateFields(value, tuple, label); };
+const producer = fields(tuple);
+const runStatus = oneOf('open', 'held', 'completed', 'degraded');
+const nodeKind = oneOf('read', 'verify', 'reducer', 'write');
 const records = {
   Run: {
     runId: nonempty, repoIdentity: nonempty, startBase: gitOid, integrationRef: optional(nonempty),
     graphRev: positive, specDigest: hash, policyDigest: hash, seq: safeInteger, headHash: optional(hash),
-    budget: object, status: oneOf('open', 'held', 'completed', 'degraded'),
+    budget: object, status: runStatus,
   },
   Node: {
-    nodeId: nonempty, graphRev: positive, kind: oneOf('read', 'verify', 'reducer', 'write'),
+    nodeId: nonempty, graphRev: positive, kind: nodeKind,
     specDigest: hash, requiredDeps: list, inputs: list, writeScope: list, gates: list,
     dirtyReasons: list, currentEpoch: safeInteger, retryBudget: safeInteger, state: nonempty,
   },
@@ -131,21 +145,104 @@ const records = {
   },
 };
 
+const span = { spanId: nonempty, path: nonempty, startLine: positive, endLine: positive };
+const provenance = fields({
+  factDigest: hash, evidenceSpans: items(fields(span)), claims: items(fields({
+    claimId: nonempty, spanIds: items(nonempty), text: nonempty, seq: optional(safeInteger),
+  })), edgeCases: items(object), failureEvidence: items(object),
+});
+const workerClaim = { workerReportedStatus: oneOf('completed'), inlineSummary: string, provenance };
+const runtimeRecords = {
+  Run: {
+    runId, workspace: absolute, graphRev: positive, status: runStatus, nodes: object,
+    attemptsIssued: safeInteger, baseSha: optional(gitOid), limits: fields({
+      maxPins: safeInteger, maxAttempts: safeInteger, maxInfraRetries: safeInteger,
+      readConcurrency: positive, maxFlakyDiagnostics: safeInteger,
+      maxInlineBytesPerNode: safeInteger, maxInlineBytesPerWave: safeInteger,
+    }),
+  },
+  Node: {
+    id: nonempty, logicalId: nonempty, kind: nodeKind, status: oneOf('pending', 'claimed', 'running',
+      'accepted', 'retry_wait', 'fresh_reset_ready', 'held_blocked', 'held_infra', 'held_upstream',
+      'failed_logic', 'held_flaky', 'superseded_by_repair'),
+    highestIssuedEpoch: safeInteger, infraRetries: safeInteger, topoRank: safeInteger, topologicalRank: safeInteger,
+    estimatedMinutes: positive, priority: (value, label) => safeInteger(value, label, Number.MIN_SAFE_INTEGER),
+    dependsOn: items(nonempty), inputUris: optional(items(casAddress)), attempt: nullable(object),
+    receiptUri: nullable(casAddress), execKey: nullable(hash), gateKey: nullable(hash),
+    artifactDigest: optional(hash), repairDepth: optional(positive), gateVersion: optional(positive),
+    timeoutMs: optional(positive), jitterMs: optional(safeInteger),
+  },
+  Attempt: {
+    ...tuple, runId, claimOp: nonempty, execKey: hash, instructionPath: absolute, nonceHash: hash,
+    directiveDigest: hash, localKey: hash, pinSlots: safeInteger, inputUris: items(casAddress),
+    receiptPhase: oneOf('prepared', 'delivered', 'checked'), hostHandle: optional(nonempty),
+    settleOp: optional(nonempty), verifierOp: optional(nonempty), verificationStartedAtMs: optional(safeInteger),
+    gateLogUri: optional(casAddress), deliveredUri: optional(casAddress),
+  },
+  Receipt: {
+    ...workerClaim, workerClaim: fields(workerClaim), gateEvidence: fields({ logUri: casAddress }),
+    verifierEvidence: fields({ logUri: casAddress, argv: items(string), envDigest: hash,
+      exit: oneOf(0), signal: oneOf(null), subjectDigest: hash,
+      spanResolutions: items(fields({ ...span, actualLines: positive, sha256: hash })),
+    }),
+    budget: fields({ mode: oneOf('bytes', 'tokens'), W_eff: nullable(safeInteger),
+      reservedTokens: nullable(safeInteger), B: nullable(safeInteger), perIssueTokens: nullable(safeInteger),
+      totalTokens: nullable(safeInteger), inlineTokens: nullable(safeInteger),
+      maxInlineBytesPerNode: safeInteger, maxInlineBytesPerWave: safeInteger,
+    }),
+  },
+};
+const runtimeKeys = {
+  Run: ['workspace', 'nodes', 'attemptsIssued'],
+  Node: ['id', 'logicalId', 'highestIssuedEpoch'],
+  Attempt: ['instructionPath', 'nonceHash', 'receiptPhase'],
+  Receipt: ['workerClaim', 'verifierEvidence', 'gateEvidence'],
+};
+
 function validateFields(value, fields, label) {
   for (const [key, validate] of Object.entries(fields)) {
     validate(Object.hasOwn(value, key) ? value[key] : undefined, `${label}.${key}`);
   }
 }
 
-function parseRecord(name, input) {
-  object(input, name);
-  const copy = immutable(input);
-  const version = Object.hasOwn(copy, 'schemaVersion') ? copy.schemaVersion : SCHEMA_VERSION;
-  if (version !== SCHEMA_VERSION) {
+function validateVersion(name, value, required) {
+  if ((required || Object.hasOwn(value, 'schemaVersion')) && value.schemaVersion !== SCHEMA_VERSION) {
     throw schemaError(`${name}.schemaVersion must be ${SCHEMA_VERSION}`);
   }
+}
+
+function validateRuntime(name, value) {
+  object(value, name);
+  validateVersion(name, value, true);
+  validateFields(value, runtimeRecords[name], name);
+  if (name === 'Run') {
+    for (const [id, node] of Object.entries(value.nodes)) {
+      validateRuntime('Node', node);
+      if (node.id !== id || (node.attempt && (node.attempt.runId !== value.runId || node.attempt.graphRev > value.graphRev))) {
+        throw schemaError(`Run.nodes[${JSON.stringify(id)}] does not match its persisted identity`);
+      }
+    }
+  } else if (name === 'Node' && value.attempt) {
+    validateRuntime('Attempt', value.attempt);
+    if (value.attempt.nodeId !== value.id || value.attempt.epoch > value.highestIssuedEpoch) {
+      throw schemaError('Node.attempt does not match its persisted identity');
+    }
+  } else if (name === 'Receipt' && (value.verifierEvidence.logUri !== value.gateEvidence.logUri
+      || value.verifierEvidence.subjectDigest !== value.provenance.factDigest)) {
+    throw schemaError('Receipt verifier evidence does not match the checked subject or log');
+  }
+}
+
+function parseRecord(name, input, runtimeOnly = false) {
+  object(input, name);
+  const copy = immutable(input);
+  if (runtimeOnly || runtimeKeys[name]?.some(key => Object.hasOwn(copy, key))) {
+    validateRuntime(name, copy);
+    return copy;
+  }
+  validateVersion(name, copy, false);
   validateFields(copy, records[name], name);
-  return Object.freeze({ ...copy, schemaVersion: version });
+  return Object.freeze({ ...copy, schemaVersion: SCHEMA_VERSION });
 }
 
 export const Run = input => parseRecord('Run', input);
@@ -153,3 +250,6 @@ export const Node = input => parseRecord('Node', input);
 export const Attempt = input => parseRecord('Attempt', input);
 export const Receipt = input => parseRecord('Receipt', input);
 export const IntegrationCandidate = input => parseRecord('IntegrationCandidate', input);
+
+// Validate the durable post-image, never the mutable transition object in place.
+export const validateRunRecords = state => parseRecord('Run', state, true);
