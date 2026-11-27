@@ -3,7 +3,7 @@ import { randomInt } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { compileGraph } from "./admission.mjs";
-import { authenticate, currentLocalKey, failureRecord, gatePolicy, inputs, issue, locate, validatedArtifact } from "./attempts.mjs";
+import { authenticate, currentLocalKey, failureRecord, gatePolicy, inputs, issue, locate, projectionEligible, validatedArtifact } from "./attempts.mjs";
 import { artifactDigest, canonical, crossRunCacheDisabled, gateKey } from "./fingerprint.mjs";
 import { canaryStats, pinCarryover, recheckSuspect } from "./host-bridge.mjs";
 import { recordVerified, revalidateNode } from "./incremental.mjs";
@@ -91,7 +91,8 @@ function capacity(s, n) {
   return null;
 }
 const pinSlots = (s, n) => inputs(s, n).length + n.skills.length + n.rules.length +
-  Number(Boolean(n.handoffCarryoverUri)) + Number(n.kind === "reducer");
+  Number(Boolean(n.handoffCarryoverUri)) + Number(n.kind === "reducer") +
+  (projectionEligible(n) ? n.dependsOn.length : 0);
 const parentsAccepted = (s, n) => n.dependsOn.every(id => getNode(s, id).status === "accepted");
 
 function captureReadiness(s, atMs) {

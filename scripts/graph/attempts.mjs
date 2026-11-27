@@ -2,7 +2,8 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { artifactDigest, crossRunCacheDisabled, execKey } from "./fingerprint.mjs";
+import { artifactDigest, canonical, crossRunCacheDisabled, execKey } from "./fingerprint.mjs";
+import { factDigest } from "./reducer.mjs";
 import { graphError, safeInteger } from "./schema.mjs";
 
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
@@ -106,23 +107,39 @@ export async function currentLocalKey(s, n, root) {
   return localKey(n, await generationContext(s, n, root));
 }
 
+export function projectionEligible(n) {
+  return n.kind === "read" && n.projection === "facts-v1" && n.projectionConfig == null &&
+    n.dependsOn.length > 0 && !n.inputUris?.length && !n.failureReceiptUri &&
+    !n.revalidateReceiptUri && !n.reductionUri && !n.handoffCarryoverUri;
+}
+
 export async function issue(state, n, { root, opId }, io) {
   const epoch = safeInteger(n.highestIssuedEpoch + 1, "epoch", 1);
-  const projected = n.kind === "read" && n.projection === "facts-v1" && n.projectionConfig == null &&
-    n.dependsOn.every(id => Boolean(state.nodes[id].factViewDigest));
-  const extra = [ ...(n.inputUris ?? []), n.failureReceiptUri, n.revalidateReceiptUri ].filter(Boolean);
-  const parents = [];
-  for (const id of n.dependsOn) {
-    const parent = state.nodes[id];
-    if (!projected) { parents.push(parent.receiptUri); continue; }
-    const checked = JSON.parse(await io.get(parent.workerReceiptUri ?? parent.receiptUri));
-    const { evidenceSpans, claims, edgeCases, failureEvidence, factDigest } = checked.provenance;
-    parents.push(await io.put(Buffer.from(JSON.stringify({ evidenceSpans, claims, edgeCases, failureEvidence, factDigest }))));
-  }
-  const inputUris = [...new Set([...parents, ...extra])];
-  for (const uri of inputUris) await io.get(uri);
+  const internal = inputs(state, n);
+  for (const uri of internal) await io.get(uri);
   const generation = await generationContext(state, n, root);
   const { skills, rules } = generation;
+  const views = [];
+  const parents = n.dependsOn.map(id => state.nodes[id]);
+  const mayProject = projectionEligible(n) && !JSON.stringify([n.prompt, n.messages, n.readScope,
+    n.writeScope, n.skills, n.rules, gatePolicy(n)]).includes("cas://") &&
+    ![...skills, ...rules].some(f => f.bytes.includes("cas://"));
+  if (mayProject && parents.every(p => p.status === "accepted" && p.verifiedResult?.receiptUri === p.receiptUri && p.factViewDigest)) {
+    for (const parent of parents) {
+      const checked = JSON.parse(await io.get(parent.workerReceiptUri ?? parent.receiptUri));
+      const { evidenceSpans, claims, edgeCases, failureEvidence } = checked.provenance;
+      const view = { evidenceSpans, claims, edgeCases, failureEvidence, factDigest: parent.factViewDigest };
+      if (checked.verifierEvidence?.subjectDigest !== view.factDigest || factDigest(view) !== view.factDigest)
+        throw graphError("ERR_FORGED_EVIDENCE", "Parent projection does not match its checked receipt");
+      const bytes = canonical(view);
+      // A fact can itself contain a CAS link. Don't certify restricted
+      // delivery when the projected bytes could reopen a fuller artifact.
+      if (bytes.includes("cas://")) break;
+      views.push(bytes);
+    }
+  }
+  const projected = views.length > 0 && views.length === parents.length;
+  const inputUris = projected ? await Promise.all(views.map(v => io.put(Buffer.from(v)))) : internal;
   generation.inputReceiptDigests = inputUris.map(uri => uri.slice("cas://sha256/".length));
   const key = n.revalidateReceiptUri ? n.execKey : execKey(generation);
   if (n.failedExecKeys?.includes(key)) throw graphError("ERR_LOGIC_RETRY", "A terminal failure fenced this generation");
@@ -137,7 +154,7 @@ export async function issue(state, n, { root, opId }, io) {
   const issued = await directive(root, state.runId, instructions);
   Object.assign(n, { status: "claimed", highestIssuedEpoch: epoch, execKey: key, cacheable: !crossRunCacheDisabled(state.hostProfile, n.volatility),
     attempt: { ...identity, ...issued, claimOp: opId, receiptPhase: "prepared", localKey: localKey(n, generation),
-      deliveredProjection: projected ? "facts-v1" : null, inputUris: [...new Set([...inputUris,
+      deliveredProjection: projected ? "facts-v1" : null, inputUris: [...new Set([...internal, ...inputUris,
       ...pinnedSkills.map(f => f.uri), ...pinnedRules.map(f => f.uri), ...[n.reductionUri].filter(Boolean)])] } });
   return { ...identity, cacheable: n.cacheable, instructionPath: issued.instructionPath };
 }
