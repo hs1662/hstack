@@ -22,6 +22,7 @@ import {
   isExemptDocOrAssetPath,
 } from "./constants.mjs";
 import {
+  SNAPSHOT_UNREADABLE_SIGNATURE,
   listCommittedPaths,
   normalizeWorkspacePath,
   readNumstatSinceHead,
@@ -541,6 +542,9 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
 const statSignature = statSnapshotFile;
 
 function sameFileSignature(a, b) {
+  if (a === SNAPSHOT_UNREADABLE_SIGNATURE || b === SNAPSHOT_UNREADABLE_SIGNATURE) {
+    return false;
+  }
   return Array.isArray(a) && Array.isArray(b)
     ? a.length === b.length && a.every((v, i) => v === b[i])
     : a === b;

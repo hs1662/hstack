@@ -54,114 +54,150 @@ function isLivePid(pid) {
   }
 }
 
-function isLiveCpuLockHolder() {
-  let pid = Number.NaN;
+let lockOwnerSeq = 0;
+
+function readOwnerFile(lockDir) {
   try {
-    pid = Number(readFileSync(join(CPU_LOCK_DIR, "pid"), "utf8"));
+    return readFileSync(join(lockDir, "pid"), "utf8").trim();
   } catch {
-    // A holder writes its pid right after mkdir; a missing pid is a holder still starting.
-  }
-  if (!(pid > 0)) {
-    return Date.now() - statSync(CPU_LOCK_DIR).mtimeMs < 1_000;
-  }
-  try {
-    process.kill(pid, 0);
-    return Date.now() - statSync(CPU_LOCK_DIR).mtimeMs < CPU_LOCK_STALE_MS;
-  } catch (err) {
-    return err.code === "EPERM";
+    return null;
   }
 }
 
-function tryTakeCpuLock() {
-  try {
-    mkdirSync(CPU_LOCK_DIR);
-    writeFileSync(join(CPU_LOCK_DIR, "pid"), String(process.pid));
-    return true;
-  } catch (err) {
-    if (err.code !== "EEXIST") {
-      throw err;
+export function createCpuLockController(lockDir, { staleMs = CPU_LOCK_STALE_MS } = {}) {
+  const sharedDir = `${lockDir}.shared`;
+  const sharedEntry = join(sharedDir, String(process.pid));
+
+  const isLiveHolder = () => {
+    const raw = readOwnerFile(lockDir);
+    if (raw === null) {
+      try {
+        return Date.now() - statSync(lockDir).mtimeMs < 1_000;
+      } catch {
+        return false;
+      }
     }
-  }
-  try {
-    if (!isLiveCpuLockHolder()) {
-      rmSync(CPU_LOCK_DIR, { recursive: true, force: true });
+    const pid = Number.parseInt(raw.split(":")[0], 10);
+    if (!(pid > 0)) {
+      try {
+        return Date.now() - statSync(lockDir).mtimeMs < Math.min(1_000, staleMs);
+      } catch {
+        return false;
+      }
     }
-  } catch {
-    // The holder released it between our checks.
-  }
-  return false;
-}
+    return isLivePid(pid);
+  };
 
-// An exclusive holder in another live process, which shared holders wait out.
-function otherExclusiveHolder() {
-  try {
-    return readFileSync(join(CPU_LOCK_DIR, "pid"), "utf8") !== String(process.pid) && isLiveCpuLockHolder();
-  } catch {
+  const tryTake = () => {
+    lockOwnerSeq += 1;
+    const ownerToken = `${process.pid}:${lockOwnerSeq}`;
+    try {
+      mkdirSync(lockDir);
+      writeFileSync(join(lockDir, "pid"), ownerToken);
+      return ownerToken;
+    } catch (err) {
+      if (err.code !== "EEXIST") {
+        throw err;
+      }
+    }
+    try {
+      const deadOwner = readOwnerFile(lockDir);
+      if (!isLiveHolder() && readOwnerFile(lockDir) === deadOwner) {
+        rmSync(lockDir, { recursive: true, force: true });
+      }
+    } catch {
+      // The holder released it between our checks.
+    }
     return false;
-  }
-}
+  };
 
-// Shared holders in other live processes; a dead holder's entry is removed.
-function otherSharedHolders() {
-  let names = [];
-  try {
-    names = readdirSync(SHARED_LOCK_DIR);
-  } catch {
-    return false;
-  }
-  return names.some((name) => {
-    if (name === String(process.pid)) {
+  const otherExclusiveHolder = () => {
+    const owner = readOwnerFile(lockDir);
+    if (!owner) {
       return false;
     }
-    if (isLivePid(Number(name))) {
-      return true;
+    const pid = Number.parseInt(owner.split(":")[0], 10);
+    return pid !== process.pid && isLiveHolder();
+  };
+
+  const otherSharedHolders = () => {
+    let names = [];
+    try {
+      names = readdirSync(sharedDir);
+    } catch {
+      return false;
     }
-    rmSync(join(SHARED_LOCK_DIR, name), { force: true });
-    return false;
-  });
+    return names.some((name) => {
+      if (name === String(process.pid)) {
+        return false;
+      }
+      if (isLivePid(Number(name))) {
+        return true;
+      }
+      rmSync(join(sharedDir, name), { force: true });
+      return false;
+    });
+  };
+
+  const takeShared = () => {
+    for (;;) {
+      while (otherExclusiveHolder()) {
+        sleep();
+      }
+      mkdirSync(sharedDir, { recursive: true });
+      try {
+        writeFileSync(sharedEntry, "");
+      } catch (err) {
+        if (err.code === "ENOENT") {
+          continue;
+        }
+        throw err;
+      }
+      if (!otherExclusiveHolder()) {
+        return;
+      }
+      rmSync(sharedEntry, { force: true });
+    }
+  };
+
+  const releaseShared = () => rmSync(sharedEntry, { force: true });
+
+  const releaseExclusive = (ownerToken) => {
+    if (readOwnerFile(lockDir) === ownerToken) {
+      rmSync(lockDir, { recursive: true, force: true });
+    }
+  };
+
+  return {
+    sharedDir,
+    isLiveHolder,
+    tryTake,
+    takeShared,
+    releaseShared,
+    otherSharedHolders,
+    releaseExclusive,
+  };
 }
 
-const sharedEntry = join(SHARED_LOCK_DIR, String(process.pid));
-function takeSharedCpuLock() {
-  for (;;) {
-    while (otherExclusiveHolder()) {
-      sleep();
-    }
-    mkdirSync(SHARED_LOCK_DIR, { recursive: true });
-    try {
-      writeFileSync(sharedEntry, "");
-    } catch (err) {
-      // Another file's after() removed the empty directory in between.
-      if (err.code === "ENOENT") {
-        continue;
-      }
-      throw err;
-    }
-    // An exclusive taker that got in between waits for this entry, so step back for it.
-    if (!otherExclusiveHolder()) {
-      return;
-    }
-    rmSync(sharedEntry, { force: true });
-  }
-}
-const releaseSharedCpuLock = () => rmSync(sharedEntry, { force: true });
-beforeEach(takeSharedCpuLock);
-afterEach(releaseSharedCpuLock);
+const defaultCpuLock = createCpuLockController(CPU_LOCK_DIR);
+beforeEach(defaultCpuLock.takeShared);
+afterEach(defaultCpuLock.releaseShared);
 
 export function withCpuLock(fn) {
-  // A test holds the lock shared; waiting for exclusive while holding it would deadlock two such tests.
+  const sharedEntry = join(defaultCpuLock.sharedDir, String(process.pid));
   const wasShared = existsSync(sharedEntry);
-  releaseSharedCpuLock();
-  while (!tryTakeCpuLock()) {
+  defaultCpuLock.releaseShared();
+  let ownerToken = false;
+  while (!(ownerToken = defaultCpuLock.tryTake())) {
     sleep();
   }
-  while (otherSharedHolders()) {
+  while (defaultCpuLock.otherSharedHolders()) {
     sleep();
   }
   const release = () => {
-    rmSync(CPU_LOCK_DIR, { recursive: true, force: true });
+    defaultCpuLock.releaseExclusive(ownerToken);
     if (wasShared) {
-      takeSharedCpuLock();
+      defaultCpuLock.takeShared();
     }
   };
   let result;

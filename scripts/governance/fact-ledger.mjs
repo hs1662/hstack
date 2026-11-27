@@ -146,9 +146,12 @@ export function readRegularFileBounded(
   try {
     const flags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
     fd = openSync(filePath, flags);
-    const st = fstatSync(fd);
-    if (!st.isFile()) {
+    const stBefore = fstatSync(fd);
+    if (!stBefore.isFile()) {
       return { ok: false, reason: "not_regular", text: "" };
+    }
+    if (stBefore.size > maxBytes) {
+      return { ok: false, reason: "too_large", text: "" };
     }
     const buf = Buffer.allocUnsafe(maxBytes + 1);
     let total = 0;
@@ -161,6 +164,17 @@ export function readRegularFileBounded(
     }
     if (total > maxBytes) {
       return { ok: false, reason: "too_large", text: "" };
+    }
+    const stAfter = fstatSync(fd);
+    if (
+      !stAfter.isFile() ||
+      total !== stBefore.size ||
+      total !== stAfter.size ||
+      stBefore.size !== stAfter.size ||
+      stBefore.mtimeMs !== stAfter.mtimeMs ||
+      stBefore.ctimeMs !== stAfter.ctimeMs
+    ) {
+      return { ok: false, reason: "changed_during_read", text: "" };
     }
     const text = buf.subarray(0, total).toString("utf8");
     const lines = text.split(/\r?\n/);
@@ -785,16 +799,30 @@ const WRAPPER_VALUE_SHORT_CHARS = {
 };
 const WRAPPER_NOARG_SHORT_CHARS = {
   env: new Set(["i", "0", "v"]),
-  sudo: new Set(["A", "b", "E", "H", "K", "k", "l", "n", "P", "S", "s", "V", "v"]),
+  sudo: new Set(["A", "E", "H", "n", "P", "S"]),
   time: new Set(["p", "v"]),
   nohup: new Set([]),
 };
 const WRAPPER_SAFE_LONG_NOARG = {
   env: new Set(["--ignore-environment", "--null", "--debug"]),
-  sudo: new Set(["--askpass", "--background", "--preserve-env", "--set-home", "--remove-timestamp", "--reset-timestamp", "--list", "--non-interactive", "--preserve-groups", "--stdin", "--shell", "--validate"]),
+  sudo: new Set(["--askpass", "--preserve-env", "--set-home", "--non-interactive", "--preserve-groups", "--stdin"]),
   time: new Set(["--portability", "--verbose"]),
   nohup: new Set([]),
 };
+const SUDO_NON_EXEC_SHORT_CHARS = new Set(["b", "e", "h", "i", "K", "k", "l", "s", "V", "v"]);
+const SUDO_NON_EXEC_LONG_FLAGS = new Set([
+  "--background",
+  "--edit",
+  "--help",
+  "--list",
+  "--login",
+  "--remove-timestamp",
+  "--reset-timestamp",
+  "--shell",
+  "--validate",
+  "--version",
+]);
+const ENV_NON_EXEC_LONG_FLAGS = new Set(["--help", "--version"]);
 
 // The binary index and wrapper context after leading assignments and wrappers, or binIdx: -1 on hijack/opaque prefix.
 function parseCommandPrefix(tokens) {
@@ -838,16 +866,10 @@ function parseCommandPrefix(tokens) {
       while (idx < tokens.length) {
         const arg = tokens[idx];
         // `env -S` splits its argument into a whole new command line.
-        if (tok === "env" && (/^-[A-Za-z0-9]*S/.test(arg) || arg.startsWith("--split-string") || isExecHijackAssign(arg))) {
+        if (tok === "env" && (arg === "--split-string" || arg.startsWith("--split-string=") || isExecHijackAssign(arg))) {
           return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
         }
-        if (tok === "env" && arg === "-") {
-          envPytestAddopts = null;
-          envPytestCleared = true;
-          idx += 1;
-          continue;
-        }
-        if (tok === "env" && (arg === "--ignore-environment")) {
+        if (tok === "env" && (arg === "-" || arg === "--ignore-environment")) {
           envPytestAddopts = null;
           envPytestCleared = true;
           idx += 1;
@@ -867,6 +889,12 @@ function parseCommandPrefix(tokens) {
           applyChdirVal(arg.slice("--chdir=".length));
           idx += 1;
           continue;
+        }
+        if (tok === "sudo" && SUDO_NON_EXEC_LONG_FLAGS.has(arg)) {
+          return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
+        }
+        if (tok === "env" && ENV_NON_EXEC_LONG_FLAGS.has(arg)) {
+          return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
         }
         if (arg === "--") {
           idx += 1;
@@ -914,6 +942,9 @@ function parseCommandPrefix(tokens) {
           let opaqueShort = false;
           for (let k = 1; k < arg.length; k += 1) {
             const ch = arg[k];
+            if (tok === "sudo" && SUDO_NON_EXEC_SHORT_CHARS.has(ch)) {
+              return { binIdx: -1, chdirs, chdirOpaque: true, envPytestAddopts: null, envPytestCleared: false };
+            }
             if (tok === "env" && ch === "i") {
               envPytestAddopts = null;
               envPytestCleared = true;
@@ -1683,22 +1714,6 @@ function isChainPrepCommand({ words, redirects }) {
   return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
 }
 
-function extractWrapperDirAfterFlag(flagToken, flagChar) {
-  if (!flagToken.startsWith("-") || flagToken.startsWith("--")) {
-    return "";
-  }
-  const fIdx = flagToken.indexOf(flagChar, 1);
-  if (fIdx === -1 || fIdx === flagToken.length - 1) {
-    return "";
-  }
-  return flagToken.slice(fIdx + 1);
-}
-
-const WRAPPER_DIR_FLAGS = {
-  env: { short: "C", long: "--chdir" },
-  sudo: { short: "D", long: "--chdir" },
-};
-
 export function extractChainPrepSignature(segment) {
   if (typeof segment !== "string" || segment.trim().length === 0) {
     return null;
@@ -1711,61 +1726,14 @@ export function extractChainPrepSignature(segment) {
   if (!isChainPrepCommand(parsed)) {
     return null;
   }
-  const idx = skipCommandPrefix(parsed.words);
+  const prefix = parseCommandPrefix(parsed.words);
+  const idx = prefix.binIdx;
   if (idx === -1 || idx >= parsed.words.length) {
     return null;
   }
-  const dirParts = [];
-  let pIdx = 0;
-  while (pIdx < idx) {
-    const tok = parsed.words[pIdx];
-    if (tok === "!" || tok === "(" || ENV_ASSIGN_RE.test(tok)) {
-      pIdx += 1;
-      continue;
-    }
-    if (SHELL_WRAPPERS.has(tok)) {
-      const valueFlags = WRAPPER_FLAGS_WITH_ARG[tok];
-      const dirSpec = WRAPPER_DIR_FLAGS[tok] ?? null;
-      pIdx += 1;
-      while (pIdx < idx) {
-        const arg = parsed.words[pIdx];
-        if (arg === "--") {
-          pIdx += 1;
-          break;
-        }
-        if (dirSpec && (arg === `-${dirSpec.short}` || arg === dirSpec.long) && pIdx + 1 < idx) {
-          dirParts.push(posix.normalize(toPosix(parsed.words[pIdx + 1])));
-          pIdx += 2;
-          continue;
-        }
-        if (dirSpec && arg.startsWith(`${dirSpec.long}=`)) {
-          dirParts.push(posix.normalize(toPosix(arg.slice(dirSpec.long.length + 1))));
-          pIdx += 1;
-          continue;
-        }
-        const attachedDir = dirSpec ? extractWrapperDirAfterFlag(arg, dirSpec.short) : "";
-        if (attachedDir) {
-          dirParts.push(posix.normalize(toPosix(attachedDir)));
-          pIdx += 1;
-          continue;
-        }
-        if (valueFlags && valueFlags.has(arg) && pIdx + 1 < idx) {
-          pIdx += 2;
-          continue;
-        }
-        if (arg.startsWith("-") && arg.length > 1) {
-          pIdx += 1;
-          continue;
-        }
-        if (tok === "env" && ENV_ASSIGN_RE.test(arg)) {
-          pIdx += 1;
-          continue;
-        }
-        break;
-      }
-      continue;
-    }
-    break;
+  const dirParts = prefix.chdirs.map((dir) => posix.normalize(toPosix(dir)));
+  if (prefix.chdirOpaque) {
+    dirParts.push("$opaque");
   }
   const prefixTag = dirParts.length > 0 ? `@wrapperDir(${dirParts.join("->")}) ` : "";
   return `${prefixTag}${["npm", ...parsed.words.slice(idx + 1)].join(" ")}`;
@@ -3544,6 +3512,12 @@ const MAX_SNAPSHOT_HASH_BYTES = 1024 * 1024;
 
 const SNAPSHOT_READ_CHUNK_BYTES = 65536;
 
+export const SNAPSHOT_UNREADABLE_SIGNATURE = "__UNREADABLE__";
+
+function isMissingFsError(err) {
+  return err?.code === "ENOENT" || err?.code === "ENOTDIR";
+}
+
 export function statSnapshotFile(gitRoot, relPath) {
   let fd = -1;
   try {
@@ -3554,17 +3528,14 @@ export function statSnapshotFile(gitRoot, relPath) {
       return [st.mtimeMs, st.size, modeSig, readlinkSync(fullPath)];
     }
     if (!st.isFile()) {
-      return null;
+      return SNAPSHOT_UNREADABLE_SIGNATURE;
     }
     if (st.size <= MAX_SNAPSHOT_HASH_BYTES) {
       const flags = fsConstants.O_RDONLY | (fsConstants.O_NONBLOCK ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
       fd = openSync(fullPath, flags);
-      const fst = fstatSync(fd);
-      if (!fst.isFile()) {
-        return null;
-      }
-      if (fst.size > MAX_SNAPSHOT_HASH_BYTES) {
-        return [fst.mtimeMs, fst.size, (fst.mode & 0o170000) | (fst.mode & 0o111)];
+      const fstBefore = fstatSync(fd);
+      if (!fstBefore.isFile() || fstBefore.size > MAX_SNAPSHOT_HASH_BYTES) {
+        return SNAPSHOT_UNREADABLE_SIGNATURE;
       }
       const chunk = Buffer.allocUnsafe(SNAPSHOT_READ_CHUNK_BYTES);
       const hasher = createHash("sha1");
@@ -3576,19 +3547,27 @@ export function statSnapshotFile(gitRoot, relPath) {
         }
         total += n;
         if (total > MAX_SNAPSHOT_HASH_BYTES) {
-          return [fst.mtimeMs, fst.size, (fst.mode & 0o170000) | (fst.mode & 0o111)];
+          return SNAPSHOT_UNREADABLE_SIGNATURE;
         }
         hasher.update(chunk.subarray(0, n));
       }
-      if (total !== fst.size) {
-        return null;
+      const fstAfter = fstatSync(fd);
+      if (
+        !fstAfter.isFile() ||
+        total !== fstBefore.size ||
+        total !== fstAfter.size ||
+        fstBefore.size !== fstAfter.size ||
+        fstBefore.mtimeMs !== fstAfter.mtimeMs ||
+        fstBefore.ctimeMs !== fstAfter.ctimeMs
+      ) {
+        return SNAPSHOT_UNREADABLE_SIGNATURE;
       }
       const digest = hasher.digest("hex");
-      return [fst.mtimeMs, fst.size, (fst.mode & 0o170000) | (fst.mode & 0o111), digest];
+      return [fstAfter.mtimeMs, fstAfter.size, (fstAfter.mode & 0o170000) | (fstAfter.mode & 0o111), digest];
     }
     return [st.mtimeMs, st.size, modeSig];
-  } catch {
-    return null;
+  } catch (err) {
+    return isMissingFsError(err) ? null : SNAPSHOT_UNREADABLE_SIGNATURE;
   } finally {
     if (fd !== -1) {
       try {
@@ -4018,7 +3997,7 @@ export function detectTestInfrastructure(cwd, gitRoot = null, { maxDepth = 64 } 
       scanUncertain = true;
     }
   }
-  const uncertain = Boolean(walk?.truncated || scanUncertain);
+  const uncertain = Boolean(walk?.truncated || scanUncertain || roots.size === 0);
   return {
     hasTestSuite: indicators.size > 0,
     indicators: [...indicators],
