@@ -43,8 +43,12 @@ export function foldCommitted(prev, frame, state) {
   return { lastSeq: header.seq, lastHash: recordHash, state };
 }
 
-function verifySnapshot(bytes, frame) {
-  const s = parse(bytes, "snapshot");
+function verifySnapshot(bytes, frame, acceptLegacy = false) {
+  let s = parse(bytes, "snapshot");
+  if (acceptLegacy && isRecord(s) && isRecord(s.state) &&
+      Object.keys(s).sort().join(",") === "recordHash,schemaVersion,seq,state") {
+    s = { ...s, lastSeq: s.seq, lastHash: s.recordHash, stateHash: checksum(s.state) };
+  }
   if (!frame || s?.schemaVersion !== 1 || s.lastSeq !== frame.seq || s.lastHash !== frame.recordHash ||
       !isRecord(s.state) || !hex.test(s.stateHash) || `cas://sha256/${s.stateHash}` !== frame.body.stateUri ||
       checksum(s.state) !== s.stateHash) throw corrupt("Snapshot does not match its committed post-image");
@@ -104,7 +108,7 @@ async function inspect(p, marked = new Set()) {
   await trace(p.root, log.roots, marked);
   let head = null;
   if (latest) {
-    head = verifySnapshot(await optionalFile(join(p.snapshots, `${latest}.json`)), log.frames[latest - 1]);
+    head = verifySnapshot(await optionalFile(join(p.snapshots, `${latest}.json`)), log.frames[latest - 1], true);
   }
   for (let i = latest; i < log.frames.length; i++) {
     const frame = log.frames[i];

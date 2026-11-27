@@ -346,3 +346,17 @@ test("versioned pure fold checks frame links and pinned post-state, independent 
   const snap = JSON.parse(await fs.readFile(join(root, "runs", "r", "snapshots", "2.json")));
   assert.deepEqual(snap, { schemaVersion: 1, ...folded, stateHash: hash('{"n":2}') });
 });
+
+test("a verified earlier v1 checkpoint remains readable without modifying the retained chain", async t => {
+  const root = await fixture(t);
+  await transaction(root, "r", request("first"), () => result(1));
+  const prior = await fs.readFile(wal(root), "utf8");
+  const { seq, recordHash } = JSON.parse(prior);
+  const path = join(root, "runs", "r", "snapshots", "1.json");
+  const legacy = JSON.stringify({ schemaVersion: 1, seq, recordHash, state: { n: 1 } });
+  await fs.writeFile(path, legacy);
+  assert.deepEqual(await readState(root, "r"), { n: 1 });
+  await transaction(root, "r", request("next"), prev => result(prev.n + 1));
+  assert.equal(await fs.readFile(path, "utf8"), legacy);
+  assert.equal((await fs.readFile(wal(root), "utf8")).startsWith(prior), true);
+});
