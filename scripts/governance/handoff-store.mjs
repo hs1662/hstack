@@ -610,11 +610,20 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
   const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
 
+  const statFreshnessMs = (gitRoot, relPath) => {
+    try {
+      const st = statSync(join(gitRoot, relPath));
+      return Math.max(st.mtimeMs, st.ctimeMs);
+    } catch {
+      return null;
+    }
+  };
   const postGateHandledDocs = new Set();
   if (postGateShell.length > 0 && activeGate) {
     if (!(ledger.turnCommittedFiles instanceof Set)) {
       ledger.turnCommittedFiles = new Set();
     }
+    const postGateStep = datingStep(postGateShell);
     const gateDocCandidates = new Set(sinceGate);
     for (const relPath of Object.keys(current.docFiles ?? {})) {
       gateDocCandidates.add(relPath);
@@ -627,6 +636,9 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
         gateDocCandidates.add(relPath);
       }
     }
+    const postGateDocTruncated = Boolean(activeGate.docFilesTruncated || current.docFilesTruncated);
+    const gateCutoffMs = Number.isFinite(activeGate.capturedAtMs) ? activeGate.capturedAtMs - 10 : 0;
+    let sawTruncatedPostGateDoc = false;
     for (const relPath of gateDocCandidates) {
       const inSinceGate = sinceGate.has(relPath);
       if (inSinceGate) {
@@ -637,46 +649,82 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       }
       const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
       const gateDoc = activeGate?.docFiles?.[relPath];
-      const hasDefinitePostGateDocChange =
+      let hasDefinitePostGateDocChange =
         gateDoc !== undefined
           ? !sameFileSignature(gateDoc, nowDoc)
-          : inSinceGate || (!activeGate.docFilesTruncated && nowDoc !== undefined);
+          : inSinceGate || (!postGateDocTruncated && nowDoc !== undefined);
+      if (!hasDefinitePostGateDocChange && gateDoc === undefined && postGateDocTruncated && postGateWriter) {
+        const freshMs = statFreshnessMs(current.gitRoot, relPath);
+        if (freshMs !== null && freshMs >= gateCutoffMs) {
+          hasDefinitePostGateDocChange = true;
+        } else {
+          sawTruncatedPostGateDoc = true;
+        }
+      }
       if (hasDefinitePostGateDocChange) {
         ledger.turnWrittenFiles.add(relPath);
-        ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+        ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postGateStep);
         postGateHandledDocs.add(relPath);
       }
     }
+    if (postGateDocTruncated && postGateWriter && !sawTruncatedPostGateDoc && gateDocCandidates.size === 0) {
+      sawTruncatedPostGateDoc = true;
+    }
+    if (sawTruncatedPostGateDoc && !postGateHandledDocs.size) {
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postGateStep);
+    }
   }
 
-  if (sinceTurn.size > 0) {
-    if (!(ledger.turnCommittedFiles instanceof Set)) {
-      ledger.turnCommittedFiles = new Set();
+  const turnDocCandidates = new Set(sinceTurn);
+  if (shellExecs.length > 0 && current && baseline) {
+    for (const relPath of Object.keys(current.docFiles ?? {})) {
+      turnDocCandidates.add(relPath);
     }
-    for (const relPath of sinceTurn) {
-      ledger.turnCommittedFiles.add(relPath);
+    for (const relPath of Object.keys(baseline.docFiles ?? {})) {
+      turnDocCandidates.add(relPath);
+    }
+    for (const relPath of dirtyFiles) {
       if (isExemptDocOrAssetPath(relPath)) {
-        if (postGateHandledDocs.has(relPath)) {
-          continue;
-        }
-        const beforeDoc = baseline.docFiles?.[relPath];
-        const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
-        if (beforeDoc === undefined && baseline.docFilesTruncated) {
-          continue;
-        }
-        const docChangedThisTurn = beforeDoc !== undefined ? !sameFileSignature(beforeDoc, nowDoc) : nowDoc !== undefined;
-        if (!docChangedThisTurn) {
-          continue;
-        }
-        const alreadyTrackedByTool = preGateKeepsToolDate(relPath);
-        ledger.turnWrittenFiles.add(relPath);
-        if (!alreadyTrackedByTool) {
-          const preStep = preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex;
-          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, preStep);
-        }
+        turnDocCandidates.add(relPath);
       }
     }
   }
+  if (sinceTurn.size > 0 && !(ledger.turnCommittedFiles instanceof Set)) {
+    ledger.turnCommittedFiles = new Set();
+  }
+  const turnDocTruncated = Boolean(baseline.docFilesTruncated || current.docFilesTruncated);
+  const turnCutoffMs = Number.isFinite(baseline.capturedAtMs) ? baseline.capturedAtMs - 10 : 0;
+  for (const relPath of turnDocCandidates) {
+    if (sinceTurn.has(relPath)) {
+      ledger.turnCommittedFiles.add(relPath);
+    }
+    if (!isExemptDocOrAssetPath(relPath) || postGateHandledDocs.has(relPath)) {
+      continue;
+    }
+    const beforeDoc = baseline.docFiles?.[relPath];
+    const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
+    let docChangedThisTurn = false;
+    if (beforeDoc !== undefined) {
+      docChangedThisTurn = !sameFileSignature(beforeDoc, nowDoc);
+    } else if (sinceTurn.has(relPath)) {
+      docChangedThisTurn = !baseline.docFilesTruncated && nowDoc !== undefined;
+    } else if (!turnDocTruncated) {
+      docChangedThisTurn = nowDoc !== undefined;
+    } else if (riskyShellExecs.length > 0) {
+      const freshMs = statFreshnessMs(current.gitRoot, relPath);
+      docChangedThisTurn = freshMs !== null && freshMs >= turnCutoffMs;
+    }
+    if (!docChangedThisTurn) {
+      continue;
+    }
+    const alreadyTrackedByTool = preGateKeepsToolDate(relPath);
+    ledger.turnWrittenFiles.add(relPath);
+    if (!alreadyTrackedByTool && (preGateShell.some(isRiskyShellExec) || sinceTurn.has(relPath))) {
+      const preStep = preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex;
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, preStep);
+    }
+  }
+
   if (sinceTurn.size > 0 && diffNumstat instanceof Map && baseline.head !== null) {
     const turnNumstat = readNumstatSinceHead(current.gitRoot, baseline.head);
     if (turnNumstat === null) {
@@ -697,14 +745,6 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       }
     }
   }
-  const statFreshnessMs = (gitRoot, relPath) => {
-    try {
-      const st = statSync(join(gitRoot, relPath));
-      return Math.max(st.mtimeMs, st.ctimeMs);
-    } catch {
-      return null;
-    }
-  };
   const signatureIn = (snapObj, relPath) => {
     if (!snapObj) {
       return undefined;

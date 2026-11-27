@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import {
   extractLinePrefixType,
   findLastLine,
@@ -887,6 +887,91 @@ function isVersionProbe(bin, arg) {
     return bin === "go" || bin === "cargo";
   }
   return arg === "--version" || arg === "-V" || arg === "--help" || arg === "-h" || (arg === "-v" && bin !== "pytest");
+}
+
+// Parse `-m pytest|py.test` through Python interpreter options (`-u`, `-W arg`, `-X arg`, ...).
+function parsePythonPytestArgs(args) {
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === "--version" || arg === "-V" || arg === "--help" || arg === "-h") {
+      return null;
+    }
+    if (!arg.startsWith("-")) {
+      return null;
+    }
+    const flag = /^-[A-Za-z]*?([cmWX]|$)/.exec(arg)?.[1];
+    if (flag === "c") {
+      return null;
+    }
+    if (flag === "m") {
+      const attached = arg.slice(arg.indexOf("m") + 1);
+      const module = attached || (args[i + 1] ?? "");
+      if (module !== "pytest" && module !== "py.test") {
+        return null;
+      }
+      return {
+        module,
+        modArgs: args.slice(attached ? i + 1 : i + 2),
+        moduleArgConsumed: attached ? i + 1 : i + 2,
+      };
+    }
+    if (PYTHON_FLAGS_WITH_ARG.has(arg)) {
+      i += 1;
+    }
+  }
+  return null;
+}
+
+function collectPrefixPytestEnv(tokens, binIdx) {
+  let envPytestAddopts = null;
+  for (let i = 0; i < binIdx; i += 1) {
+    const tok = tokens[i];
+    if (typeof tok === "string" && tok.startsWith("PYTEST_ADDOPTS=")) {
+      envPytestAddopts = tok.slice("PYTEST_ADDOPTS=".length);
+    }
+  }
+  return envPytestAddopts;
+}
+
+export function extractPytestCommandInfo(segment) {
+  if (typeof segment !== "string" || segment.trim().length === 0) {
+    return null;
+  }
+  const cleaned = segment.trim().replace(/^[(!\s]+/, "");
+  const tokens = tokenizeSegment(cleaned);
+  if (!tokens || tokens.length === 0) {
+    return null;
+  }
+  const idx = skipCommandPrefix(tokens);
+  if (idx === -1 || idx >= tokens.length) {
+    return null;
+  }
+  const envPytestAddopts = collectPrefixPytestEnv(tokens, idx);
+  const baseBin = posix.basename(toPosix(tokens[idx]));
+  if (baseBin === "pytest" || baseBin === "py.test") {
+    return {
+      runnerKind: "pytest",
+      bin: baseBin,
+      args: tokens.slice(idx + 1),
+      envPytestAddopts,
+      prefixEndIdx: idx + 1,
+      tokens,
+    };
+  }
+  if (baseBin === "python" || baseBin === "python3" || /^python3?\.\d+$/.test(baseBin)) {
+    const pyMod = parsePythonPytestArgs(tokens.slice(idx + 1));
+    if (pyMod) {
+      return {
+        runnerKind: "python-pytest",
+        bin: baseBin,
+        args: pyMod.modArgs,
+        envPytestAddopts,
+        prefixEndIdx: idx + 1 + pyMod.moduleArgConsumed,
+        tokens,
+      };
+    }
+  }
+  return null;
 }
 
 // python runs any program, so it counts only for `-m pytest|unittest` (with actual test execution) or a test file.
@@ -3559,38 +3644,44 @@ function resolveNormalizedPath(dir) {
   }
 }
 
-function addAncestorDirs(roots, dir, stopRoot = "") {
+function addAncestorDirs(roots, dir, stopRoot = "", maxDepth = 64) {
   if (typeof dir !== "string" || dir.trim().length === 0) {
-    return;
+    return { truncated: false };
   }
   const curResolved = resolveNormalizedPath(dir);
   roots.add(curResolved);
   const stop = typeof stopRoot === "string" && stopRoot.trim().length > 0 ? resolveNormalizedPath(stopRoot) : "";
   if (!stop) {
-    return;
+    return { truncated: false };
   }
   const relFromStop = relative(stop, curResolved);
-  if (relFromStop.startsWith("..") || isAbsolute(relFromStop)) {
-    return;
+  const isOutsideStop =
+    relFromStop === ".." ||
+    relFromStop.startsWith(`..${sep}`) ||
+    relFromStop.startsWith("../") ||
+    isAbsolute(relFromStop);
+  if (isOutsideStop) {
+    return { truncated: false };
   }
   let cur = curResolved;
-  for (let depth = 0; depth < 32; depth += 1) {
+  for (let depth = 0; depth < maxDepth; depth += 1) {
     roots.add(cur);
     if (cur === stop) {
-      break;
+      return { truncated: false };
     }
     const parent = dirname(cur);
     if (parent === cur) {
-      break;
+      return { truncated: false };
     }
     cur = parent;
   }
+  return { truncated: cur !== stop };
 }
 
-export function detectTestInfrastructure(cwd, gitRoot = null) {
+export function detectTestInfrastructure(cwd, gitRoot = null, { maxDepth = 64 } = {}) {
   const indicators = new Set();
   const roots = new Set();
-  addAncestorDirs(roots, cwd, gitRoot);
+  const walk = addAncestorDirs(roots, cwd, gitRoot, maxDepth);
   if (typeof gitRoot === "string" && gitRoot.trim().length > 0) {
     roots.add(gitRoot);
   }
@@ -3600,5 +3691,6 @@ export function detectTestInfrastructure(cwd, gitRoot = null) {
   return {
     hasTestSuite: indicators.size > 0,
     indicators: [...indicators],
+    ...(walk?.truncated ? { uncertain: true } : {}),
   };
 }
