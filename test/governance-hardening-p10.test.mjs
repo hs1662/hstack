@@ -1,15 +1,15 @@
 // v0.1.2 gate audit run 5 (Round H): untracked overflow vs tracked edits, strict npx/npm/go whitelist, sequential pipefail.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 
 import { analyzeField } from "../scripts/analyzer.mjs";
 import { AUDITOR_SESSION_MARKER, CHALLENGER_SESSION_MARKER, GATE_TOOL_NAME, VERDICT_HEADERS } from "../scripts/governance/constants.mjs";
 import { decideGate } from "../scripts/governance/decide-gate.mjs";
-import { classifyCommand, inferExecutionFailure, listCommittedPaths, readFactLedger, readNumstatSinceHead, readSessionRole, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
-import { mergeShellWrittenFiles, resolveSessionStatePath, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
+import { classifyCommand, commandMatchesExpectedTokens, extractChainPrepSignature, inferExecutionFailure, listCommittedPaths, readFactLedger, readGitLedger, readNumstatSinceHead, readSessionRole, snapshotWorkingTree } from "../scripts/governance/fact-ledger.mjs";
+import { mergeShellWrittenFiles, resolveSessionStatePath, saveGateSnapshot, saveTurnSnapshot, updateSessionPollutionState } from "../scripts/governance/handoff-store.mjs";
 import { classifyRisk } from "../scripts/governance/risk-classifier.mjs";
 import { readTranscriptSteps } from "../scripts/hook-io.mjs";
 import { createMcpServerHandler } from "../scripts/mcp/server.mjs";
@@ -2893,6 +2893,7 @@ describe("H11 OMH gpt-6.2-astra round-7 regressions (P1 F1-F10, P2 F11)", () => 
         },
       },
     ]);
+    assert.equal(Math.floor(lstatSync(join(repo, "app.mjs")).mtimeMs), frozenTime.getTime());
     assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts.join(" | "));
     assertGateBlocked(out);
   });
@@ -3036,5 +3037,296 @@ describe("H11 OMH gpt-6.2-astra round-7 regressions (P1 F1-F10, P2 F11)", () => 
       ledgerLastWriteStepIndex: ledger.lastWriteStepIndex,
     });
     assert.equal(ev.ok, false, "eslint --rule 'node --test' must not match expected node --test executable");
+  });
+});
+
+describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () => {
+  it("R8-F1: detects pre-gate dirty edit on other file even when a later PASS gate snapshot is missing", () => {
+    const repo = makeRepo();
+    git(repo, ["commit", "-q", "--allow-empty", "-m", "init"]);
+    writeFileSync(join(repo, "other.mjs"), "export const other = 1;\n");
+    git(repo, ["add", "other.mjs"]);
+    git(repo, ["commit", "-q", "-m", "add other"]);
+
+    const convId = "p10-r8-f1-missing-gate-snap-and-other";
+    const { verdicts, out } = runTurnOnRepo(repo, convId, [
+      { write: "app.mjs", content: "export const v = 2;\n" },
+      { cmd: "echo ok", output: "ok", effect: (r) => writeFileSync(join(r, "other.mjs"), "export const other = 2;\n") },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["app.mjs", "other.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "수정 및 검증을 완료했습니다.",
+        },
+      },
+      {
+        cmd: "node --version",
+        output: "v22.0.0",
+        effect: () => rmSync(resolveSessionStatePath(convId, DATA_DIR), { force: true }),
+      },
+    ]);
+    assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts.join(" | "));
+    assertGateBlocked(out);
+  });
+
+  it("R8-F2: evicts stale 1st-PASS gate snapshot when 2nd-PASS gate snapshot fails to save", () => {
+    const repo = makeRepo();
+    const convId = "p10-r8-f2-stale-first-gate";
+    const { verdicts, out } = runTurnOnRepo(repo, convId, [
+      { write: "app.mjs", content: "export const v = 2;\n" },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "1차 검증을 완료했습니다.",
+        },
+      },
+      { write: "app.mjs", content: "export const v = 3;\n" },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: ["app.mjs"],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "2차 검증을 완료했습니다.",
+        },
+      },
+      {
+        cmd: "node --version",
+        output: "v22.0.0",
+        effect: () => {
+          const snapPath = resolveSessionStatePath(convId, DATA_DIR);
+          const data = JSON.parse(readFileSync(snapPath, "utf8"));
+          if (data.turnSnapshot?.gate) {
+            data.turnSnapshot.gate.passCount = 1;
+            writeFileSync(snapPath, JSON.stringify(data));
+          }
+          saveGateSnapshot({ conversationId: convId, snapshot: null, dataDir: DATA_DIR, gatePassCount: 2 });
+        },
+      },
+    ]);
+    assert.equal(verdicts[0], VERDICT_HEADERS.PASS);
+    assert.equal(verdicts[1], VERDICT_HEADERS.PASS);
+    assertGateBlocked(out);
+  });
+
+  it("R8-F3: sets TIER_1 and stops fail-closed when untracked file line count cannot be read cleanly", () => {
+    const repo = makeRepo();
+    const badFile = join(repo, "unreadable.mjs");
+    writeFileSync(badFile, "export const secret = 1;\n");
+    const realGit = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const fakeBin = createTempDir("hstack-p10-r8-f3-git-");
+    const fakeGit = join(fakeBin, "git");
+    writeFileSync(
+      fakeGit,
+      `#!/bin/sh\nif echo "$*" | grep -q -- "--numstat"; then exit 128; fi\nexec "${realGit}" "$@"\n`,
+      { mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${prevPath}`;
+    try {
+      const gl = readGitLedger(repo);
+      assert.equal(gl.gitAvailable, true);
+      assert.equal(gl.diffNumstatUnavailable, true);
+      unlinkSync(badFile);
+      const glClean = readGitLedger(repo);
+      assert.equal(glClean.gitAvailable, true);
+      assert.equal(glClean.diffNumstatUnavailable, true);
+    } finally {
+      process.env.PATH = prevPath;
+    }
+
+    const untrackedRepo = makeRepo();
+    symlinkSync(join(untrackedRepo, "missing-target.mjs"), join(untrackedRepo, "broken.mjs"));
+    const convId = "p10-r8-f3-untracked-unreadable";
+    const { out } = runTurnOnRepo(untrackedRepo, convId, [
+      { cmd: "echo ok", output: "ok" },
+    ]);
+    assertGateBlocked(out);
+  });
+
+  it("R8-F4: respects pytest INI precedence (pytest.ini stops fallback to setup.cfg)", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pytest.ini"), "[metadata]\nname = demo\n");
+    writeFileSync(join(repo, "setup.cfg"), "[tool:pytest]\ntestpaths = unit\n");
+    writeFileSync(join(repo, "tox.ini"), "[tool:pytest]\ntestpaths = unit\n");
+    mkdirSync(join(repo, "integration"), { recursive: true });
+    writeFileSync(join(repo, "integration/test_a.py"), "def test_a(): pass\n");
+
+    const transcriptPath = join(createTempDir("hstack-p10-r8-f4-"), "t.jsonl");
+    writeFileSync(
+      transcriptPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 고쳐줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const x = 1;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest integration/test_a.py", Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const ledger = readFactLedger(transcriptPath, repo, gl.gitRoot);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 전체 실행을 확인했습니다.",
+      },
+      { cwd: repo, ledger, gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "PASS", `Blocked rules: ${dec.blockedRules.join(",")}`);
+
+    // Fallback to setup.cfg must still work cleanly when tox.ini has [tool:pytest] only (which tox.ini ignores).
+    const repo2 = makeRepo();
+    writeFileSync(join(repo2, "tox.ini"), "[tool:pytest]\ntestpaths = unit\n");
+    mkdirSync(join(repo2, "integration"), { recursive: true });
+    writeFileSync(join(repo2, "integration/test_b.py"), "def test_b(): pass\n");
+    const tr2 = join(createTempDir("hstack-p10-r8-f4b-"), "t.jsonl");
+    writeFileSync(
+      tr2,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 고쳐줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo2, "app.mjs"), Content: "export const x = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest integration/test_b.py", Cwd: repo2 } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo2 } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl2 = readGitLedger(repo2);
+    const dec2 = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "pytest 전체 실행을 확인했습니다.",
+      },
+      { cwd: repo2, ledger: readFactLedger(tr2, repo2, gl2.gitRoot), gitLedger: gl2, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec2.verdict, "PASS", `tox.ini ignores [tool:pytest]: ${dec2.blockedRules.join(",")}`);
+  });
+
+  it("R8-F5: preserves commas inside quoted pytest paths and parses TOML string arrays without naive comma split", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "pyproject.toml"), '[tool.pytest.ini_options]\ntestpaths = ["tests/a,b"]\n');
+    mkdirSync(join(repo, "tests/a,b"), { recursive: true });
+    writeFileSync(join(repo, "tests/a,b/test_comma.py"), "def test_comma(): pass\n");
+
+    const transcriptPath = join(createTempDir("hstack-p10-r8-f5-"), "t.jsonl");
+    writeFileSync(
+      transcriptPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 고쳐줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const x = 2;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: 'pytest "tests/a,b/test_comma.py"', Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "pytest", Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const ledger = readFactLedger(transcriptPath, repo, gl.gitRoot);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: "pytest", outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "쉼표 포함 경로 pytest 재실행을 확인했습니다.",
+      },
+      { cwd: repo, ledger, gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "PASS", `Blocked rules: ${dec.blockedRules.join(",")}`);
+  });
+
+  it("R8-F6: treats pytest -k quoted tokens as exact match without space collapsing", () => {
+    const repo = makeRepo();
+    const transcriptPath = join(createTempDir("hstack-p10-r8-f6-"), "t.jsonl");
+    writeFileSync(
+      transcriptPath,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "테스트 확인" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: join(repo, "app.mjs"), Content: "export const x = 3;\n" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: 'pytest -k "foo   bar"', Cwd: repo } }] },
+        { step_index: 4, type: "GENERIC", status: "ERROR", content: "FAILED" },
+        { step_index: 5, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: 'pytest -k "foo bar"', Cwd: repo } }] },
+        { step_index: 6, type: "GENERIC", status: "DONE", content: "1 passed" },
+      ]),
+    );
+    const gl = readGitLedger(repo);
+    const ledger = readFactLedger(transcriptPath, repo, gl.gitRoot);
+    const dec = decideGate(
+      {
+        modified_files: ["app.mjs"],
+        inspected_files: [],
+        verification_runs: [{ command: 'pytest -k "foo bar"', outcome: "pass" }],
+        unverified_scope: [],
+        self_assessment: "확인 완료.",
+      },
+      { cwd: repo, ledger, gitLedger: gl, testInfra: { hasTestSuite: true }, auditEscalation: "off" },
+    );
+    assert.equal(dec.verdict, "REJECT");
+    assert.ok(dec.blockedRules.includes("R3_CONCEALED_FAILURE"));
+  });
+
+  it("R8-F7: extractChainPrepSignature parses wrapper flags without getting tricked by attached paths named env", () => {
+    const sig1 = extractChainPrepSignature("env -Cconfig/env npm ci");
+    const sig2 = extractChainPrepSignature("env -Cother/env npm ci");
+    assert.ok(sig1 && sig2, `expected valid prep signatures: ${sig1}, ${sig2}`);
+    assert.notEqual(sig1, sig2);
+  });
+
+  it("R8-F8: blocks make dry-run/help/override variants via attached numeric -j/-l and long flags", () => {
+    assert.equal(classifyCommand("make -j4 -n test"), "other");
+    assert.equal(classifyCommand("make -j4 --print-directory=no -B SHELL=/bin/true test"), "other");
+    assert.equal(classifyCommand("make -B test"), "verification");
+    assert.equal(classifyCommand("make --silent test"), "verification");
+    assert.equal(classifyCommand("make --jobs=4 --always-make test"), "verification");
+  });
+
+  it("R8-F9: tracks committed README/doc write in R4 even when git dirty list clears after commit", () => {
+    const repo = makeRepo();
+    writeFileSync(join(repo, "README.md"), "# initial\n");
+    git(repo, ["add", "README.md"]);
+    git(repo, ["commit", "-q", "-m", "add readme"]);
+
+    const { verdicts } = runTurnOnRepo(repo, "p10-r8-f9-doc-commit", [
+      { write: "README.md", content: "# changed and committed\n" },
+      {
+        cmd: "git commit -am update-readme",
+        effect: (r) => git(r, ["commit", "-qam", "update-readme"]),
+      },
+      { cmd: "node --test", output: PASS_OUTPUT },
+      {
+        gate: {
+          modified_files: [],
+          inspected_files: [],
+          verification_runs: [{ command: "node --test", outcome: "pass" }],
+          unverified_scope: [],
+          self_assessment: "문서 수정 및 테스트 완료.",
+        },
+      },
+    ]);
+    assert.equal(verdicts[0], VERDICT_HEADERS.REJECT_NEUTRAL, `missing committed README must trigger R4: ${verdicts[0]}`);
+  });
+
+  it("R8-F10: commandMatchesExpectedTokens unwraps sh -c wrapper for L16 expected command match", () => {
+    assert.equal(commandMatchesExpectedTokens('sh -c "node --test"', ["node", "--test"]), true);
+    assert.equal(commandMatchesExpectedTokens('bash -lc "npx vitest run"', ["npx", "vitest"]), true);
   });
 });
