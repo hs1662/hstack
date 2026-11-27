@@ -574,6 +574,16 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     }
     return true;
   }
+  if (sinceTurn.size > 0) {
+    if (!(ledger.turnCommittedFiles instanceof Set)) {
+      ledger.turnCommittedFiles = new Set();
+    }
+    for (const relPath of sinceTurn) {
+      if (!isExemptDocOrAssetPath(relPath)) {
+        ledger.turnCommittedFiles.add(relPath);
+      }
+    }
+  }
   if (sinceTurn.size > 0 && diffNumstat instanceof Map && baseline.head !== null) {
     const turnNumstat = readNumstatSinceHead(current.gitRoot, baseline.head);
     if (turnNumstat === null) {
@@ -623,6 +633,15 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
   const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
   const postGateWriter = postGateShell.some(isRiskyShellExec);
+  if (lastGateStep !== -1 && !baseline.gate) {
+    const postMissingGateExec = shellExecs.findLast((exec) => exec.stepIndex > lastGateStep && isRiskyShellExec(exec));
+    if (postMissingGateExec) {
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postMissingGateExec.stepIndex);
+      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, postMissingGateExec.stepIndex);
+      syncPendingAsyncAfterWrite(ledger);
+      return true;
+    }
+  }
   const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
   const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
   const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
@@ -749,7 +768,7 @@ function summarizeDiffStat(gitLedger) {
 
 function collectRecentVerifications(ledger) {
   const execs = Array.isArray(ledger?.turnExecutions) ? ledger.turnExecutions : [];
-  const verifications = execs.filter((exec) => exec.kind === "verification");
+  const verifications = execs.filter((exec) => exec.kind === "verification" && exec.hasResult !== false);
   return verifications.slice(-MAX_RECENT_VERIFICATIONS).map((exec) => ({
     command: exec.command || "",
     passed: Boolean(exec.passed),
@@ -761,7 +780,7 @@ function detectEpistemicWarnings(verifiedFacts, ledger, cwd, gitRoot) {
   const warnings = [];
   const readFiles = ledger?.sessionReadFiles instanceof Set ? ledger.sessionReadFiles : new Set();
   const verifications = Array.isArray(ledger?.turnExecutions)
-    ? ledger.turnExecutions.filter((exec) => exec.kind === "verification")
+    ? ledger.turnExecutions.filter((exec) => exec.kind === "verification" && exec.hasResult !== false)
     : [];
   const lastVerification = verifications.length > 0 ? verifications[verifications.length - 1] : null;
   const hasUnresolvedFailure = Boolean(lastVerification && !lastVerification.passed);

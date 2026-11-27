@@ -145,9 +145,64 @@ function normalizeTestpathItem(raw) {
   return raw.trim().replace(/^['"]|['"]$/g, "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
 }
 
+function splitQuotedWhitespace(rawValue, { splitComma = false } = {}) {
+  const items = [];
+  let cur = "";
+  let quote = null;
+  let hasToken = false;
+  for (let i = 0; i < rawValue.length; i += 1) {
+    const ch = rawValue[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < rawValue.length) {
+        i += 1;
+        cur += rawValue[i];
+      } else if (ch === quote) {
+        quote = null;
+      } else {
+        cur += ch;
+      }
+      continue;
+    }
+    if (ch === "\\" && i + 1 < rawValue.length) {
+      i += 1;
+      cur += rawValue[i];
+      hasToken = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      hasToken = true;
+      continue;
+    }
+    if (/\s/.test(ch) || (splitComma && ch === ",")) {
+      if (hasToken) {
+        items.push(cur);
+        cur = "";
+        hasToken = false;
+      }
+      continue;
+    }
+    cur += ch;
+    hasToken = true;
+  }
+  if (quote !== null) {
+    return null;
+  }
+  if (hasToken) {
+    items.push(cur);
+  }
+  return items;
+}
+
+function shlexSplitTestpaths(rawValue) {
+  const rawItems = splitQuotedWhitespace(rawValue, { splitComma: true });
+  return rawItems ? rawItems.map(normalizeTestpathItem).filter(Boolean) : null;
+}
+
 function parseIniTestpaths(text, targetSections) {
   const lines = text.split(/\r?\n/);
   let inTargetSection = false;
+  let sawTargetSection = false;
   let foundKey = false;
   const collected = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -159,6 +214,7 @@ function parseIniTestpaths(text, targetSections) {
     const secMatch = /^\[([^\]]+)\]\s*$/.exec(trimmed);
     if (secMatch) {
       inTargetSection = targetSections.has(secMatch[1].trim().toLowerCase());
+      sawTargetSection ||= inTargetSection;
       continue;
     }
     if (!inTargetSection) {
@@ -169,10 +225,9 @@ function parseIniTestpaths(text, targetSections) {
       foundKey = true;
       const firstVal = keyMatch[1].replace(/\s+[#;].*$/, "").trim();
       if (firstVal) {
-        for (const item of firstVal.split(/[\s,]+/)) {
-          const norm = normalizeTestpathItem(item);
-          if (norm) collected.push(norm);
-        }
+        const splitFirst = shlexSplitTestpaths(firstVal);
+        if (!splitFirst) return { restricted: true, paths: [] };
+        collected.push(...splitFirst);
       }
       for (let j = i + 1; j < lines.length; j += 1) {
         const nextLine = lines[j];
@@ -182,10 +237,9 @@ function parseIniTestpaths(text, targetSections) {
         }
         if (/^[ \t]+/.test(nextLine) && !nextTrimmed.startsWith("[") && !nextTrimmed.includes("=")) {
           const clean = nextTrimmed.replace(/\s+[#;].*$/, "").trim();
-          for (const item of clean.split(/[\s,]+/)) {
-            const norm = normalizeTestpathItem(item);
-            if (norm) collected.push(norm);
-          }
+          const splitNext = shlexSplitTestpaths(clean);
+          if (!splitNext) return { restricted: true, paths: [] };
+          collected.push(...splitNext);
           i = j;
         } else {
           break;
@@ -193,24 +247,20 @@ function parseIniTestpaths(text, targetSections) {
       }
     }
   }
-  return foundKey ? { restricted: true, paths: collected } : null;
+  if (!sawTargetSection) {
+    return null;
+  }
+  return foundKey ? { restricted: true, paths: collected } : { restricted: false, paths: [] };
 }
 
 function readPytestTestpaths(execDir) {
   if (!execDir || !existsSync(execDir)) {
     return { restricted: false, paths: [] };
   }
-  for (const [fileName, sections] of [
-    ["pytest.ini", new Set(["pytest"])],
-    ["tox.ini", new Set(["pytest", "tool:pytest"])],
-    ["setup.cfg", new Set(["tool:pytest"])],
-  ]) {
-    const cfgPath = join(execDir, fileName);
-    if (!existsSync(cfgPath)) {
-      continue;
-    }
+  const pytestIniPath = join(execDir, "pytest.ini");
+  if (existsSync(pytestIniPath)) {
     try {
-      const parsed = parseIniTestpaths(readFileSync(cfgPath, "utf8"), sections);
+      const parsed = parseIniTestpaths(readFileSync(pytestIniPath, "utf8"), new Set(["pytest"]));
       if (parsed) {
         return parsed;
       }
@@ -223,13 +273,38 @@ function readPytestTestpaths(execDir) {
     try {
       const text = readFileSync(pyprojPath, "utf8");
       const sect = /\[tool\.pytest\.ini_options\]([\s\S]*?)(?:\n\[|$)/.exec(text);
-      if (sect && /(?:^|\n)[ \t]*testpaths[ \t]*=/.test(sect[1])) {
-        const arrMatch = /testpaths[ \t]*=[ \t]*\[([\s\S]*?)\]/.exec(sect[1]);
-        if (!arrMatch) {
-          return { restricted: true, paths: [] };
+      if (sect) {
+        if (!/(?:^|\n)[ \t]*testpaths[ \t]*=/.test(sect[1])) {
+          return { restricted: false, paths: [] };
         }
-        const paths = arrMatch[1].split(",").map(normalizeTestpathItem).filter(Boolean);
-        return { restricted: true, paths };
+        const arrMatch = /testpaths[ \t]*=[ \t]*\[([\s\S]*?)\]/.exec(sect[1]);
+        if (arrMatch) {
+          const paths = arrMatch[1].split(",").map(normalizeTestpathItem).filter(Boolean);
+          return { restricted: true, paths };
+        }
+        const strMatch = /testpaths[ \t]*=[ \t]*(.+)/.exec(sect[1]);
+        const split = strMatch ? shlexSplitTestpaths(strMatch[1].replace(/\s+#.*$/, "")) : null;
+        return split ? { restricted: true, paths: split } : { restricted: true, paths: [] };
+      }
+      if (/^\[tool\.pytest\b/m.test(text)) {
+        return { restricted: true, paths: [] };
+      }
+    } catch {
+      return { restricted: true, paths: [] };
+    }
+  }
+  for (const [fileName, sections] of [
+    ["tox.ini", new Set(["pytest", "tool:pytest"])],
+    ["setup.cfg", new Set(["tool:pytest"])],
+  ]) {
+    const cfgPath = join(execDir, fileName);
+    if (!existsSync(cfgPath)) {
+      continue;
+    }
+    try {
+      const parsed = parseIniTestpaths(readFileSync(cfgPath, "utf8"), sections);
+      if (parsed) {
+        return parsed;
       }
     } catch {
       return { restricted: true, paths: [] };
@@ -282,7 +357,8 @@ const RUNNER_VALUE_FLAGS = new Set([
 ]);
 
 function isDefaultDiscoverableTestTarget(target, runnerPrefix, execDir = "") {
-  const rawFile = runnerPrefix.includes("pytest") ? target.split("::")[0] : target;
+  const unquoted = target.replace(/^['"]|['"]$/g, "");
+  const rawFile = runnerPrefix.includes("pytest") ? unquoted.split("::")[0] : unquoted;
   const normRaw = rawFile.replace(/\\/g, "/");
   if (normRaw.startsWith("/") || /^[A-Za-z]:\//.test(normRaw)) {
     return false;
@@ -343,8 +419,11 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   if (failedSeg === passedSeg) {
     return true;
   }
-  const failed = failedSeg.split(" ");
-  const passed = passedSeg.split(" ");
+  const failed = splitQuotedWhitespace(failedSeg);
+  const passed = splitQuotedWhitespace(passedSeg);
+  if (!failed || !passed) {
+    return false;
+  }
   if ([...failed, ...passed].some((token) => SHELL_OPERATOR_TOKEN_RE.test(token))) {
     return false;
   }
@@ -754,12 +833,13 @@ export function decideGate(input = {}, context = {}) {
     blockedRules.push("R1_UNREAD_INSPECTED");
   }
 
+  const isCompletedExec = (exec) => exec && exec.hasResult !== false;
   const hasCodeWrite = ledger.lastCodeWriteStepIndex !== -1;
   const postWriteExecutions = hasCodeWrite
     ? ledger.turnExecutions.filter((exec) => exec.stepIndex > ledger.lastCodeWriteStepIndex)
     : ledger.turnExecutions;
   const postWriteVerifications = hasCodeWrite
-    ? postWriteExecutions.filter((exec) => exec.kind === "verification")
+    ? postWriteExecutions.filter((exec) => exec.kind === "verification" && isCompletedExec(exec))
     : [];
 
   if (hasCodeWrite && postWriteVerifications.length === 0) {
@@ -820,7 +900,7 @@ export function decideGate(input = {}, context = {}) {
   }
 
   for (const writtenFile of ledger.turnWrittenFiles) {
-    if (gitLedger.gitAvailable && !gitLedger.gitDirtyFiles.has(writtenFile)) {
+    if (gitLedger.gitAvailable && !gitLedger.gitDirtyFiles.has(writtenFile) && !ledger.turnCommittedFiles?.has(writtenFile)) {
       continue;
     }
     if (!reportedModifiedSet.has(writtenFile)) {
@@ -840,11 +920,11 @@ export function decideGate(input = {}, context = {}) {
       normClaim.length > 0
         ? postWriteExecutions.filter((exec) => exec.kind !== "read_only" && claimMatchesExecution(normClaim, exec))
         : [];
-    const matchedPass = matchingExecs.some((exec) => exec.passed === true);
+    const matchedPass = matchingExecs.some((exec) => isCompletedExec(exec) && exec.passed === true);
     const coveredByR3Failure =
       hasCodeWrite &&
       blockedRules.includes("R3_CONCEALED_FAILURE") &&
-      matchingExecs.some((exec) => exec.kind === "verification" && !exec.passed);
+      matchingExecs.some((exec) => exec.kind === "verification" && isCompletedExec(exec) && !exec.passed);
     if (!matchedPass && !coveredByR3Failure) {
       details.fabricatedCommands.push(run.command || "(비어 있는 명령)");
     }
@@ -965,7 +1045,10 @@ export function decideGate(input = {}, context = {}) {
   const canDegradePreflightOnly =
     isOnlyPreflightUnvotedBlock && priorRejects >= 3 && effectiveUnverifiedScope.length >= 1;
   const needsIndependentAudit =
-    hasCodeWrite && auditEscalation === "auto" && risk.tier === "TIER_1" && sessionRole === "main";
+    (hasCodeWrite || risk.reasons.includes("numstat_unavailable")) &&
+    auditEscalation === "auto" &&
+    risk.tier === "TIER_1" &&
+    sessionRole === "main";
 
   if (canDegradeStandard && !isOnlyPreflightUnvotedBlock && needsIndependentAudit) {
     // TIER_1 changes never degrade past the independent audit, however many REJECTs pile up.

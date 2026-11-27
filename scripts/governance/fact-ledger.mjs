@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { closeSync, existsSync, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import {
@@ -103,9 +104,25 @@ const CARGO_VALUE_FLAGS = new Set(["--manifest-path", "--target", "--target-dir"
 const DENO_VERIFICATION_SUBCOMMANDS = new Set(["test", "check", "lint", "bench", "compile"]);
 const PYTEST_DRY_RUN_FLAGS = new Set(["--collect-only", "--co", "--fixtures", "--fixtures-per-test", "--markers", "--setup-plan", "--setup-only"]);
 const JS_TEST_LIST_FLAGS = new Set(["--listTests", "--list-tests", "--list", "--showConfig", "--show-config"]);
-const MAKE_DRY_RUN_LONG_FLAGS = new Set(["--just-print", "--dry-run", "--recon", "--question", "--touch", "--print-data-base", "--help", "--version"]);
-const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "o", "W", "l", "j", "E"]);
-const MAKE_NOOP_SHORT_FLAGS = new Set(["n", "q", "t", "p", "h", "v"]);
+const MAKE_DRY_RUN_LONG_FLAGS = new Set([
+  "--just-print",
+  "--dry-run",
+  "--recon",
+  "--question",
+  "--touch",
+  "--print-data-base",
+  "--help",
+  "--version",
+  "--ignore-errors",
+  "--assume-old",
+  "--old-file",
+  "--assume-new",
+  "--new-file",
+  "--what-if",
+  "--keep-going",
+]);
+const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "l", "j", "E"]);
+const MAKE_NOOP_SHORT_FLAGS = new Set(["n", "q", "t", "p", "h", "v", "i", "o", "W", "k"]);
 const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
 const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
   /^(?:--if-present|--script-shell|--userconfig|--globalconfig|--prefix|--dir|--cwd|-C|--preload|-r|--require|--import|--loader)(?:=|$)/;
@@ -1220,6 +1237,17 @@ function isChainPrepCommand({ words, redirects }) {
   return positional.length === 1 && (positional[0] === "ci" || positional[0] === "install");
 }
 
+function extractWrapperDirAfterFlag(flagToken, flagChar) {
+  if (!flagToken.startsWith("-") || flagToken.startsWith("--")) {
+    return "";
+  }
+  const fIdx = flagToken.indexOf(flagChar, 1);
+  if (fIdx === -1 || fIdx === flagToken.length - 1) {
+    return "";
+  }
+  return flagToken.slice(fIdx + 1);
+}
+
 export function extractChainPrepSignature(segment) {
   if (typeof segment !== "string" || segment.trim().length === 0) {
     return null;
@@ -1237,19 +1265,60 @@ export function extractChainPrepSignature(segment) {
     return null;
   }
   const dirParts = [];
+  let wrapperBin = "";
   for (let i = 0; i < idx; i += 1) {
     const w = parsed.words[i];
-    if ((w === "-C" || w === "--chdir" || w === "-D") && i + 1 < idx) {
-      dirParts.push(parsed.words[i + 1]);
+    if (ENV_ASSIGN_RE.test(w)) {
+      continue;
+    }
+    const base = posix.basename(toPosix(w));
+    if (SHELL_WRAPPERS.has(base)) {
+      wrapperBin = base;
+      continue;
+    }
+    const dirFlagChar = wrapperBin === "sudo" ? "D" : wrapperBin === "env" ? "C" : "";
+    if (!dirFlagChar) {
+      continue;
+    }
+    if ((w === `-${dirFlagChar}` || w === "--chdir") && i + 1 < idx) {
+      dirParts.push(posix.normalize(toPosix(parsed.words[i + 1])));
       i += 1;
-    } else if (w.startsWith("--chdir=")) {
-      dirParts.push(w.slice("--chdir=".length));
-    } else if (/^-(?:[A-Za-z]*[CD])(.+)$/.test(w)) {
-      dirParts.push(w.replace(/^-[A-Za-z]*[CD]/, ""));
+      continue;
+    }
+    if (w.startsWith("--chdir=")) {
+      dirParts.push(posix.normalize(toPosix(w.slice("--chdir=".length))));
+      continue;
+    }
+    const attached = extractWrapperDirAfterFlag(w, dirFlagChar);
+    if (attached) {
+      dirParts.push(posix.normalize(toPosix(attached)));
     }
   }
   const prefixTag = dirParts.length > 0 ? `@wrapperDir(${dirParts.join("->")}) ` : "";
   return `${prefixTag}${["npm", ...parsed.words.slice(idx + 1)].join(" ")}`;
+}
+
+export function commandMatchesExpectedTokens(commandLine, expectedTokens) {
+  if (typeof commandLine !== "string" || !Array.isArray(expectedTokens) || expectedTokens.length === 0) {
+    return false;
+  }
+  const cmds = lexVerificationChain(commandLine);
+  if (!cmds) {
+    return false;
+  }
+  for (const cmd of cmds) {
+    const idx = skipCommandPrefix(cmd.words);
+    if (idx === -1 || idx >= cmd.words.length) {
+      continue;
+    }
+    const execWords = cmd.words.slice(idx);
+    const baseBin = posix.basename(toPosix(execWords[0]));
+    const normWords = [baseBin, ...execWords.slice(1)];
+    if (normWords.length >= expectedTokens.length && expectedTokens.every((tok, k) => normWords[k] === tok)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // A known test runner, optionally behind safe assignments and wrappers. A shell `-c` body must itself match the
@@ -1417,7 +1486,8 @@ export function inferExecutionFailure(result) {
   if (!result || typeof result !== "object") {
     return false;
   }
-  if (result.status === "ERROR") {
+  const normStatus = typeof result.status === "string" ? result.status.trim().toUpperCase() : "";
+  if (normStatus === "ERROR" || normStatus === "FAILED") {
     return true;
   }
   if (typeof result.error === "string" && result.error.trim().length > 0) {
@@ -2131,6 +2201,7 @@ function createEmptyLedger(transcriptAvailable = false) {
     latestTokens: { inputTokens: null, cacheReadTokens: null, outputTokens: null },
     gateBlockedThisTurn: false,
     commitNumstatUnavailable: false,
+    turnCommittedFiles: new Set(),
   };
 }
 
@@ -2222,6 +2293,7 @@ function scanTranscriptToLedger(filePath, cwd, gitRoot, onUserInput = null, turn
     ledger.turnWorkerConversationIds = [];
     ledger.gateBlockedThisTurn = false;
     ledger.commitNumstatUnavailable = false;
+    ledger.turnCommittedFiles = new Set();
     pendingCalls = [];
     seenGenericInCurrentPlanner = false;
     asyncAuditsByConversationId.clear();
@@ -2967,6 +3039,8 @@ const SNAPSHOT_MAX_FILES = 2000;
 
 const SNAPSHOT_MAX_BUFFER = 16 * 1024 * 1024;
 
+const MAX_SNAPSHOT_HASH_BYTES = 1024 * 1024;
+
 export function statSnapshotFile(gitRoot, relPath) {
   try {
     const fullPath = join(gitRoot, relPath);
@@ -2974,6 +3048,10 @@ export function statSnapshotFile(gitRoot, relPath) {
     const modeSig = (st.mode & 0o170000) | (st.mode & 0o111);
     if (st.isSymbolicLink()) {
       return [st.mtimeMs, st.size, modeSig, readlinkSync(fullPath)];
+    }
+    if (st.isFile() && st.size <= MAX_SNAPSHOT_HASH_BYTES) {
+      const digest = createHash("sha1").update(readFileSync(fullPath)).digest("hex");
+      return [st.mtimeMs, st.size, modeSig, digest];
     }
     return [st.mtimeMs, st.size, modeSig];
   } catch {

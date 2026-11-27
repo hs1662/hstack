@@ -33,7 +33,15 @@ import {
   WORKER_ROLE_LABEL,
   WRITE_TOOL_NAMES,
 } from "../scripts/governance/constants.mjs";
-import { classifyCommand, extractMcpCheckCommands, extractSubagentTypeNames, inferExecutionFailure, readFactLedger, readGitLedger } from "../scripts/governance/fact-ledger.mjs";
+import {
+  classifyCommand,
+  commandMatchesExpectedTokens,
+  extractMcpCheckCommands,
+  extractSubagentTypeNames,
+  inferExecutionFailure,
+  readFactLedger,
+  readGitLedger,
+} from "../scripts/governance/fact-ledger.mjs";
 import {
   GATE_STOP_MARKER,
   PRE_TOOL_USE_UI_TOOLS,
@@ -2062,11 +2070,11 @@ export function evaluateGovernanceCase(
   }
 
   if (typeof exp.expectPostEditTestCommand === "string" && exp.expectPostEditTestCommand.trim().length > 0) {
-    const expectedNorm = exp.expectPostEditTestCommand.trim().replace(/\s+/g, " ");
+    const expectedTokens = exp.expectPostEditTestCommand.trim().split(/\s+/);
     const cmds = Array.isArray(governance.postEditPassingCommands) ? governance.postEditPassingCommands : [];
-    const matched = cmds.some((c) => typeof c === "string" && c.trim().replace(/\s+/g, " ").includes(expectedNorm));
+    const matched = cmds.some((c) => commandMatchesExpectedTokens(c, expectedTokens));
     if (!matched) {
-      failures.push(`Expected post-edit passing verification command "${expectedNorm}", got [${cmds.join(", ")}]`);
+      failures.push(`Expected post-edit passing verification command "${expectedTokens.join(" ")}", got [${cmds.join(", ")}]`);
     }
   }
 

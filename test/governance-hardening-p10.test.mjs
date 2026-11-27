@@ -2963,8 +2963,18 @@ describe("H11 OMH gpt-6.2-astra round-7 regressions (P1 F1-F10, P2 F11)", () => 
       { step_index: 5, type: "GENERIC", status: "FAILED", content: "" },
       { step_index: 6, type: "PLANNER_RESPONSE", tool_calls: [{ name: GATE_TOOL_NAME, args: {} }] },
     ]);
-    writeFileSync(p, raw);
-    const ledger = readFactLedger(p, "/repo", "/repo");
+    const pGate = join(dir, "failed-status-gate.jsonl");
+    writeFileSync(
+      pGate,
+      toJsonl([
+        { step_index: 0, type: "USER_INPUT", content: "수정해 줘" },
+        { step_index: 1, type: "PLANNER_RESPONSE", tool_calls: [{ name: "write_file", args: { Path: "/repo/src/calc.mjs" } }] },
+        { step_index: 2, type: "GENERIC", status: "DONE", content: "ok" },
+        { step_index: 3, type: "PLANNER_RESPONSE", tool_calls: [{ name: "run_command", args: { CommandLine: "node --test" } }] },
+        { step_index: 4, type: "GENERIC", status: "FAILED", content: "" },
+      ]),
+    );
+    const gateLedger = readFactLedger(pGate, "/repo", "/repo");
 
     const gateDec = decideGate(
       {
@@ -2976,7 +2986,7 @@ describe("H11 OMH gpt-6.2-astra round-7 regressions (P1 F1-F10, P2 F11)", () => 
       },
       {
         cwd: "/repo",
-        ledger,
+        ledger: gateLedger,
         gitLedger: { gitAvailable: false, gitRoot: "/repo", gitDirtyFiles: new Set() },
         testInfra: { hasTestSuite: true },
         auditEscalation: "off",
@@ -2985,6 +2995,8 @@ describe("H11 OMH gpt-6.2-astra round-7 regressions (P1 F1-F10, P2 F11)", () => 
     assert.equal(gateDec.verdict, "REJECT");
     assert.ok(gateDec.blockedRules.includes("R3_CONCEALED_FAILURE"));
 
+    writeFileSync(p, raw);
+    const ledger = readFactLedger(p, "/repo", "/repo");
     const liveEval = evaluateGovernanceCase(l16, {
       steps: parseTranscriptJsonl(raw),
       auditRecords: [
