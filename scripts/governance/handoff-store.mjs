@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { resolvePluginDataDir } from "../hook-io.mjs";
+import { classifyCanaryTurn, createCanaryState, transitionCanary } from "./language-canary.mjs";
 import {
   DEFAULT_POLLUTION_THRESHOLDS,
   HANDOFF_COPY,
@@ -28,6 +29,7 @@ import {
   SNAPSHOT_UNREADABLE_SIGNATURE,
   listCommittedPaths,
   normalizeWorkspacePath,
+  readGitLedger,
   readNumstatSinceHead,
   resolveGitRootFast,
   snapshotWorkingTree,
@@ -314,6 +316,40 @@ export function readSessionState(conversationId, dataDir = resolvePluginDataDir(
   } catch {
     return null;
   }
+}
+
+// Lock order: session, then workspace (only on handoff). A replay or a late hook
+// cannot count the same user turn twice or move the observed frontier backwards.
+export function recordLanguageCanaryTurn({ conversationId, cwd, user, reply, request, ledger, config, dataDir }) {
+  if (!cwd || !conversationId || !Number.isSafeInteger(user?.stepIndex) || !reply) return null;
+  const classification = classifyCanaryTurn({ text: reply.content, userRequest: request }, config);
+  if (!classification.applicable) return null;
+  const filePath = resolveSessionStatePath(conversationId, dataDir);
+  return withSessionLock(filePath, () => {
+    const session = readSessionState(conversationId, dataDir) ?? {};
+    if (Number.isSafeInteger(session.canaryTurn) && user.stepIndex <= session.canaryTurn) return null;
+    const { state, event } = transitionCanary(session.languageCanary ?? createCanaryState(), classification, config);
+    let message = null;
+    let canaryHandoff = session.canaryHandoff;
+    if (event === "load_failure") {
+      message = "[카나리아:load_failure] 첫 유효 응답이 한국어에서 이탈했습니다. 새 세션으로 교체하기 전에 한국어 규칙이 로드됐는지 확인하세요.";
+    } else if (event === "suspect") {
+      message = "[카나리아:suspect] 한국어 산문 이탈이 반복됐습니다. 현재 세션의 한국어 규칙을 다시 고정하세요.";
+    } else if (event === "handoff_required") {
+      const pinOwner = `canary:${createHash("sha256").update(conversationId).digest("hex").slice(0, 24)}`;
+      const { snapshot } = saveHandoffSnapshot({
+        conversationId, cwd, ledger, dataDir, pinOwner, gitLedger: readGitLedger(cwd),
+        input: {
+          objective: "언어 이탈 이전 세션의 작업 상태 인계",
+          remaining_tasks: ["새 세션에서 작업 목표와 미검증 항목을 재확인하세요."],
+        },
+      });
+      canaryHandoff = { snapshotId: snapshot.snapshotId, pinOwner };
+      message = `[카나리아:handoff_required] 핸드오프 ${snapshot.snapshotId}를 고정했습니다(소유자 ${pinOwner}). 새 세션에서 이 ID를 불러오세요. 완료 검증 판정과는 별개입니다.`;
+    }
+    atomicWriteJson(filePath, { ...session, canaryTurn: user.stepIndex, languageCanary: state, canaryHandoff });
+    return message;
+  });
 }
 
 export function updateSessionPollutionState({

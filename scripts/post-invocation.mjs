@@ -7,6 +7,7 @@ import { detectSessionRoleFromHeaderSteps, readFactLedgerAndSteps, readTurnLedge
 import {
   claimAutonomyTurnFlag,
   markPreflightChallengeLogged,
+  recordLanguageCanaryTurn,
   resolveEffectiveConversationKey,
   updateSessionPollutionState,
 } from "./governance/handoff-store.mjs";
@@ -20,7 +21,7 @@ import {
   resolvePluginDataDir,
   runHookCli,
 } from "./hook-io.mjs";
-import { decideHookAction } from "./transcript.mjs";
+import { decideHookAction, getToolCalls } from "./transcript.mjs";
 
 export { readTranscriptSteps };
 
@@ -87,6 +88,7 @@ function tryLogCompletedPreflightChallenges(conversationId, ledger, dataDir) {
 
 function evaluateAndLogPostInvocation(context, decision, options = {}) {
   let autoHandoffMessage = null;
+  let canaryMessage = null;
   try {
     const { payload, transcriptPath, steps } = context;
     const dataDir = options.dataDir ?? resolvePluginDataDir();
@@ -99,6 +101,27 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
     const tokens = ledger?.latestTokens ?? { inputTokens: null, cacheReadTokens: null, outputTokens: null };
     const cfg = options.governanceConfig ?? readGovernanceConfig(dataDir);
     const autonomyMode = resolveAutonomyMode(dataDir, cfg);
+
+    // A PostInvocation may follow every tool call. Sample only the completed
+    // assistant reply for the last real user turn, never a tool's response.
+    if (sessionRole === "main" && conversationId && cwd) {
+      let user = null;
+      let reply = null;
+      for (let i = steps.length - 1; i >= 0; i--) {
+        if (steps[i].type === "USER_INPUT") { user = steps[i]; break; }
+        if (!reply && steps[i].type === "PLANNER_RESPONSE") reply = steps[i];
+      }
+      if (user && reply && !getToolCalls(reply).length) {
+        try {
+          canaryMessage = recordLanguageCanaryTurn({
+            conversationId, cwd, user, reply, ledger, config: cfg?.languageCanary, dataDir,
+            request: payload.lastUserInput ?? payload.last_user_input ?? user.content,
+          });
+        } catch {
+          // Contention or an unavailable store must not change the legacy gate or claim a saved handoff.
+        }
+      }
+    }
 
     let pollutionState = null;
     if (sessionRole !== "auditor" && sessionRole !== "challenger" && conversationId) {
@@ -198,7 +221,7 @@ function evaluateAndLogPostInvocation(context, decision, options = {}) {
     );
   } catch {
   }
-  return autoHandoffMessage;
+  return [autoHandoffMessage, canaryMessage].filter(Boolean);
 }
 
 function loadContextWithLedger(stdinText) {
@@ -229,9 +252,9 @@ export function handlePostInvocation(stdinText, readTextFileOrOptions) {
   const langOptions = typeof rawLastUserInput === "string" ? { lastUserInput: rawLastUserInput } : {};
   const decision = decideHookAction(steps, langOptions);
 
-  let autoHandoffMessage = null;
+  let advisories = [];
   if (!isFn) {
-    autoHandoffMessage = evaluateAndLogPostInvocation(context, decision, options);
+    advisories = evaluateAndLogPostInvocation(context, decision, options);
   }
 
   const injectSteps = [];
@@ -242,10 +265,10 @@ export function handlePostInvocation(stdinText, readTextFileOrOptions) {
       },
     });
   }
-  if (autoHandoffMessage) {
+  for (const message of advisories) {
     injectSteps.push({
       systemMessage: {
-        systemMessage: autoHandoffMessage,
+        systemMessage: message,
       },
     });
   }
