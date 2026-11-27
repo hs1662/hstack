@@ -121,8 +121,35 @@ const MAKE_DRY_RUN_LONG_FLAGS = new Set([
   "--what-if",
   "--keep-going",
 ]);
-const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "l", "j", "E"]);
+const MAKE_SAFE_LONG_FLAGS = new Set([
+  "--always-make",
+  "--silent",
+  "--quiet",
+  "--no-print-directory",
+  "--print-directory",
+  "--no-builtin-rules",
+  "--no-builtin-variables",
+  "--warn-undefined-variables",
+  "--environment-overrides",
+  "--check-symlink-times",
+  "--trace",
+  "--debug",
+  "--jobs",
+  "--load-average",
+  "--max-load",
+  "--directory",
+  "--file",
+  "--makefile",
+  "--include-dir",
+  "--output-sync",
+  "--shuffle",
+  "--stop-on-failure",
+  "--stop-on-error",
+]);
+const MAKE_LONG_VALUE_FLAGS = new Set(["--directory", "--file", "--makefile", "--include-dir", "--output-sync", "--shuffle", "--jobs", "--load-average", "--max-load", "--debug"]);
+const MAKE_VALUE_FLAGS = new Set(["f", "C", "I", "l", "j"]);
 const MAKE_NOOP_SHORT_FLAGS = new Set(["n", "q", "t", "p", "h", "v", "i", "o", "W", "k"]);
+const MAKE_SAFE_SHORT_FLAGS = new Set(["B", "s", "w", "r", "R", "S", "d", "e", "L", "O"]);
 const SCRIPT_RUNNER_SAFE_VALUE_FLAGS = new Set(["-w", "--workspace", "--filter", "-F"]);
 const SCRIPT_RUNNER_BLOCKED_FLAG_RE =
   /^(?:--if-present|--script-shell|--userconfig|--globalconfig|--prefix|--dir|--cwd|-C|--preload|-r|--require|--import|--loader)(?:=|$)/;
@@ -1077,58 +1104,81 @@ function isJsTestToolArgsSafe(tool, toolArgs) {
 function isMakeVerification(args) {
   const sepIdx = args.indexOf("--");
   const head = sepIdx === -1 ? args : args.slice(0, sepIdx);
-  for (let i = 0; i < head.length; i += 1) {
-    const arg = head[i];
-    if (/^(?:MAKEFLAGS|GNUMAKEFLAGS)=/.test(arg)) {
+  const blockedArgs = (sepIdx === -1 ? head : args);
+  for (let i = 0; i < blockedArgs.length; i += 1) {
+    const arg = blockedArgs[i];
+    if (/^(?:MAKEFLAGS|GNUMAKEFLAGS|SHELL|MAKE)=/.test(arg)) {
       return false;
     }
+    if (arg === "--" || !arg.startsWith("-")) {
+      continue;
+    }
     if (arg.startsWith("--")) {
-      const flagName = arg.split("=", 1)[0];
-      if (MAKE_DRY_RUN_LONG_FLAGS.has(flagName)) {
+      const eqIdx = arg.indexOf("=");
+      const flagName = eqIdx === -1 ? arg : arg.slice(0, eqIdx);
+      if (MAKE_DRY_RUN_LONG_FLAGS.has(flagName) || !MAKE_SAFE_LONG_FLAGS.has(flagName)) {
         return false;
+      }
+      if (eqIdx !== -1 && !MAKE_LONG_VALUE_FLAGS.has(flagName)) {
+        return false;
+      }
+      if (eqIdx !== -1 && (flagName === "--jobs" || flagName === "--load-average" || flagName === "--max-load")) {
+        const val = arg.slice(eqIdx + 1);
+        if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(val)) {
+          return false;
+        }
+      }
+      if (eqIdx === -1 && MAKE_LONG_VALUE_FLAGS.has(flagName)) {
+        if ((flagName === "--jobs" || flagName === "--load-average" || flagName === "--max-load") && (!blockedArgs[i + 1] || !/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(blockedArgs[i + 1]))) {
+          continue;
+        }
+        if (i + 1 < blockedArgs.length) {
+          i += 1;
+        }
       }
       continue;
     }
-    if (arg.startsWith("-") && arg.length > 1) {
-      const chars = arg.slice(1);
-      for (let j = 0; j < chars.length; j += 1) {
-        const ch = chars[j];
-        if (MAKE_NOOP_SHORT_FLAGS.has(ch)) {
-          return false;
-        }
-        if (ch === "O") {
-          break;
-        }
-        if (MAKE_VALUE_FLAGS.has(ch)) {
-          const rest = chars.slice(j + 1);
-          if (ch === "j" || ch === "l") {
-            if (rest.length > 0) {
-              const numMatch = /^(?:\d+(?:\.\d*)?|\.\d+)(.*)$/.exec(rest);
-              const trailing = numMatch ? numMatch[1] : rest;
-              if (numMatch) {
-                for (const t of trailing) {
-                  if (MAKE_NOOP_SHORT_FLAGS.has(t) || !/[A-Za-z]/.test(t)) {
-                    return false;
-                  }
-                }
-                j += (numMatch[0].length - trailing.length);
-                continue;
-              }
+    const chars = arg.slice(1);
+    if (chars.length === 0) {
+      return false;
+    }
+    for (let j = 0; j < chars.length; j += 1) {
+      const ch = chars[j];
+      if (MAKE_NOOP_SHORT_FLAGS.has(ch)) {
+        return false;
+      }
+      if (ch === "O") {
+        break;
+      }
+      if (MAKE_VALUE_FLAGS.has(ch)) {
+        const rest = chars.slice(j + 1);
+        if (ch === "j" || ch === "l") {
+          if (rest.length > 0) {
+            const numMatch = /^(?:\d+(?:\.\d*)?|\.\d+)(.*)$/.exec(rest);
+            if (!numMatch) {
               return false;
             }
-            if (head[i + 1] && /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(head[i + 1])) {
-              i += 1;
+            const trailing = numMatch[1];
+            for (const t of trailing) {
+              if (MAKE_NOOP_SHORT_FLAGS.has(t) || (!MAKE_SAFE_SHORT_FLAGS.has(t) && !MAKE_VALUE_FLAGS.has(t))) {
+                return false;
+              }
             }
-            break;
+            j += numMatch[0].length - trailing.length;
+            continue;
           }
-          if (rest.length === 0 && i + 1 < head.length) {
+          if (blockedArgs[i + 1] && /^(?:\d+(?:\.\d*)?|\.\d+)$/.test(blockedArgs[i + 1])) {
             i += 1;
           }
           break;
         }
-        if (!/[A-Za-z]/.test(ch)) {
-          return false;
+        if (rest.length === 0 && i + 1 < blockedArgs.length) {
+          i += 1;
         }
+        break;
+      }
+      if (!MAKE_SAFE_SHORT_FLAGS.has(ch)) {
+        return false;
       }
     }
   }
@@ -1265,34 +1315,56 @@ export function extractChainPrepSignature(segment) {
     return null;
   }
   const dirParts = [];
-  let wrapperBin = "";
-  for (let i = 0; i < idx; i += 1) {
-    const w = parsed.words[i];
-    if (ENV_ASSIGN_RE.test(w)) {
+  let pIdx = 0;
+  while (pIdx < idx) {
+    const tok = parsed.words[pIdx];
+    if (tok === "!" || tok === "(" || ENV_ASSIGN_RE.test(tok)) {
+      pIdx += 1;
       continue;
     }
-    const base = posix.basename(toPosix(w));
-    if (SHELL_WRAPPERS.has(base)) {
-      wrapperBin = base;
+    if (SHELL_WRAPPERS.has(tok)) {
+      const valueFlags = WRAPPER_FLAGS_WITH_ARG[tok];
+      const dirFlagChar = tok === "sudo" ? "D" : tok === "env" ? "C" : "";
+      pIdx += 1;
+      while (pIdx < idx) {
+        const arg = parsed.words[pIdx];
+        if (arg === "--") {
+          pIdx += 1;
+          break;
+        }
+        if ((arg === `-${dirFlagChar}` || (tok === "env" && arg === "--chdir")) && dirFlagChar && pIdx + 1 < idx) {
+          dirParts.push(posix.normalize(toPosix(parsed.words[pIdx + 1])));
+          pIdx += 2;
+          continue;
+        }
+        if (tok === "env" && arg.startsWith("--chdir=")) {
+          dirParts.push(posix.normalize(toPosix(arg.slice("--chdir=".length))));
+          pIdx += 1;
+          continue;
+        }
+        const attachedDir = dirFlagChar ? extractWrapperDirAfterFlag(arg, dirFlagChar) : "";
+        if (attachedDir) {
+          dirParts.push(posix.normalize(toPosix(attachedDir)));
+          pIdx += 1;
+          continue;
+        }
+        if (valueFlags && valueFlags.has(arg) && pIdx + 1 < idx) {
+          pIdx += 2;
+          continue;
+        }
+        if (arg.startsWith("-") && arg.length > 1) {
+          pIdx += 1;
+          continue;
+        }
+        if (tok === "env" && ENV_ASSIGN_RE.test(arg)) {
+          pIdx += 1;
+          continue;
+        }
+        break;
+      }
       continue;
     }
-    const dirFlagChar = wrapperBin === "sudo" ? "D" : wrapperBin === "env" ? "C" : "";
-    if (!dirFlagChar) {
-      continue;
-    }
-    if ((w === `-${dirFlagChar}` || w === "--chdir") && i + 1 < idx) {
-      dirParts.push(posix.normalize(toPosix(parsed.words[i + 1])));
-      i += 1;
-      continue;
-    }
-    if (w.startsWith("--chdir=")) {
-      dirParts.push(posix.normalize(toPosix(w.slice("--chdir=".length))));
-      continue;
-    }
-    const attached = extractWrapperDirAfterFlag(w, dirFlagChar);
-    if (attached) {
-      dirParts.push(posix.normalize(toPosix(attached)));
-    }
+    break;
   }
   const prefixTag = dirParts.length > 0 ? `@wrapperDir(${dirParts.join("->")}) ` : "";
   return `${prefixTag}${["npm", ...parsed.words.slice(idx + 1)].join(" ")}`;
@@ -1316,6 +1388,12 @@ export function commandMatchesExpectedTokens(commandLine, expectedTokens) {
     const normWords = [baseBin, ...execWords.slice(1)];
     if (normWords.length >= expectedTokens.length && expectedTokens.every((tok, k) => normWords[k] === tok)) {
       return true;
+    }
+    if (SHELL_INTERPRETERS.has(baseBin)) {
+      const body = inlineInterpreterBody(baseBin, execWords.slice(1));
+      if (body && commandMatchesExpectedTokens(body, expectedTokens)) {
+        return true;
+      }
     }
   }
   return false;
@@ -2940,7 +3018,7 @@ function countTextFileLinesLightweight(absPath) {
     }
     return lines;
   } catch {
-    return 0;
+    return null;
   } finally {
     if (fd !== undefined) {
       try {
@@ -3193,6 +3271,7 @@ export function readGitLedger(cwd) {
     gitRoot: null,
     gitDirtyFiles: new Set(),
     diffNumstat: new Map(),
+    numstatUnavailable: false,
     gitBranch: "",
     gitHead: "",
   };
@@ -3246,6 +3325,7 @@ export function readGitLedger(cwd) {
     }
 
     const diffNumstat = new Map();
+    let numstatUnavailable = gitDirtyFiles.size > 0;
     if (Date.now() < deadline) {
       try {
         const numstatOut = execFileSync("git", ["-c", "core.quotepath=false", "diff", "--numstat", "-z", "HEAD"], {
@@ -3255,12 +3335,15 @@ export function readGitLedger(cwd) {
           stdio: ["ignore", "pipe", "ignore"],
         });
         parseNumstatOutput(numstatOut, gitRoot, diffNumstat, true);
+        numstatUnavailable = false;
       } catch {
+        let allSubDiffsOk = true;
         for (const diffArgs of [
           ["-c", "core.quotepath=false", "diff", "--numstat", "-z", "--cached"],
           ["-c", "core.quotepath=false", "diff", "--numstat", "-z"],
         ]) {
           if (Date.now() >= deadline) {
+            allSubDiffsOk = false;
             break;
           }
           try {
@@ -3272,8 +3355,10 @@ export function readGitLedger(cwd) {
             });
             parseNumstatOutput(out, gitRoot, diffNumstat, true);
           } catch {
+            allSubDiffsOk = false;
           }
         }
+        numstatUnavailable = !allSubDiffsOk;
       }
     }
 
@@ -3282,7 +3367,9 @@ export function readGitLedger(cwd) {
         continue;
       }
       const lines = countTextFileLinesLightweight(join(gitRoot, relPath));
-      if (lines > 0) {
+      if (lines === null) {
+        numstatUnavailable = true;
+      } else if (lines > 0) {
         diffNumstat.set(relPath, { added: lines, deleted: 0 });
       }
     }
@@ -3314,7 +3401,7 @@ export function readGitLedger(cwd) {
       }
     }
 
-    return { gitAvailable: true, gitRoot, gitDirtyFiles, diffNumstat, gitBranch, gitHead };
+    return { gitAvailable: true, gitRoot, gitDirtyFiles, diffNumstat, numstatUnavailable, gitBranch, gitHead };
   } catch {
     return empty;
   }

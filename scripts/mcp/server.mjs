@@ -360,7 +360,8 @@ export function createMcpServerHandler(options = {}) {
 
     // Stop dates later shell-made tree changes against the tree the last passing verify_completion saw.
     if (cwd && PASSING_VERDICTS.has(decision.verdict)) {
-      saveGateSnapshot({ conversationId: conversationKey, snapshot: snapshotWorkingTree(cwd), dataDir });
+      const priorPassCount = ledger.turnGateAttempts.filter((attempt) => PASSING_VERDICTS.has(attempt.verdict)).length;
+      saveGateSnapshot({ conversationId: conversationKey, snapshot: snapshotWorkingTree(cwd), dataDir, gatePassCount: priorPassCount + 1 });
     }
 
     const completedPriorAttempts = ledger.turnGateAttempts.filter((attempt) => attempt.verdict !== "UNKNOWN").length;

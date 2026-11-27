@@ -434,15 +434,27 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
 }
 
 // The tree as the last passing verify_completion saw it, attached to the current turn snapshot so a new turn discards it.
-export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePluginDataDir() } = {}) {
+export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePluginDataDir(), gatePassCount = null } = {}) {
   const filePath = resolveSessionStatePath(conversationId, dataDir);
-  if (!filePath || !snapshot) {
+  if (!filePath) {
     return false;
   }
   try {
     return withSessionLock(filePath, () => {
       const prev = readSessionState(conversationId, dataDir);
-      if (!prev?.turnSnapshot || typeof prev.turnSnapshot !== "object" || prev.turnSnapshot.gitRoot !== snapshot.gitRoot) {
+      if (!prev?.turnSnapshot || typeof prev.turnSnapshot !== "object") {
+        return false;
+      }
+      if (!snapshot || prev.turnSnapshot.gitRoot !== snapshot.gitRoot) {
+        if ("gate" in prev.turnSnapshot) {
+          const nextTurn = { ...prev.turnSnapshot };
+          delete nextTurn.gate;
+          atomicWriteJson(filePath, {
+            ...prev,
+            updatedAt: new Date().toISOString(),
+            turnSnapshot: nextTurn,
+          });
+        }
         return false;
       }
       atomicWriteJson(filePath, {
@@ -456,6 +468,7 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
             untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
             untrackedTruncated: Boolean(snapshot.untrackedTruncated),
             capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
+            passCount: Number.isInteger(gatePassCount) && gatePassCount >= 1 ? gatePassCount : null,
           },
         },
       });
@@ -493,6 +506,7 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
           untrackedFiles: untrackedOf(snap.gate),
           untrackedTruncated: Boolean(snap.gate?.untrackedTruncated),
           capturedAtMs: capturedAtOf(snap.gate),
+          passCount: Number.isInteger(snap.gate?.passCount) ? snap.gate.passCount : null,
         }
       : null;
   return {
@@ -551,11 +565,17 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const keepsToolDate = (relPath) => riskyStep === -1 && ledger.turnWrittenFiles.has(relPath);
   const baseline = readTurnSnapshot({ conversationId: conversationKey, turnStartStepIndex: ledger.turnStartStepIndex, dataDir });
   const current = baseline ? snapshotWorkingTree(cwd) : null;
+  const passingAttempts = ledger.turnGateAttempts.filter((attempt) => PASSING_VERDICTS.has(attempt.verdict));
+  const lastGateStep = passingAttempts.at(-1)?.stepIndex ?? -1;
+  const activeGate =
+    baseline?.gate && (baseline.gate.passCount === null || baseline.gate.passCount === passingAttempts.length)
+      ? baseline.gate
+      : null;
   // Commits made this turn leave a clean tree, so the files they touched count as changed too.
   const committedSince = (head) =>
     head === null || head === current.head ? new Set() : listCommittedPaths(current.gitRoot, head, current.head);
   const sinceTurn = current && current.gitRoot === baseline.gitRoot ? committedSince(baseline.head) : null;
-  const sinceGate = sinceTurn && baseline.gate ? committedSince(baseline.gate.head) : new Set();
+  const sinceGate = sinceTurn && activeGate ? committedSince(activeGate.head) : new Set();
   if (!sinceTurn || !sinceGate) {
     if (baseline && baseline.head !== null && (!current || current.head !== baseline.head) && (!sinceTurn || !sinceGate)) {
       ledger.commitNumstatUnavailable = true;
@@ -579,9 +599,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       ledger.turnCommittedFiles = new Set();
     }
     for (const relPath of sinceTurn) {
-      if (!isExemptDocOrAssetPath(relPath)) {
-        ledger.turnCommittedFiles.add(relPath);
-      }
+      ledger.turnCommittedFiles.add(relPath);
     }
   }
   if (sinceTurn.size > 0 && diffNumstat instanceof Map && baseline.head !== null) {
@@ -630,18 +648,8 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     const now = fromCurrent !== undefined ? fromCurrent : committed.has(relPath) ? statSignature(current.gitRoot, relPath) : undefined;
     return before !== undefined ? !sameFileSignature(before, now) : now !== undefined;
   };
-  const lastGateStep = ledger.turnGateAttempts.findLast((attempt) => PASSING_VERDICTS.has(attempt.verdict))?.stepIndex ?? -1;
-  const postGateShell = baseline.gate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
+  const postGateShell = activeGate ? shellExecs.filter((exec) => exec.stepIndex > lastGateStep) : [];
   const postGateWriter = postGateShell.some(isRiskyShellExec);
-  if (lastGateStep !== -1 && !baseline.gate) {
-    const postMissingGateExec = shellExecs.findLast((exec) => exec.stepIndex > lastGateStep && isRiskyShellExec(exec));
-    if (postMissingGateExec) {
-      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postMissingGateExec.stepIndex);
-      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, postMissingGateExec.stepIndex);
-      syncPendingAsyncAfterWrite(ledger);
-      return true;
-    }
-  }
   const toolWroteAfterGate = (relPath) => (ledger.turnToolWriteSteps.get(relPath) ?? -1) > lastGateStep;
   const preGateShell = postGateShell.length > 0 ? shellExecs.filter((exec) => exec.stepIndex < lastGateStep) : shellExecs;
   const preGateKeepsToolDate = (relPath) => !preGateShell.some(isRiskyShellExec) && ledger.turnWrittenFiles.has(relPath);
@@ -649,17 +657,17 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   const canDiffTurnUntracked = Boolean(!baseline.untrackedTruncated && !current.untrackedTruncated && baseline.untrackedFiles && current.untrackedFiles);
   const canDiffGateUntracked = Boolean(
     postGateShell.length > 0 &&
-      baseline.gate &&
-      !baseline.gate.untrackedTruncated &&
+      activeGate &&
+      !activeGate.untrackedTruncated &&
       !current.untrackedTruncated &&
-      baseline.gate.untrackedFiles &&
+      activeGate.untrackedFiles &&
       current.untrackedFiles,
   );
 
   const trackedKeySet = new Set([
     ...Object.keys(current.files),
     ...Object.keys(baseline.files),
-    ...Object.keys(baseline.gate?.files ?? {}),
+    ...Object.keys(activeGate?.files ?? {}),
     ...sinceTurn,
     ...sinceGate,
   ]);
@@ -667,7 +675,7 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     ? new Set([...Object.keys(current.untrackedFiles), ...Object.keys(baseline.untrackedFiles)])
     : new Set();
   const gateUntrackedKeySet = canDiffGateUntracked
-    ? new Set([...Object.keys(current.untrackedFiles), ...Object.keys(baseline.gate.untrackedFiles)])
+    ? new Set([...Object.keys(current.untrackedFiles), ...Object.keys(activeGate.untrackedFiles)])
     : new Set();
   const allDiffKeys = new Set([...trackedKeySet, ...turnUntrackedKeySet, ...gateUntrackedKeySet]);
 
@@ -676,8 +684,8 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       continue;
     }
     const isTrackedCandidate = trackedKeySet.has(relPath);
-    const canCheckGate = postGateShell.length > 0 && baseline.gate && (isTrackedCandidate || gateUntrackedKeySet.has(relPath));
-    if (canCheckGate && changedBetween(baseline.gate, sinceGate, relPath)) {
+    const canCheckGate = postGateShell.length > 0 && activeGate && (isTrackedCandidate || gateUntrackedKeySet.has(relPath));
+    if (canCheckGate && changedBetween(activeGate, sinceGate, relPath)) {
       if (postGateWriter || !toolWroteAfterGate(relPath)) {
         record(relPath, datingStep(postGateShell));
       }
@@ -690,10 +698,10 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
   }
 
   const untrackedIncomplete = Boolean(
-    current.untrackedTruncated || baseline.untrackedTruncated || (postGateShell.length > 0 && baseline.gate?.untrackedTruncated),
+    current.untrackedTruncated || baseline.untrackedTruncated || (postGateShell.length > 0 && activeGate?.untrackedTruncated),
   );
   if (untrackedIncomplete && riskyShellExecs.length > 0) {
-    const baseMs = postGateWriter && baseline.gate?.capturedAtMs ? baseline.gate.capturedAtMs : baseline.capturedAtMs;
+    const baseMs = postGateWriter && activeGate?.capturedAtMs ? activeGate.capturedAtMs : baseline.capturedAtMs;
     const cutoffMs = Number.isFinite(baseMs) ? baseMs - 10 : 0;
     const targetStep = postGateWriter ? datingStep(postGateShell) : riskyStep;
     const markRecentUntracked = (step) => {
@@ -712,6 +720,15 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
     };
     if (postGateWriter || lastGateStep === -1 || riskyStep > lastGateStep) {
       markRecentUntracked(targetStep);
+      return true;
+    }
+  }
+  if (lastGateStep !== -1 && !activeGate) {
+    const postMissingGateExec = shellExecs.findLast((exec) => exec.stepIndex > lastGateStep && isRiskyShellExec(exec));
+    if (postMissingGateExec) {
+      ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, postMissingGateExec.stepIndex);
+      ledger.lastCodeWriteStepIndex = Math.max(ledger.lastCodeWriteStepIndex, postMissingGateExec.stepIndex);
+      syncPendingAsyncAfterWrite(ledger);
       return true;
     }
   }

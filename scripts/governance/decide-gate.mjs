@@ -92,7 +92,7 @@ function extractVerificationEntries(cmd, baseDir = ".") {
       continue;
     }
     if (classifyCommand(norm) === "verification") {
-      entries.push({ seg: norm, dir: state.dir, prepKey: prepPrefixes.join(" && ") });
+      entries.push({ seg: seg.trim(), dir: state.dir, prepKey: prepPrefixes.join(" && ") });
     }
   }
   return entries;
@@ -194,9 +194,54 @@ function splitQuotedWhitespace(rawValue, { splitComma = false } = {}) {
   return items;
 }
 
-function shlexSplitTestpaths(rawValue) {
-  const rawItems = splitQuotedWhitespace(rawValue, { splitComma: true });
-  return rawItems ? rawItems.map(normalizeTestpathItem).filter(Boolean) : null;
+function parseTomlStringArray(rawArrayBody) {
+  const items = [];
+  let i = 0;
+  while (i < rawArrayBody.length) {
+    const ch = rawArrayBody[i];
+    if (/\s|,/.test(ch)) {
+      i += 1;
+      continue;
+    }
+    if (ch === "#") {
+      while (i < rawArrayBody.length && rawArrayBody[i] !== "\n") {
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i += 1;
+      let val = "";
+      let closed = false;
+      while (i < rawArrayBody.length) {
+        const c = rawArrayBody[i];
+        if (c === "\\" && quote === '"' && i + 1 < rawArrayBody.length) {
+          i += 1;
+          val += rawArrayBody[i];
+          i += 1;
+          continue;
+        }
+        if (c === quote) {
+          closed = true;
+          i += 1;
+          break;
+        }
+        val += c;
+        i += 1;
+      }
+      if (!closed) {
+        return null;
+      }
+      const normalized = normalizeTestpathItem(val);
+      if (normalized) {
+        items.push(normalized);
+      }
+      continue;
+    }
+    return null;
+  }
+  return items;
 }
 
 function parseIniTestpaths(text, targetSections) {
@@ -253,17 +298,63 @@ function parseIniTestpaths(text, targetSections) {
   return foundKey ? { restricted: true, paths: collected } : { restricted: false, paths: [] };
 }
 
+function shlexSplitTestpaths(rawValue) {
+  const rawItems = splitQuotedWhitespace(rawValue, { splitComma: false });
+  return rawItems ? rawItems.map(normalizeTestpathItem).filter(Boolean) : null;
+}
+
+function extractBracketedTomlArray(sectionBody) {
+  const startMatch = /(?:^|\n)[ \t]*testpaths[ \t]*=[ \t]*\[/.exec(sectionBody);
+  if (!startMatch) {
+    return null;
+  }
+  let i = startMatch.index + startMatch[0].length;
+  const start = i;
+  let quote = null;
+  while (i < sectionBody.length) {
+    const ch = sectionBody[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"' && i + 1 < sectionBody.length) {
+        i += 2;
+        continue;
+      }
+      if (ch === quote) {
+        quote = null;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === "#") {
+      while (i < sectionBody.length && sectionBody[i] !== "\n") {
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      i += 1;
+      continue;
+    }
+    if (ch === "]") {
+      return sectionBody.slice(start, i);
+    }
+    i += 1;
+  }
+  return "";
+}
+
 function readPytestTestpaths(execDir) {
   if (!execDir || !existsSync(execDir)) {
     return { restricted: false, paths: [] };
   }
-  const pytestIniPath = join(execDir, "pytest.ini");
-  if (existsSync(pytestIniPath)) {
+  for (const iniName of ["pytest.ini", ".pytest.ini"]) {
+    const pytestIniPath = join(execDir, iniName);
+    if (!existsSync(pytestIniPath)) {
+      continue;
+    }
     try {
       const parsed = parseIniTestpaths(readFileSync(pytestIniPath, "utf8"), new Set(["pytest"]));
-      if (parsed) {
-        return parsed;
-      }
+      return parsed ?? { restricted: false, paths: [] };
     } catch {
       return { restricted: true, paths: [] };
     }
@@ -277,10 +368,10 @@ function readPytestTestpaths(execDir) {
         if (!/(?:^|\n)[ \t]*testpaths[ \t]*=/.test(sect[1])) {
           return { restricted: false, paths: [] };
         }
-        const arrMatch = /testpaths[ \t]*=[ \t]*\[([\s\S]*?)\]/.exec(sect[1]);
-        if (arrMatch) {
-          const paths = arrMatch[1].split(",").map(normalizeTestpathItem).filter(Boolean);
-          return { restricted: true, paths };
+        const arrBody = extractBracketedTomlArray(sect[1]);
+        if (arrBody !== null) {
+          const paths = parseTomlStringArray(arrBody);
+          return paths ? { restricted: true, paths } : { restricted: true, paths: [] };
         }
         const strMatch = /testpaths[ \t]*=[ \t]*(.+)/.exec(sect[1]);
         const split = strMatch ? shlexSplitTestpaths(strMatch[1].replace(/\s+#.*$/, "")) : null;
@@ -294,7 +385,7 @@ function readPytestTestpaths(execDir) {
     }
   }
   for (const [fileName, sections] of [
-    ["tox.ini", new Set(["pytest", "tool:pytest"])],
+    ["tox.ini", new Set(["pytest"])],
     ["setup.cfg", new Set(["tool:pytest"])],
   ]) {
     const cfgPath = join(execDir, fileName);
@@ -416,13 +507,13 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   if (failedSeg.length === 0 || passedSeg.length === 0) {
     return false;
   }
-  if (failedSeg === passedSeg) {
-    return true;
-  }
   const failed = splitQuotedWhitespace(failedSeg);
   const passed = splitQuotedWhitespace(passedSeg);
   if (!failed || !passed) {
     return false;
+  }
+  if (failed.length === passed.length && failed.every((tok, idx) => tok === passed[idx])) {
+    return true;
   }
   if ([...failed, ...passed].some((token) => SHELL_OPERATOR_TOKEN_RE.test(token))) {
     return false;

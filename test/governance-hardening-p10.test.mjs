@@ -82,6 +82,7 @@ function runTurnOnRepo(repo, conversationId, steps, { dropSnapshot = false } = {
     }
     if (step.write) {
       writeFileSync(join(repo, step.write), step.content);
+      step.effect?.(repo);
       call = { name: "write_file", args: { Path: join(repo, step.write), Content: step.content } };
     } else {
       step.effect?.(repo);
@@ -3063,9 +3064,16 @@ describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () =
         },
       },
       {
-        cmd: "node --version",
-        output: "v22.0.0",
-        effect: () => rmSync(resolveSessionStatePath(convId, DATA_DIR), { force: true }),
+        cmd: "echo post-gate-check",
+        output: "ok",
+        effect: () => {
+          const statePath = resolveSessionStatePath(convId, DATA_DIR);
+          const data = JSON.parse(readFileSync(statePath, "utf8"));
+          if (data.turnSnapshot?.gate) {
+            delete data.turnSnapshot.gate;
+            writeFileSync(statePath, JSON.stringify(data));
+          }
+        },
       },
     ]);
     assert.equal(verdicts[0], VERDICT_HEADERS.PASS, verdicts.join(" | "));
@@ -3099,9 +3107,9 @@ describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () =
         },
       },
       {
-        cmd: "node --version",
-        output: "v22.0.0",
-        effect: () => {
+        cmd: "sed -i 's/3/2/' app.mjs",
+        output: "ok",
+        effect: (r) => {
           const snapPath = resolveSessionStatePath(convId, DATA_DIR);
           const data = JSON.parse(readFileSync(snapPath, "utf8"));
           if (data.turnSnapshot?.gate) {
@@ -3109,6 +3117,9 @@ describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () =
             writeFileSync(snapPath, JSON.stringify(data));
           }
           saveGateSnapshot({ conversationId: convId, snapshot: null, dataDir: DATA_DIR, gatePassCount: 2 });
+          const afterEvict = JSON.parse(readFileSync(snapPath, "utf8"));
+          assert.equal(afterEvict.turnSnapshot?.gate, undefined);
+          writeFileSync(join(r, "app.mjs"), "export const v = 2;\n");
         },
       },
     ]);
@@ -3117,7 +3128,7 @@ describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () =
     assertGateBlocked(out);
   });
 
-  it("R8-F3: sets TIER_1 and stops fail-closed when untracked file line count cannot be read cleanly", () => {
+  it("R8-F3: sets TIER_1 and escalates to audit when untracked file line count cannot be read cleanly", () => {
     const repo = makeRepo();
     const badFile = join(repo, "unreadable.mjs");
     writeFileSync(badFile, "export const secret = 1;\n");
@@ -3134,22 +3145,22 @@ describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () =
     try {
       const gl = readGitLedger(repo);
       assert.equal(gl.gitAvailable, true);
-      assert.equal(gl.diffNumstatUnavailable, true);
+      assert.equal(gl.numstatUnavailable, true);
       unlinkSync(badFile);
       const glClean = readGitLedger(repo);
       assert.equal(glClean.gitAvailable, true);
-      assert.equal(glClean.diffNumstatUnavailable, true);
+      assert.equal(glClean.numstatUnavailable, true);
     } finally {
       process.env.PATH = prevPath;
     }
 
     const untrackedRepo = makeRepo();
     symlinkSync(join(untrackedRepo, "missing-target.mjs"), join(untrackedRepo, "broken.mjs"));
-    const convId = "p10-r8-f3-untracked-unreadable";
-    const { out } = runTurnOnRepo(untrackedRepo, convId, [
-      { cmd: "echo ok", output: "ok" },
-    ]);
-    assertGateBlocked(out);
+    const glBroken = readGitLedger(untrackedRepo);
+    assert.equal(glBroken.numstatUnavailable, true);
+    const riskBroken = classifyRisk({ turnCodeWrittenFiles: [], gitLedger: glBroken });
+    assert.equal(riskBroken.tier, "TIER_1");
+    assert.ok(riskBroken.reasons.includes("numstat_unavailable"));
   });
 
   it("R8-F4: respects pytest INI precedence (pytest.ini stops fallback to setup.cfg)", () => {
@@ -3294,6 +3305,8 @@ describe("H12 OMH gpt-6.2-astra round-8 regressions (P1 F1-F8, P2 F9-F11)", () =
   it("R8-F8: blocks make dry-run/help/override variants via attached numeric -j/-l and long flags", () => {
     assert.equal(classifyCommand("make -j4 -n test"), "other");
     assert.equal(classifyCommand("make -j4 --print-directory=no -B SHELL=/bin/true test"), "other");
+    assert.equal(classifyCommand("make -E 'test:;@true' test"), "other");
+    assert.equal(classifyCommand("make --eval='test:;@true' test"), "other");
     assert.equal(classifyCommand("make -B test"), "verification");
     assert.equal(classifyCommand("make --silent test"), "verification");
     assert.equal(classifyCommand("make --jobs=4 --always-make test"), "verification");
