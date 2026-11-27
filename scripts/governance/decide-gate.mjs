@@ -73,7 +73,7 @@ function extractVerificationEntries(cmd, baseDir = ".") {
     return [];
   }
   const entries = [];
-  let state = { dir: normalizeExecDir(baseDir), stack: [] };
+  let state = { dir: normalizeExecDir(baseDir, { preserveSpaces: true }), stack: [] };
   let prepPrefixes = [];
   let seq = 0;
   for (const seg of splitShellSegments(cmd)) {
@@ -172,7 +172,7 @@ function splitQuotedWhitespaceWithMeta(rawValue, { splitComma = false } = {}) {
   let cur = "";
   let quote = null;
   let hasToken = false;
-  let hadUnquotedMeta = false;
+  let unquotedMetaPositions = [];
   for (let i = 0; i < rawValue.length; i += 1) {
     const ch = rawValue[i];
     if (quote) {
@@ -199,15 +199,15 @@ function splitQuotedWhitespaceWithMeta(rawValue, { splitComma = false } = {}) {
     }
     if (/\s/.test(ch) || (splitComma && ch === ",")) {
       if (hasToken) {
-        items.push({ value: cur, hadUnquotedMeta });
+        items.push({ value: cur, unquotedMetaMask: unquotedMetaPositions.join(",") });
         cur = "";
         hasToken = false;
-        hadUnquotedMeta = false;
+        unquotedMetaPositions = [];
       }
       continue;
     }
     if (SHELL_EXPANSION_META_RE.test(ch)) {
-      hadUnquotedMeta = true;
+      unquotedMetaPositions.push(cur.length);
     }
     cur += ch;
     hasToken = true;
@@ -216,7 +216,7 @@ function splitQuotedWhitespaceWithMeta(rawValue, { splitComma = false } = {}) {
     return null;
   }
   if (hasToken) {
-    items.push({ value: cur, hadUnquotedMeta });
+    items.push({ value: cur, unquotedMetaMask: unquotedMetaPositions.join(",") });
   }
   return items;
 }
@@ -474,37 +474,50 @@ function parseTomlKeySegments(rawKeyPart) {
   return segs;
 }
 
-function tomlHasOtherPytestConfig(text, hasPrimaryIniOptions) {
+function parsePytestPyprojectToml(text) {
   let currentTable = [];
   let iniOptionsCount = 0;
+  let inIniOptions = false;
+  const iniLines = [];
   const lines = text.split(/\r?\n/);
   for (const rawLine of lines) {
     const t = rawLine.trim();
+    if (inIniOptions && !t.startsWith("[")) {
+      if (/"""|'''/.test(t)) {
+        return { failClosed: true, iniSectionBody: null };
+      }
+      iniLines.push(rawLine);
+    }
     if (!t || t.startsWith("#")) {
       continue;
     }
     if (t.startsWith("[")) {
       const closeIdx = t.startsWith("[[") ? t.indexOf("]]") : t.indexOf("]");
       if (closeIdx === -1) {
-        return true;
+        return { failClosed: true, iniSectionBody: null };
       }
       const headerBody = t.slice(t.startsWith("[[") ? 2 : 1, closeIdx).trim();
       const segs = parseTomlKeySegments(headerBody);
       if (!segs) {
         if (/pytest/i.test(headerBody)) {
-          return true;
+          return { failClosed: true, iniSectionBody: null };
         }
         currentTable = [];
+        inIniOptions = false;
         continue;
       }
       currentTable = segs;
       if (segs.length === 3 && segs[0] === "tool" && segs[1] === "pytest" && segs[2] === "ini_options") {
         iniOptionsCount += 1;
-        if (iniOptionsCount > 1 || !hasPrimaryIniOptions) {
-          return true;
+        if (iniOptionsCount > 1) {
+          return { failClosed: true, iniSectionBody: null };
         }
-      } else if (segs.length >= 2 && segs[0] === "tool" && segs[1] === "pytest") {
-        return true;
+        inIniOptions = true;
+      } else {
+        inIniOptions = false;
+        if (segs.length >= 2 && segs[0] === "tool" && segs[1] === "pytest") {
+          return { failClosed: true, iniSectionBody: null };
+        }
       }
       continue;
     }
@@ -514,26 +527,35 @@ function tomlHasOtherPytestConfig(text, hasPrimaryIniOptions) {
       const keySegs = parseTomlKeySegments(keyPart);
       if (!keySegs) {
         if (/pytest/i.test(keyPart)) {
-          return true;
+          return { failClosed: true, iniSectionBody: null };
         }
         continue;
       }
       const fullPath = [...currentTable, ...keySegs];
       if (fullPath.length >= 2 && fullPath[0] === "tool" && fullPath[1] === "pytest") {
         const isDirectIniOption =
-          hasPrimaryIniOptions &&
           currentTable.length === 3 &&
           currentTable[0] === "tool" &&
           currentTable[1] === "pytest" &&
           currentTable[2] === "ini_options" &&
           keySegs.length === 1;
         if (!isDirectIniOption) {
-          return true;
+          return { failClosed: true, iniSectionBody: null };
         }
+      }
+      // Root inline table `tool = { ... }` may embed `pytest.ini_options.testpaths`; fail closed when unhandled.
+      if (fullPath.length === 1 && fullPath[0] === "tool") {
+        return { failClosed: true, iniSectionBody: null };
+      }
+      if (fullPath[0] === "tool" && /"""|'''/.test(t.slice(eqPos + 1))) {
+        return { failClosed: true, iniSectionBody: null };
       }
     }
   }
-  return false;
+  return {
+    failClosed: false,
+    iniSectionBody: iniOptionsCount === 1 ? iniLines.join("\n") : null,
+  };
 }
 
 function readPytestTestpaths(execDir) {
@@ -556,20 +578,24 @@ function readPytestTestpaths(execDir) {
   if (existsSync(pyprojPath)) {
     try {
       const text = readFileSync(pyprojPath, "utf8");
-      const sect = /^\[tool\.pytest\.ini_options\][ \t]*(?:#.*)?\r?\n([\s\S]*?)(?=\r?\n\[|$)/m.exec(text);
-      if (sect) {
-        if (tomlHasOtherPytestConfig(text, true) || sectionHasUnsupportedTestpathsKey(sect[1])) {
+      const parsedToml = parsePytestPyprojectToml(text);
+      if (parsedToml.failClosed) {
+        return { restricted: true, paths: [] };
+      }
+      if (parsedToml.iniSectionBody !== null) {
+        const sectBody = parsedToml.iniSectionBody;
+        if (sectionHasUnsupportedTestpathsKey(sectBody)) {
           return { restricted: true, paths: [] };
         }
-        if (!/(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=/.test(sect[1])) {
+        if (!/(?:^|\n)[ \t]*(?:testpaths|"testpaths"|'testpaths')[ \t]*=/.test(sectBody)) {
           return { restricted: false, paths: [] };
         }
-        const arrBody = extractBracketedTomlArray(sect[1]);
+        const arrBody = extractBracketedTomlArray(sectBody);
         if (arrBody !== null) {
           const paths = parseTomlStringArray(arrBody);
           return paths ? { restricted: true, paths } : { restricted: true, paths: [] };
         }
-        const strMatch = /(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*(.+)/.exec(sect[1]);
+        const strMatch = /(?:testpaths|"testpaths"|'testpaths')[ \t]*=[ \t]*(.+)/.exec(sectBody);
         if (strMatch) {
           const rhs = strMatch[1].trim();
           const dec = decodeTomlStringToken(rhs, 0);
@@ -578,9 +604,6 @@ function readPytestTestpaths(execDir) {
             return split ? { restricted: true, paths: split } : { restricted: true, paths: [] };
           }
         }
-        return { restricted: true, paths: [] };
-      }
-      if (/^\[(?:["']?tool["']?\s*\.\s*["']?pytest["']?\b)/m.test(text) || tomlHasOtherPytestConfig(text, false)) {
         return { restricted: true, paths: [] };
       }
     } catch {
@@ -743,11 +766,14 @@ function runnerPrefixLength(tokens) {
   return prefix ? { kind: "all", prefix, end: start + prefix.length } : null;
 }
 
+const PYTEST_DISCOVERY_OVERRIDE_FLAG_RE =
+  /^(?:-c|--config-file|--config|-o|--override-ini|--rootdir|--confcutdir|--pyargs|--noconftest|--import-mode|--ignore|--ignore-glob|--deselect)(?:=|$)/;
+
 function droppedTokenIndexes(failed, passed) {
   const dropped = [];
   let j = 0;
   for (let i = 0; i < failed.length; i += 1) {
-    if (j < passed.length && failed[i] === passed[j]) {
+    if (j < passed.length && metaTokenEqual(failed[i], passed[j])) {
       j += 1;
     } else {
       dropped.push(i);
@@ -763,14 +789,16 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
   if (failedSeg.length === 0 || passedSeg.length === 0) {
     return false;
   }
-  const failed = splitQuotedWhitespace(failedSeg);
-  const passed = splitQuotedWhitespace(passedSeg);
-  if (!failed || !passed) {
+  const failedMeta = splitQuotedWhitespaceWithMeta(failedSeg);
+  const passedMeta = splitQuotedWhitespaceWithMeta(passedSeg);
+  if (!failedMeta || !passedMeta) {
     return false;
   }
-  if (failed.length === passed.length && failed.every((tok, idx) => tok === passed[idx])) {
+  if (tokensEqualExact(failedMeta, passedMeta)) {
     return true;
   }
+  const failed = failedMeta.map((t) => t.value);
+  const passed = passedMeta.map((t) => t.value);
   if ([...failed, ...passed].some((token) => SHELL_OPERATOR_TOKEN_RE.test(token))) {
     return false;
   }
@@ -788,7 +816,13 @@ function segmentResolvedBy(failedSeg, passedSeg, execDir = "") {
       targets(failed).every((target) => target === "." || (target.startsWith("./") && !target.split("/").includes("..")))
     );
   }
-  const dropped = droppedTokenIndexes(failed, passed);
+  if (
+    runner.prefix.includes("pytest") &&
+    [...failed.slice(runner.end), ...passed.slice(runner.end)].some((tok) => PYTEST_DISCOVERY_OVERRIDE_FLAG_RE.test(tok))
+  ) {
+    return false;
+  }
+  const dropped = droppedTokenIndexes(failedMeta, passedMeta);
   if (!dropped || dropped.length === 0 || dropped.some((index) => index < runner.end)) {
     return false;
   }
@@ -855,11 +889,14 @@ function isCommandResolvedBy(failedCmd, passedCmd, failedBaseDir = ".", passedBa
   if (failedEntries.length > 0 && passedEntries.length > 0) {
     return failedEntries.every((failedEntry) => passedEntries.some((passedEntry) => entriesMatchForResolution(failedEntry, passedEntry, failedBaseDir)));
   }
-  return normalizeExecDir(failedBaseDir) === normalizeExecDir(passedBaseDir) && segmentResolvedBy(failedNorm, passedNorm, failedBaseDir);
+  return (
+    normalizeExecDir(failedBaseDir, { preserveSpaces: true }) === normalizeExecDir(passedBaseDir, { preserveSpaces: true }) &&
+    segmentResolvedBy(failedNorm, passedNorm, failedBaseDir)
+  );
 }
 
 function extractExecutionVerificationEntries(exec, defaultCwd = ".") {
-  const baseDir = normalizeExecDir(exec?.execCwd || defaultCwd || ".");
+  const baseDir = normalizeExecDir(exec?.execCwd || defaultCwd || ".", { preserveSpaces: true });
   const candidates =
     Array.isArray(exec?.subCommands) && exec.subCommands.length > 0 ? exec.subCommands : [exec?.command ?? ""];
   const entries = [];
@@ -875,8 +912,8 @@ function isExecutionResolvedBy(failedExec, passedExec, defaultCwd = ".") {
   const hasFailedSubs = Array.isArray(failedExec?.subCommands) && failedExec.subCommands.length > 0;
   const hasPassedSubs = Array.isArray(passedExec?.subCommands) && passedExec.subCommands.length > 0;
   if (!hasFailedSubs && !hasPassedSubs) {
-    const failedBase = normalizeExecDir(failedExec?.execCwd || defaultCwd || ".");
-    const passedBase = normalizeExecDir(passedExec?.execCwd || defaultCwd || ".");
+    const failedBase = normalizeExecDir(failedExec?.execCwd || defaultCwd || ".", { preserveSpaces: true });
+    const passedBase = normalizeExecDir(passedExec?.execCwd || defaultCwd || ".", { preserveSpaces: true });
     if (isCommandResolvedBy(failedExec?.command, passedExec?.command, failedBase, passedBase)) {
       return true;
     }
@@ -1040,7 +1077,7 @@ export function formatGateReceipt({
 }
 
 function metaTokenEqual(a, b) {
-  return a.value === b.value && a.hadUnquotedMeta === b.hadUnquotedMeta;
+  return a.value === b.value && a.unquotedMetaMask === b.unquotedMetaMask;
 }
 
 function tokensEqualExact(a, b) {

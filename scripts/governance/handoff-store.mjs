@@ -422,6 +422,7 @@ export function saveTurnSnapshot({ conversationId, turnStartStepIndex, snapshot,
           head: snapshot.head,
           files: snapshot.files,
           docFiles: snapshot.docFiles ?? null,
+          docFilesTruncated: Boolean(snapshot.docFilesTruncated),
           untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
           untrackedTruncated: Boolean(snapshot.untrackedTruncated),
           capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
@@ -467,6 +468,7 @@ export function saveGateSnapshot({ conversationId, snapshot, dataDir = resolvePl
             head: snapshot.head,
             files: snapshot.files,
             docFiles: snapshot.docFiles ?? null,
+            docFilesTruncated: Boolean(snapshot.docFilesTruncated),
             untrackedFiles: snapshot.untrackedTruncated ? null : snapshot.untrackedFiles ?? null,
             untrackedTruncated: Boolean(snapshot.untrackedTruncated),
             capturedAtMs: Number.isFinite(snapshot.capturedAtMs) ? snapshot.capturedAtMs : Date.now(),
@@ -508,6 +510,7 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
           head: headOf(snap.gate),
           files: gateFiles,
           docFiles: docFilesOf(snap.gate),
+          docFilesTruncated: Boolean(snap.gate?.docFilesTruncated),
           untrackedFiles: untrackedOf(snap.gate),
           untrackedTruncated: Boolean(snap.gate?.untrackedTruncated),
           capturedAtMs: capturedAtOf(snap.gate),
@@ -519,6 +522,7 @@ export function readTurnSnapshot({ conversationId, turnStartStepIndex, dataDir =
     head: headOf(snap),
     files: snap.files,
     docFiles: docFilesOf(snap),
+    docFilesTruncated: Boolean(snap.docFilesTruncated),
     untrackedFiles: untrackedOf(snap),
     untrackedTruncated: Boolean(snap.untrackedTruncated),
     capturedAtMs: capturedAtOf(snap),
@@ -615,19 +619,26 @@ export function mergeShellWrittenFiles(ledger, { conversationKey, cwd, dirtyFile
       if (isExemptDocOrAssetPath(relPath)) {
         const beforeDoc = baseline.docFiles?.[relPath];
         const nowDoc = current.docFiles?.[relPath] ?? statSignature(current.gitRoot, relPath);
+        if (beforeDoc === undefined && baseline.docFilesTruncated) {
+          continue;
+        }
         const docChangedThisTurn = beforeDoc !== undefined ? !sameFileSignature(beforeDoc, nowDoc) : nowDoc !== undefined;
         if (!docChangedThisTurn) {
           continue;
         }
-        const isPostGate = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
-        const docStep = isPostGate
-          ? datingStep(postGateShell)
-          : preGateShell.length > 0
-            ? datingStep(preGateShell)
-            : ledger.turnStartStepIndex;
-        if (isPostGate || !preGateKeepsToolDate(relPath)) {
+        const inGateRange = postGateShell.length > 0 && activeGate && sinceGate.has(relPath);
+        const gateDoc = activeGate?.docFiles?.[relPath];
+        const docChangedAfterGate =
+          inGateRange &&
+          !(gateDoc !== undefined && sameFileSignature(gateDoc, nowDoc)) &&
+          !(gateDoc === undefined && activeGate?.docFilesTruncated);
+        if (docChangedAfterGate) {
           ledger.turnWrittenFiles.add(relPath);
-          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, docStep);
+          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, datingStep(postGateShell));
+        } else if (!inGateRange && !preGateKeepsToolDate(relPath)) {
+          const preStep = preGateShell.length > 0 ? datingStep(preGateShell) : ledger.turnStartStepIndex;
+          ledger.turnWrittenFiles.add(relPath);
+          ledger.lastWriteStepIndex = Math.max(ledger.lastWriteStepIndex, preStep);
         }
       }
     }

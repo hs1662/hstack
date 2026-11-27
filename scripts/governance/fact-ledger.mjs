@@ -1120,6 +1120,10 @@ function isMakeVerification(args) {
       if (!assignMatch || assignMatch[2] === "!=" || MAKE_BLOCKED_VARS.has(assignMatch[1])) {
         return false;
       }
+      const rhs = arg.slice(assignMatch[0].length);
+      if (/[`$]/.test(rhs)) {
+        return false;
+      }
       continue;
     }
     if (arg === "--" || !arg.startsWith("-")) {
@@ -1719,12 +1723,22 @@ function extractCommandLine(call) {
   return pickString(args, ["CommandLine", "commandLine", "command"]);
 }
 
+function pickRawPathString(obj, keys) {
+  for (const key of keys) {
+    const value = obj?.[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value;
+    }
+  }
+  return "";
+}
+
 function extractCommandCwd(call, fallbackCwd = "") {
   const args = asObject(call?.args);
   if (!args) {
     return fallbackCwd;
   }
-  return pickString(args, ["Cwd", "cwd"]) || fallbackCwd;
+  return pickRawPathString(args, ["Cwd", "cwd"]) || fallbackCwd;
 }
 
 export function extractMcpCheckCommands(call) {
@@ -3206,6 +3220,7 @@ export function snapshotWorkingTree(cwd) {
   const docFiles = {};
   let trackedCodeCount = 0;
   let trackedDocCount = 0;
+  let docFilesTruncated = false;
   const trackedTokens = trackedOut.split("\0");
   for (let i = 0; i < trackedTokens.length; i += 1) {
     const entry = trackedTokens[i];
@@ -3226,6 +3241,8 @@ export function snapshotWorkingTree(cwd) {
         if (trackedDocCount < SNAPSHOT_MAX_FILES) {
           trackedDocCount += 1;
           docFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+        } else {
+          docFilesTruncated = true;
         }
         continue;
       }
@@ -3256,6 +3273,8 @@ export function snapshotWorkingTree(cwd) {
         if (trackedDocCount < SNAPSHOT_MAX_FILES) {
           trackedDocCount += 1;
           docFiles[relPath] = statSnapshotFile(gitRoot, relPath);
+        } else {
+          docFilesTruncated = true;
         }
         continue;
       }
@@ -3272,7 +3291,7 @@ export function snapshotWorkingTree(cwd) {
     untrackedFiles = null;
   }
 
-  return { gitRoot, head, files, docFiles, untrackedFiles, untrackedTruncated, capturedAtMs: Date.now() };
+  return { gitRoot, head, files, docFiles, docFilesTruncated, untrackedFiles, untrackedTruncated, capturedAtMs: Date.now() };
 }
 
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
