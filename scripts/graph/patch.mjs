@@ -145,7 +145,7 @@ export async function applyPatch(previous, command, options, io) {
     throw graphError('ERR_STALE_GRAPH_REV', 'expectedRev does not match the current graph revision');
   }
   const graphRev = safeInteger(previous.graphRev + 1, 'graphRev', 1);
-  const patch = immutable(options.patch);
+  const patch = immutable(options.patch ?? {});
   fields(patch, ['patchId', 'reason', ...commands[command]]);
   const { patchId = options.opId, reason = command } = patch;
   if (!text(options.opId) || !text(patchId) || !text(reason)) throw invalid('expected nonempty opId, patchId and reason');

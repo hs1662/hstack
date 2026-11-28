@@ -164,6 +164,12 @@ async function accept(s, n, o, io) {
   }
   const log = n.gateArgv ? io.measurements.first : o.gateLog;
   if (!isRecord(log)) throw graphError("ERR_MISSING_EVIDENCE", "Missing host gate measurement");
+  if (!n.gateArgv && (
+    (Object.hasOwn(log, "runId") && log.runId !== s.runId) ||
+    (Object.hasOwn(log, "nodeId") && log.nodeId !== n.id) ||
+    (Object.hasOwn(log, "graphRev") && log.graphRev !== n.attempt.graphRev) ||
+    (Object.hasOwn(log, "epoch") && log.epoch !== n.attempt.epoch)
+  )) throw graphError("ERR_FORGED_EVIDENCE", "Gate log does not match this run, node, or attempt");
   const gateLogUri = await io.put(Buffer.from(canonical(log)));
   n.attempt.gateLogUri = gateLogUri;
   if (n.flaky === true && (Number.isInteger(log.exitCode) && log.exitCode !== 0 || log.timedOut === true || typeof log.signal === "string")) {
