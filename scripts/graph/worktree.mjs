@@ -54,11 +54,16 @@ async function listed(workspace, path) {
 }
 
 // Policy files (.worktreeinclude) are copied as bytes and mode; a symlink or a directory is never followed.
+// Like the .worktreeinclude format, a listed file that does not exist locally is skipped and stays unprotected.
 async function copyIncluded(workspace, path, include) {
   const manifest = [];
   for (const rel of include) {
     const source = join(workspace, rel);
-    const stat = await lstat(source);
+    let stat;
+    try { stat = await lstat(source); } catch (error) {
+      if (error.code === "ENOENT") continue;
+      throw error;
+    }
     if (!stat.isFile()) throw failure(`worktree include ${rel} is not a regular file`);
     const bytes = await readFile(source);
     const mode = stat.mode & 0o7777;

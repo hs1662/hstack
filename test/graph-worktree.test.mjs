@@ -153,12 +153,13 @@ describe("graph worktree lifecycle", () => {
 
     const s = slot(root);
     const { manifest } = await provision({ workspace, path: s.path, baseSha, reason: s.reason,
-      include: [".env", "conf/local.json"], tmpDir: s.tmpDir });
+      include: [".env", "absent.env", "conf/local.json"], tmpDir: s.tmpDir });
     assert.deepEqual(readFileSync(join(s.path, ".env")), secret);
     assert.equal(statSync(join(s.path, ".env")).mode & 0o777, 0o640);
     const sha = createHash("sha256").update(secret).digest("hex");
     assert.deepEqual(manifest[0], { path: ".env", sha256: sha, mode: 0o640 });
-    assert.equal(manifest[1].path, "conf/local.json");
+    assert.deepEqual(manifest.map(entry => entry.path), [".env", "conf/local.json"]);
+    assert.equal(existsSync(join(s.path, "absent.env")), false);
     assert.equal(readFileSync(join(s.path, "conf", "local.json"), "utf8"), "{}\n");
 
     symlinkSync(join(workspace, ".env"), join(workspace, "link.env"));
