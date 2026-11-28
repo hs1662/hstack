@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { promisify } from "node:util";
 
-import { commitTree, git, gitOk, isAncestor, repoConfigDigest, revParse, splitZ } from "../scripts/graph/git.mjs";
+import { commitTree, git, gitOk, isAncestor, repoConfigDigest, revParse, splitZ, treeBytes } from "../scripts/graph/git.mjs";
 import { createTempDir } from "./fixtures.mjs";
 
 const run = promisify(execFile);
@@ -115,6 +115,15 @@ describe("graph git wrapper", () => {
       seen.add(next);
     }
     await plain(dir, "worktree", "remove", "--force", linked);
+  });
+
+  it("estimates a checkout as the sum of its blob sizes", async () => {
+    const dir = await repo();
+    mkdirSync(join(dir, "d"));
+    writeFileSync(join(dir, "d", "b.bin"), Buffer.alloc(1000, 7));
+    await plain(dir, "add", "d/b.bin");
+    await plain(dir, "commit", "-q", "-m", "more");
+    assert.equal(await treeBytes(dir, "HEAD"), 2 + 1000);
   });
 
   it("splits NUL-terminated output without a trailing empty item", () => {

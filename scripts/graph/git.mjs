@@ -87,15 +87,26 @@ export const gitDir = (cwd, options = {}) => line(["rev-parse", "--path-format=a
 export const objectFormat = (cwd, options = {}) => line(["rev-parse", "--show-object-format"], { ...options, cwd });
 export const zeroOid = (format = "sha1") => "0".repeat(format === "sha256" ? 64 : 40);
 
-/** A commit whose bytes depend only on its inputs: fixed identity, UTC second, no signature. */
-export async function commitTree(cwd, { tree, parents, dateSec, message, scope = "engine" }) {
+/** A commit whose bytes depend only on its inputs: fixed identity, UTC second, no signature. `env` may add
+ * variables such as a private GIT_INDEX_FILE, never override the identity or date. */
+export async function commitTree(cwd, { tree, parents, dateSec, message, scope = "engine", env: extra = {} }) {
   if (!Number.isSafeInteger(dateSec) || dateSec < 0) throw failure("commit date must be a nonnegative safe integer");
   if (typeof message !== "string" || !message || message.includes("\0")) throw failure("commit message must be nonempty without NUL");
   const date = `@${dateSec} +0000`;
-  const env = { GIT_AUTHOR_NAME: IDENTITY.name, GIT_AUTHOR_EMAIL: IDENTITY.email, GIT_AUTHOR_DATE: date,
+  const env = { ...extra, GIT_AUTHOR_NAME: IDENTITY.name, GIT_AUTHOR_EMAIL: IDENTITY.email, GIT_AUTHOR_DATE: date,
     GIT_COMMITTER_NAME: IDENTITY.name, GIT_COMMITTER_EMAIL: IDENTITY.email, GIT_COMMITTER_DATE: date };
   return line(["commit-tree", "--no-gpg-sign", tree, ...parents.flatMap(parent => ["-p", parent]), "-m", message],
     { cwd, scope, env });
+}
+
+/** Sum of blob sizes in a tree: the checkout-size estimate for worktree disk capacity. */
+export async function treeBytes(cwd, treeish, options = {}) {
+  let total = 0;
+  for (const entry of splitZ(await gitOk(["ls-tree", "-r", "-l", "-z", treeish], { ...options, cwd }))) {
+    const size = entry.slice(0, entry.indexOf("\t")).trim().split(/\s+/)[3];
+    if (/^\d+$/.test(size)) total += Number(size); // gitlinks report "-"
+  }
+  return total;
 }
 
 /** NUL-separated git output as strings; a trailing terminator yields no empty item. */
@@ -122,8 +133,8 @@ async function fileDigest(path) {
 }
 
 /** sha256(canonical({config, attributes, exclude, hooks})) of $GIT_COMMON_DIR, the same from every worktree. */
-export async function repoConfigDigest(cwd) {
-  const dir = await commonDir(cwd);
+export async function repoConfigDigest(cwd, options = {}) {
+  const dir = await commonDir(cwd, options);
   let names = [];
   try { names = (await readdir(join(dir, "hooks"))).sort(); } catch (error) {
     if (error.code !== "ENOENT") throw error;
