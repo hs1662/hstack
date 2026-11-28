@@ -337,8 +337,8 @@ test('only a NodeRevalidated transaction restores prior receipt and advances ver
 
 test('inject-repair accepts an omitted patch via applyPatch and the public CLI', async t => {
   const s = graph(node('scan', { status: 'failed_logic', receiptUri: uri, prompt: 'scan carefully' }));
-  const { state, body } = await mutate(s, 'inject-repair', 'scan', undefined);
-  assert.equal(body.nodeId, 'scan::repair::e1');
+  const { state, response } = await mutate(s, 'inject-repair', 'scan', undefined);
+  assert.equal(response.nodeId, 'scan::repair::e1');
   assert.equal(state.nodes['scan::repair::e1'].prompt, 'scan carefully');
 
   const { execFile } = await import('node:child_process');
@@ -349,7 +349,7 @@ test('inject-repair accepts an omitted patch via applyPatch and the public CLI',
   const data = join(root, 'graph');
   await mkdir(data, { mode: 0o700 });
   const cli = fileURLToPathForTest();
-  const run = args => promisify(execFile)(process.execPath, [cli, ...args, '--root', data, '--workspace', root], { encoding: 'utf8' });
+  const run = args => promisify(execFile)(process.execPath, [cli, ...args, '--root', data, '--workspace', root], { cwd: root, encoding: 'utf8' });
   await writeFile(join(root, 'source'), 'evidence\n');
   await writeFile(join(root, 'spec.json'), JSON.stringify({ schemaVersion: 1, nodes: [{ id: 'a', kind: 'read', prompt: 'read source' }] }));
   await run(['init']);

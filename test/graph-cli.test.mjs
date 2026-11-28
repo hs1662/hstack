@@ -685,7 +685,8 @@ describe("graph CLI against the real engine", () => {
   });
 
   it("binds external --gate-log metadata to the current run, node, revision, and epoch", async () => {
-    const { repo, cli, json } = compiledRun([gated("a"), nodeSpec("plain"), nodeSpec("other")]);
+    const { repo, cli, json } = compiledRun([gated("a"), nodeSpec("plain"),
+      nodeSpec("other-run"), nodeSpec("other-rev"), nodeSpec("other-epoch")]);
     const rPlain = await workerReceipt();
     const rPlainFile = json("r-plain.json", rPlain);
     const foreignGate = cli(["gate", "--node", "a", "--receipt", rPlainFile, "--out", "foreign-gate.json"]);
@@ -699,15 +700,15 @@ describe("graph CLI against the real engine", () => {
     assert.equal(cli(["status"]).out.result.nodes.plain.attempt.failureClass, "ERR_FORGED_EVIDENCE");
 
     const baseLog = JSON.parse(readFileSync(join(repo, "foreign-gate.json"), "utf8"));
-    for (const [tag, bad] of [
-      ["run", { ...baseLog, runId: "other-run", nodeId: "other", graphRev: 1, epoch: 1 }],
-      ["rev", { ...baseLog, runId: "host", nodeId: "other", graphRev: 2, epoch: 1 }],
-      ["epoch", { ...baseLog, runId: "host", nodeId: "other", graphRev: 1, epoch: 99 }],
+    for (const [nodeId, bad] of [
+      ["other-run", { ...baseLog, runId: "other-run", nodeId: "other-run", graphRev: 1, epoch: 1 }],
+      ["other-rev", { ...baseLog, runId: "host", nodeId: "other-rev", graphRev: 2, epoch: 1 }],
+      ["other-epoch", { ...baseLog, runId: "host", nodeId: "other-epoch", graphRev: 1, epoch: 99 }],
     ]) {
-      const tok = startedAttempt(cli, "other", tag);
+      const tok = startedAttempt(cli, nodeId, nodeId);
       const res = cli(["settle", "--token", tok, "--outcome", "accepted", "--receipt", rPlainFile,
-        "--gate-log", json(`bad-${tag}.json`, bad), "--op-id", `s-${tag}`]);
-      assert.equal(res.out.result.status, "failed_logic", tag);
+        "--gate-log", json(`bad-${nodeId}.json`, bad), "--op-id", `s-${nodeId}`]);
+      assert.equal(res.out.result.status, "failed_logic", nodeId);
     }
 
     const { repo: repo2, cli: cli2, json: json2 } = compiledRun([nodeSpec("ok")]);
