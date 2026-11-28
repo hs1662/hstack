@@ -35,4 +35,15 @@ graph metrics --run survey
 | `revalidate` | `--run ID --node ID --expected-rev N --op-id OP`. 증거가 일치할 때만 `NodeRevalidated`를 기록한다. 현재 검증을 생략하는 옵션이 아니다. |
 | `reduce` / `retry` / `resume` / `gc` | `reduce`는 필수 명단을 대조한다. `retry`는 예산과 시각이 허용한 인프라 재시도만 연다. `resume`은 저널을 검증하며 `gc`는 루트 전체를 확인한 뒤 고아만 수거한다. |
 
+**v2 명령** (`schemaVersion: 2` Run 전용, 절차는 [v2 쓰기 통합](v2-write.md)):
+
+| 명령 | 필수 플래그 | 값 플래그 |
+|---|---|---|
+| `integrate` | `--run ID --op-id OP` | 없음 |
+| `release` | `--token PATH --op-id OP` | 없음 |
+| `land` | `--run ID --op-id OP` | `--mode ff-only\|branch\|merge\|patch`, `--branch NAME`, `--out FILE`, `--allow partial,dirty-nonoverlap` |
+| `gc --scope git` | `--run ID` | `--scope git\|cas` |
+
+새 플래그는 모두 값을 받는다. 불리언 플래그는 없다(D32).
+
 **영수증:** `workerReportedStatus`, `inlineSummary`, `provenance`를 제출한다. `provenance`에는 `evidenceSpans`, `claims`, `edgeCases`, `failureEvidence` 배열과 그 네 배열에서 엔진의 `factDigest()`로 계산한 값이 필요하다. 파일 스팬의 `path`는 저장소 상대 경로이며 `startLine`과 `endLine`은 양 끝을 포함하는 1부터 시작하는 행 번호다. `claims[].spanIds` 등은 실제 스팬을 가리켜야 한다. 호스트 게이트 로그에는 실제 `argv`, `envDigest`, `exitCode`, `signal`, `subjectDigest`를 기록하고, 정책 필드(`testPlan`·`auditPolicy`·`gateVersion`)나 재검증이 붙은 무게이트 노드에서는 `gateKey`도 일치해야 한다. 로그에 `runId`·`nodeId`·`graphRev`·`epoch`가 있으면 현재 시도와 일치해야 한다. 워커가 이 값을 써서 자기 작업을 승인할 수 없다.
