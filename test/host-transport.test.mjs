@@ -56,10 +56,14 @@ test("normalization retains original host events and every raw field", () => {
   assert.deepEqual(post.raw, native);
 });
 
-test("capability negotiation never promises cancellation, resume or isolated writes from host identity", () => {
+test("capability negotiation never promises cancellation or resume, and isolates writes in engine worktrees", () => {
+  const expected = {
+    "claude-code": { spawn: true, readOnlySubagent: "enforced", isolatedWrite: true, nativeWorktree: true },
+    antigravity: { spawn: true, readOnlySubagent: "prompt", isolatedWrite: true, nativeWorktree: null },
+    unknown: { spawn: false, readOnlySubagent: false, isolatedWrite: true, nativeWorktree: null },
+  };
   for (const host of ["claude-code", "antigravity", "unknown"]) {
-    assert.deepEqual(getHostCapabilities(host), { host, spawn: host !== "unknown", readOnlySubagent: host !== "unknown",
-      isolatedWrite: false, cancel: false, resume: false, usageTelemetry: null });
+    assert.deepEqual(getHostCapabilities(host), { host, ...expected[host], cancel: false, resume: false, usageTelemetry: null });
   }
   const env = { CLAUDE_PLUGIN_ROOT: "/claude", CLAUDE_PLUGIN_DATA: "/c-data", PLUGIN_ROOT: "/agy", PLUGIN_DATA: "/a-data" };
   for (const [host, pluginRoot, dataDir] of [["claude-code", "/claude", "/c-data"], ["antigravity", "/agy", "/a-data"]]) {

@@ -6,10 +6,12 @@ import { normalizeClaudeTool } from "./tools.mjs";
 // Capabilities of this package, not grants in a particular session. A separately
 // prompted worker isn't a filesystem sandbox, and transcript counters aren't a
 // reliable per-worker usage API. Never infer cancel/resume from a session ID.
+// isolatedWrite means engine-provided CLI worktrees; nativeWorktree is informational only.
 const unknown = Object.freeze({ host: "unknown", spawn: false, readOnlySubagent: false,
-  isolatedWrite: false, cancel: false, resume: false, usageTelemetry: null });
-const agy = Object.freeze({ ...unknown, host: "antigravity", spawn: true, readOnlySubagent: true });
-const claude = Object.freeze({ ...unknown, host: "claude-code", spawn: true, readOnlySubagent: true });
+  isolatedWrite: true, nativeWorktree: null, cancel: false, resume: false, usageTelemetry: null });
+const agy = Object.freeze({ ...unknown, host: "antigravity", spawn: true, readOnlySubagent: "prompt" });
+const claude = Object.freeze({ ...unknown, host: "claude-code", spawn: true, readOnlySubagent: "enforced",
+  nativeWorktree: true });
 
 export function getHostCapabilities(host) {
   return host === "antigravity" ? agy : host === "claude-code" ? claude : unknown;

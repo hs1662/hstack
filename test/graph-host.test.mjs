@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { canaryStats, contextRotAbort, hostCaps, pinCarryover, recheckSuspect } from "../scripts/graph/host-bridge.mjs";
+import { runCli } from "../scripts/graph/cli.mjs";
 import * as store from "../scripts/governance/handoff-store.mjs";
 import { getHostCapabilities } from "../scripts/host/host-adapter.mjs";
 import { createTempDir } from "./fixtures.mjs";
@@ -32,6 +33,30 @@ test("host capabilities are the adapter's values marked as hints, never grants",
   for (const [host, dispatchHint] of dispatchTools) {
     assert.deepEqual(hostCaps(host), { ...getHostCapabilities(host), dispatchHint, hintOnly: true });
     assert.ok(Object.isFrozen(hostCaps(host)));
+  }
+});
+
+test("O-H-1 pins v2 host capabilities through the graph CLI", async () => {
+  for (const [host, readOnlySubagent, nativeWorktree] of [
+    ["claude-code", "enforced", true],
+    ["antigravity", "prompt", null],
+  ]) {
+    const caps = hostCaps(host);
+    assert.equal(caps.readOnlySubagent, readOnlySubagent);
+    assert.equal(caps.isolatedWrite, true);
+    assert.equal(caps.nativeWorktree, nativeWorktree);
+
+    let output = "";
+    const exitCode = await runCli(["host-caps"], {
+      env: { HSTACK_HOST: host },
+      stdout: { write: (chunk) => { output += chunk; } },
+    });
+    assert.equal(exitCode, 0);
+    const envelope = JSON.parse(output);
+    assert.equal(envelope.ok, true);
+    assert.equal(envelope.result.readOnlySubagent, readOnlySubagent);
+    assert.equal(envelope.result.isolatedWrite, true);
+    assert.equal(envelope.result.nativeWorktree, nativeWorktree);
   }
 });
 
