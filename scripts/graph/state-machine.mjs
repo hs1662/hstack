@@ -17,6 +17,7 @@ import { graphError, isRecord, isRunSchemaVersion, nonempty, normalizeV2Policy, 
 import { readState, recover, transaction } from "./wal-store.mjs";
 import { measureGate } from "./verify-gate.mjs";
 import { acceptedRef, defaultMaxOpenWorktrees } from "./worktree.mjs";
+import { autoRelease, claimWriter, ensureProvisioned, EvidenceWork, ReleaseWork, requestRelease, SealWork, settleWriter } from "./write-attempts.mjs";
 
 const own = (map, id) => Object.hasOwn(map, id) ? map[id] : undefined;
 const held = new Set(["held_blocked", "held_infra", "held_upstream", "failed_logic", "held_flaky", "held_conflict", "held_integration"]);
@@ -44,7 +45,7 @@ const runState = state => {
   return state;
 };
 const types = new Map(Object.entries({
-  compile: "GraphCompiled", claim: "AttemptClaimed", start: "AttemptStarted", settle: "AttemptSettled",
+  compile: "GraphCompiled", claim: "AttemptClaimed", start: "AttemptStarted", settle: "AttemptSettled", release: "Released",
   retry: "RetryOpened", reduce: "RunReduced", revalidate: "NodeRevalidated", amend: "GraphPatched", expand: "GraphPatched", "inject-repair": "GraphPatched",
 }));
 
@@ -253,6 +254,10 @@ async function settle(s, n, o, io, now) {
   let reason = outcome;
   switch (outcome) {
     case "success": case "completed": case "accepted":
+      if (n.attempt.worktree) {
+        reason = await settleWriter(s, n, o, io);
+        break;
+      }
       try { await accept(s, n, o, io); }
       catch (err) {
         reason = err.code;
@@ -277,21 +282,24 @@ async function settle(s, n, o, io, now) {
     case "logic_terminal": n.status = "failed_logic"; break;
     default: throw bad("Unknown settlement outcome");
   }
-  if (n.status !== "accepted") n.receiptUri = await io.put(Buffer.from(canonical(failureRecord(receipt, reason))));
+  const succeeded = n.status === "accepted" || n.status === "sealed";
+  if (!succeeded) n.receiptUri = await io.put(Buffer.from(canonical(failureRecord(receipt, reason))));
   if (n.status === "failed_logic") n.failedExecKeys = [...new Set([...(n.failedExecKeys ?? []), n.execKey])];
   // GateWork abandons its first draft. Only the committing draft may touch
   // the canary session or count a host observation.
   observeHost(s, n, o);
   n.attempt.settleOp = o.opId;
-  n.attempt.failureClass = n.status === "accepted" ? null : reason;
+  n.attempt.failureClass = succeeded ? null : reason;
   const verified = ["success", "completed", "accepted"].includes(outcome);
   if (verified && n.attempt.gateLogUri) n.attempt.receiptPhase = "checked";
   captureFinish(s, { nodeId: n.id, atMs: Date.now(), verificationStartedAtMs: verified ? n.attempt.verificationStartedAtMs ?? now : undefined,
-    usage: n.attempt.observedUsage, outcome: n.status === "accepted" ? "accepted" :
+    usage: n.attempt.observedUsage, outcome: succeeded ? "accepted" :
       ["context_rot_abort", "infra_transient"].includes(outcome) ? "infra" : "rejected" });
   if (outcome === "context_rot_abort") captureCanary(s, "handoffs");
   n.attempt.inputUris = [];
-  return { runId: s.runId, graphRev: s.graphRev, nodeId: n.id, epoch: n.attempt.epoch, status: n.status, receiptUri: n.receiptUri };
+  if (n.attempt.worktree) s.worktrees[n.attempt.worktree.id].settled = true;
+  return { runId: s.runId, graphRev: s.graphRev, nodeId: n.id, epoch: n.attempt.epoch, status: n.status, receiptUri: n.receiptUri,
+    ...(n.attempt.worktree && { reason }) };
 }
 
 export async function dispatch(command, options = {}) {
@@ -301,7 +309,7 @@ export async function dispatch(command, options = {}) {
     throw bad("Reserved operation ID");
   }
   if (command === "integrate") throw graphError(V2_WRITE_ERROR, "Write integration is reserved for v2");
-  const authorized = command === "start" || command === "settle";
+  const authorized = command === "start" || command === "settle" || command === "release";
   if (authorized) o.run = locate(o.root, o.token, o.run);
   const run = nonempty(o.run, "run");
   if (command === "resume") return runState(await recover(o.root, run));
@@ -324,9 +332,10 @@ export async function dispatch(command, options = {}) {
     if (owner && owner.attempt.verifierRequestDigest !== requestDigest)
       throw graphError("ERR_OP_CONFLICT", "Request differs from the reserved verification");
   };
-  let compiledV2;
+  const effects = { root, run, opId, payload, requestDigest, refresh, guard };
+  let compiledV2, evidence, releaseRecorded = false;
   const commit = () => transaction(root, run, { opId, payload, type, guard }, async (state, store) => {
-    const io = { ...store, budgetContext: o.telemetry?.budgetContext ?? o.hostBudget,
+    const io = { ...store, evidence, budgetContext: o.telemetry?.budgetContext ?? o.hostBudget,
       maxInlineBytesPerNode: state?.limits?.maxInlineBytesPerNode, maxInlineBytesPerWave: state?.limits?.maxInlineBytesPerWave };
     if (command === "compile") {
       if (state) throw graphError("ERR_RUN_EXISTS", "Run already compiled");
@@ -346,8 +355,10 @@ export async function dispatch(command, options = {}) {
         throw graphError("ERR_GATE_IN_PROGRESS", "Another settlement owns this attempt");
       if (command === "settle" && n.attempt.measuredUri)
         io.measurements = JSON.parse(await store.get(n.attempt.measuredUri));
-      if (command === "start") {
+      if (command === "release") response = requestRelease(s, o.token, releaseRecorded);
+      else if (command === "start") {
         if (n.status !== "claimed") throw notReady("Only claimed attempts may start");
+        if (n.attempt.worktree && n.attempt.worktree.phase !== "ready") throw notReady("Worktree is not ready");
         n.attempt.hostHandle = nonempty(o.hostHandle, "hostHandle");
         observeHost(s, n, o);
         n.status = "running";
@@ -361,9 +372,6 @@ export async function dispatch(command, options = {}) {
       const n = getNode(s, o.node);
       switch (command) {
         case "claim": {
-          if (s.schemaVersion === STATE_SCHEMA_V2 && n.kind === "write") {
-            throw graphError(V2_WRITE_ERROR, "v2 write claims are not enabled");
-          }
           if (o.expectedRev !== s.graphRev) throw graphError("ERR_STALE_GRAPH_REV", "Graph revision changed");
           if (!pending(n, now) || !parentsAccepted(s, n)) throw notReady("Node or prerequisites not ready");
           const reason = capacity(s, n);
@@ -373,7 +381,9 @@ export async function dispatch(command, options = {}) {
             const reduced = await reduceRun(s, { node: n.id }, io);
             n.reductionUri = reduced.response.indexUri;
           }
-          response = await issue(s, n, o, io);
+          const issueAttempt = s.schemaVersion === STATE_SCHEMA_V2 && n.kind === "write" ? claimWriter : issue;
+          response = await issueAttempt(s, n, { root, opId, io });
+          if (response.error) break;
           n.attempt.pinSlots = pinSlots(s, n);
           s.attemptsIssued++;
           captureClaim(s, { nodeId: n.id, atMs: now });
@@ -403,7 +413,24 @@ export async function dispatch(command, options = {}) {
     result.state = validateRunRecords(result.state);
     return result;
   });
-  try { return await commit(); }
+  try {
+    for (;;) {
+      let result;
+      try { result = await commit(); }
+      catch (work) {
+        if (work instanceof SealWork || work instanceof ReleaseWork) {
+          await work.perform(effects);
+          if (work instanceof ReleaseWork) releaseRecorded = true;
+        } else if (work instanceof EvidenceWork) evidence = await work.check(o.receipt);
+        else throw work;
+        continue;
+      }
+      if (command === "claim" && result.error) throw graphError(result.error.code, result.error.message);
+      if (command === "claim" && result.worktreePath) await ensureProvisioned(effects, result);
+      if (command === "settle" && result.reason) await autoRelease(effects, o.token, result.status);
+      return result;
+    }
+  }
   catch (err) {
     if (err instanceof CompileWork) {
       compiledV2 = await compile(o);

@@ -47,7 +47,7 @@ export const EXIT_CODES = Object.freeze({ ok: 0, engine: 1, stale: 49, usage: 64
 
 export const COMMANDS = Object.freeze([
   "init", "compile", "ready", "claim", "start", "settle", "status", "resume", "retry", "amend", "expand",
-  "inject-repair", "reduce", "revalidate", "gc", "host-caps", "metrics", "gate", "integrate",
+  "inject-repair", "reduce", "revalidate", "gc", "host-caps", "metrics", "gate", "integrate", "release",
 ]);
 const COMMAND_SET = new Set(COMMANDS);
 
@@ -68,6 +68,7 @@ const COMMAND_ONLY_FLAGS = new Map([
 ]);
 // Graph patches run inside one GraphPatched transaction keyed by the current physical node and revision.
 const REQUIRED_FLAGS = new Map([
+  ["release", ["token", "op-id"]],
   ["amend", ["node", "expected-rev", "op-id", "patch"]],
   ["expand", ["node", "expected-rev", "op-id", "patch"]],
   ["inject-repair", ["node", "expected-rev", "op-id"]],

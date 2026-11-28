@@ -1,3 +1,4 @@
+// allow: SIZE_OK - receipt verification and two-stage reduction share the occurrence and CAS representation.
 // Graph v1 artifact verification and two-stage reduction. A pointer always
 // names an occurrence (tuple, immutable receipt, collection offset), not just an ID.
 import { createHash } from "node:crypto";
@@ -78,7 +79,6 @@ function confined(root, path) {
 }
 
 async function fileEvidence(root, path) {
-  if (!text(path) || path.includes("\0") || win32.isAbsolute(path) || path.split(/[\\/]/).includes("..")) throw forged("file path");
   try {
     const resolved = await realpath(join(root, path));
     if (!confined(root, resolved)) throw forged(path);
@@ -108,7 +108,7 @@ function identity(record, key) {
   return record[key];
 }
 
-async function validate(r, io, files) {
+export async function validateEvidence(r, io, files = new Map()) {
   if (!isRecord(r) || !isRecord(r.provenance)) throw missing("provenance");
   if (r.schemaVersion !== undefined && r.schemaVersion !== 1) throw forged("schemaVersion");
   identity(r, "workerReportedStatus");
@@ -125,7 +125,8 @@ async function validate(r, io, files) {
     const path = identity(s, "path");
     if (s.startLine == null || s.endLine == null) throw missing(`line range ${id}`);
     if (!positive(s.startLine) || !positive(s.endLine) || s.endLine < s.startLine) throw forged(`line range ${id}`);
-    if (!files.has(path)) files.set(path, await fileEvidence(await realpath(io.workspaceRoot), path));
+    if (path.includes("\0") || win32.isAbsolute(path) || path.split(/[\\/]/).includes("..")) throw forged("file path");
+    if (!files.has(path)) files.set(path, io.evidenceFile ? await io.evidenceFile(path) : await fileEvidence(await realpath(io.workspaceRoot), path));
     const file = files.get(path);
     if (s.endLine > file.lines || ["sha256", "digest", "blobDigest"].some(k => k in s && s[k] !== file.digest)) throw forged(`file evidence ${id}`);
     spanResolutions.push({spanId:id,path,startLine:s.startLine,endLine:s.endLine,actualLines:file.lines,sha256:file.digest});
@@ -149,6 +150,12 @@ async function validate(r, io, files) {
       }
     }
   }
+  return spanResolutions;
+}
+
+async function validate(r, io, files) {
+  const spanResolutions = await validateEvidence(r, io, files);
+  const p = r.provenance;
   const uri = identity(io, "gateLogUri");
   if (r.gateEvidence?.logUri != null && r.gateEvidence.logUri !== uri) throw forged("worker gate pointer");
   const log = parse(await load(uri, io), "gate log");

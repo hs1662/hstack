@@ -35,6 +35,7 @@ export const FAST = [
   "graph-run-roots.test.mjs",
   "graph-runtime-records.test.mjs",
   "graph-skill.test.mjs",
+  "graph-v2-claim.test.mjs",
   "graph-v2-schema.test.mjs",
   "graph-worktree.test.mjs",
   "host-mcp-session.test.mjs",
@@ -48,6 +49,7 @@ export const FAULT = [
   "graph-mass.test.mjs",
   "graph-state.test.mjs",
   "graph-wal.test.mjs",
+  "graph-worktree-crash.test.mjs",
 ];
 
 export function allTestFiles() {

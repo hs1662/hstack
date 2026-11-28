@@ -179,7 +179,7 @@ test("v2 compile records Git context, policy, and include paths and rejects inva
     { spec: { ...defaults, policy: { integration: { maxOpenWorktrees: 65 } } } },
     { spec: { ...defaults, policy: { seal: { allowSymlinks: 1 } } } },
   ]) await assert.rejects(dispatch("compile", { ...options, run: "invalid", spec: defaults, ...request }), invalid);
-  await assert.rejects(dispatch("claim", { ...options, node: "a", opId: "write", expectedRev: 1 }), unavailable);
+  assert.ok((await dispatch("claim", { ...options, node: "a", opId: "write", expectedRev: 1 })).worktreePath);
   await assert.rejects(dispatch("integrate", options), unavailable);
   await dispatch("claim", { ...options, node: "read", opId: "reader", expectedRev: 1 });
   assert.equal((await dispatch("status", options)).nodes.read.status, "claimed");

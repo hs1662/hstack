@@ -23,12 +23,22 @@ export function locate(root, token, run) {
 }
 
 export async function authenticate(state, { token, command, opId }) {
+  if (command === "release") {
+    const record = Object.values(state?.worktrees ?? {}).find(w => w.kind === "worker" && w.instructionPath === token);
+    if (!record) throw stale();
+    await verifyDirective(record, state.runId, record.nodeId);
+    return state.nodes[record.nodeId];
+  }
   const n = Object.values(state?.nodes ?? {}).find(n => n.attempt?.instructionPath === token);
   if (!n || n.attempt.epoch !== n.highestIssuedEpoch ||
       !["claimed", "running"].includes(n.status) && !(command === "settle" && n.attempt.settleOp === opId)) throw stale();
-  const a = n.attempt;
+  await verifyDirective(n.attempt, state.runId, n.id);
+  return n;
+}
+
+async function verifyDirective(a, runId, nodeId) {
   try {
-    if (await realpath(token) !== token) throw stale();
+    if (await realpath(a.instructionPath) !== a.instructionPath) throw stale();
     const fd = await open(a.instructionPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const st = await fd.stat();
@@ -36,14 +46,13 @@ export async function authenticate(state, { token, command, opId }) {
       const bytes = await fd.readFile();
       if (hash(bytes) !== a.directiveDigest) throw stale();
       const d = JSON.parse(bytes);
-      if (d.epoch !== a.epoch || d.runId !== state.runId || d.nodeId !== n.id ||
+      if (d.epoch !== a.epoch || d.runId !== runId || d.nodeId !== nodeId ||
           d.graphRev !== a.graphRev || hash(d.nonce) !== a.nonceHash) throw stale();
     } finally { await fd.close(); }
   } catch (err) {
     if (["ENOENT", "ELOOP", "ENOTDIR", "EACCES"].includes(err.code)) throw stale();
     throw err;
   }
-  return n;
 }
 
 async function syncDir(path) {
@@ -87,13 +96,13 @@ export function inputs(state, n) {
     n.failureReceiptUri, n.revalidateReceiptUri].filter(Boolean))];
 }
 
-async function generationContext(state, n, root) {
+async function generationContext(state, n, { root, baseSha }) {
   const load = names => Promise.all(names.map(name => loadFile(state.workspace, name, root)));
   const [skills, rules] = await Promise.all([load(n.skills), load(n.rules)]);
   return {
     spec: { id: n.logicalId, kind: n.kind, handoffCarryoverUri: n.handoffCarryoverUri ?? null },
     renderedPrompt: n.prompt, messages: n.messages ?? [], readScope: n.readScope, writeScope: n.writeScope,
-    host: state.hostProfile, baseSha: state.baseSha, skills, rules, environment: state.environment, policy: state.policy ?? null,
+    host: state.hostProfile, baseSha, skills, rules, environment: state.environment, policy: state.policy ?? null,
     projection: n.projection, projectionConfig: n.projectionConfig, volatility: n.volatility,
   };
 }
@@ -104,7 +113,7 @@ function localKey(n, generation) {
 }
 
 export async function currentLocalKey(s, n, root) {
-  return localKey(n, await generationContext(s, n, root));
+  return localKey(n, await generationContext(s, n, { root, baseSha: n.attempt?.baseSha ?? s.baseSha }));
 }
 
 export function projectionEligible(n) {
@@ -113,11 +122,11 @@ export function projectionEligible(n) {
     !n.revalidateReceiptUri && !n.reductionUri && !n.handoffCarryoverUri;
 }
 
-export async function issue(state, n, { root, opId }, io) {
+export async function issue(state, n, { root, opId, io, writer }) {
   const epoch = safeInteger(n.highestIssuedEpoch + 1, "epoch", 1);
   const internal = inputs(state, n);
   for (const uri of internal) await io.get(uri);
-  const generation = await generationContext(state, n, root);
+  const generation = await generationContext(state, n, { root, baseSha: writer?.baseSha ?? state.baseSha });
   const { skills, rules } = generation;
   const views = [];
   const parents = n.dependsOn.map(id => state.nodes[id]);
@@ -141,7 +150,7 @@ export async function issue(state, n, { root, opId }, io) {
   const projected = views.length > 0 && views.length === parents.length;
   const inputUris = projected ? await Promise.all(views.map(v => io.put(Buffer.from(v)))) : internal;
   generation.inputReceiptDigests = inputUris.map(uri => uri.slice("cas://sha256/".length));
-  const key = n.revalidateReceiptUri ? n.execKey : execKey(generation);
+  const key = n.revalidateReceiptUri && !writer ? n.execKey : execKey(generation);
   if (n.failedExecKeys?.includes(key)) throw graphError("ERR_LOGIC_RETRY", "A terminal failure fenced this generation");
   const pinFiles = files => Promise.all(files.map(async ({ name, bytes }) => ({ name, uri: await io.put(bytes) })));
   const pinnedSkills = await pinFiles(skills), pinnedRules = await pinFiles(rules);
@@ -150,13 +159,13 @@ export async function issue(state, n, { root, opId }, io) {
     prompt: n.prompt, skills: pinnedSkills, rules: pinnedRules, messages: generation.messages,
     readScope: n.readScope, writeScope: n.writeScope, inputUris, handoffCarryoverUri: n.handoffCarryoverUri ?? null,
     revalidateReceiptUri: n.revalidateReceiptUri ?? null, gate: gatePolicy(n), reductionUri: n.reductionUri ?? null,
-    dispatch: { workspace: state.workspace } };
+    dispatch: { workspace: state.workspace }, ...writer };
   const issued = await directive(root, state.runId, instructions);
   Object.assign(n, { status: "claimed", highestIssuedEpoch: epoch, execKey: key, cacheable: !crossRunCacheDisabled(state.hostProfile, n.volatility),
     attempt: { ...identity, ...issued, claimOp: opId, receiptPhase: "prepared", localKey: localKey(n, generation),
       deliveredProjection: projected ? "facts-v1" : null, inputUris: [...new Set([...internal, ...inputUris,
       ...pinnedSkills.map(f => f.uri), ...pinnedRules.map(f => f.uri), ...[n.reductionUri].filter(Boolean)])] } });
-  return { ...identity, cacheable: n.cacheable, instructionPath: issued.instructionPath };
+  return { ...identity, cacheable: n.cacheable, instructionPath: issued.instructionPath, ...writer };
 }
 
 export const gatePolicy = n => ({
