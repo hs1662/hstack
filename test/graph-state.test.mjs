@@ -403,7 +403,8 @@ test("steering: dirty required read needs explicit revalidation, and a volatile 
   const records = frames.filter(r => r.type === "NodeRevalidated");
   assert.deepEqual(records.map(r => [r.body.nodeId, r.body.graphRev, r.body.priorReceiptUri]), [["child", 2, previous]]);
   assert.ok(records[0].body.reason);
-  assert.ok(records[0].body.refs.includes(previous));
+  // A frame names each URI once (D26); the run's root union still holds the prior receipt.
+  assert.ok(frames.slice(0, frames.indexOf(records[0]) + 1).some(r => r.body.refs.includes(previous)));
 });
 
 test("explicit full receipt input prevents a facts-v1 delivery marker", async t => {

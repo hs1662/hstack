@@ -55,8 +55,10 @@ function verifySnapshot(bytes, frame, acceptLegacy = false) {
   return s;
 }
 
+// `roots` keeps first-seen order; `rootCounts[i]` is its size after frame i + 1,
+// so the roots first seen up to a checkpoint are a prefix of that order.
 function framesFrom(bytes) {
-  const frames = [], ops = new Map(), roots = new Set();
+  const frames = [], ops = new Map(), roots = new Set(), rootCounts = [];
   let offset = 0;
   for (let end; (end = bytes.indexOf(10, offset)) !== -1; offset = end + 1) {
     const frame = parse(bytes.subarray(offset, end), `WAL at byte ${offset}`);
@@ -77,8 +79,9 @@ function framesFrom(bytes) {
     frames.push(frame);
     ops.set(opId, frame);
     for (const uri of refsIn(body)) roots.add(uri);
+    rootCounts.push(roots.size);
   }
-  return { frames, ops, roots, offset };
+  return { frames, ops, roots, rootCounts, offset };
 }
 
 function assertPublic(value) {
@@ -97,7 +100,10 @@ function assertPublic(value) {
 
 // Read the checkpoint names first: a lock-free reader may then observe *newer*
 // WAL commits, never a checkpoint from the future relative to its WAL bytes.
-async function inspect(p, marked = new Set()) {
+// A commit writes checkpoint k only after tracing every root of frames <= k, and
+// getBlob verifies digests on each read. So a transaction (`incremental`) traces
+// only roots first seen after the verified checkpoint; resume and GC trace all.
+async function inspect(p, { marked = new Set(), incremental = false } = {}) {
   await directory(p.root, ["runs", p.runId, "wal"], false);
   await directory(p.root, ["runs", p.runId, "snapshots"], false);
   const names = await entries(p.snapshots);
@@ -105,23 +111,26 @@ async function inspect(p, marked = new Set()) {
     ? Math.max(max, Number(name.slice(0, -5))) : max, 0);
   const bytes = await optionalFile(p.file) ?? Buffer.alloc(0);
   const log = framesFrom(bytes);
-  await trace(p.root, log.roots, marked);
   let head = null;
   if (latest) {
     head = verifySnapshot(await optionalFile(join(p.snapshots, `${latest}.json`)), log.frames[latest - 1], true);
   }
+  const roots = [...log.roots];
+  const verified = incremental && latest ? log.rootCounts[latest - 1] : 0;
+  for (const uri of roots.slice(0, verified)) marked.add(uri);
+  await trace(p.root, roots.slice(verified), marked);
   for (let i = latest; i < log.frames.length; i++) {
     const frame = log.frames[i];
     const state = parse(await getBlob(p.root, frame.body.stateUri), "committed post-state");
     head = foldCommitted(head, frame, state);
   }
   const last = log.frames.at(-1);
-  return { ...log, bytes, state: head?.state ?? null, last, checkpointSeq: latest };
+  return { ...log, bytes, marked, state: head?.state ?? null, last, checkpointSeq: latest };
 }
 
 // Internal collector entry point: caller already holds the global lock.
 export async function markJournal(root, runId, marked) {
-  return (await inspect(paths(root, runId), marked)).frames.length;
+  return (await inspect(paths(root, runId), { marked })).frames.length;
 }
 
 async function pins(p, log, staging = []) {
@@ -199,7 +208,7 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
   const payloadDigest = checksum(["hstack.transaction/v1", type, payload]);
   return withLock(root, async () => {
     await pendingIntent(root, runId);
-    const log = await inspect(p);
+    const log = await inspect(p, { incremental: true });
     if (guard) await guard(log.state); // Fencing must apply even to a cached receipt.
     const prior = log.ops.get(opId);
     if (prior && prior.payloadDigest !== payloadDigest) {
@@ -240,9 +249,11 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
       }
       assertPublic(data);
       const stateUri = await putBlob(root, Buffer.from(canonical(state)));
-      const refs = [...new Set([...refsIn(state), ...(data.refs ?? [])])];
+      // Readers use the union of all frame refs, so a frame names only URIs new
+      // to this run's log; the same union is what full-refs frames produced.
+      const refs = [...new Set([...refsIn(state), ...(data.refs ?? [])])].filter(uri => !log.roots.has(uri));
       const body = { ...data.body, refs, stateUri, response: data.response };
-      await trace(root, refsIn(body));
+      await trace(root, refsIn(body), log.marked);
       const eventType = nonempty(data.eventType ?? type, "eventType");
       const header = { schemaVersion: 1, seq: log.frames.length + 1,
         prevHash: log.last?.recordHash ?? null, opId, payloadDigest, type: eventType, body };

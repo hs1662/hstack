@@ -347,6 +347,71 @@ test("versioned pure fold checks frame links and pinned post-state, independent 
   assert.deepEqual(snap, { schemaVersion: 1, ...folded, stateHash: hash('{"n":2}') });
 });
 
+test("mixed full-refs and incremental-refs frames keep one root set across commit, resume, and GC", async t => {
+  const root = await fixture(t);
+  const { canonical } = await import("../scripts/graph/fingerprint.mjs");
+  const { putBlob, refsIn } = await import("../scripts/graph/gc.mjs");
+  const put = (text) => putBlob(root, Buffer.from(text));
+  const casFile = (uri) => join(root, "cas", "sha256", uri.slice(13, 15), uri.slice(13));
+  const [leaf, child] = [await put("leaf"), await put("child")];
+  const manifest = await put(JSON.stringify({ child }));
+  // v0.3.0 writers repeated every state reference in every frame.
+  const legacy = [{ n: 1, evidence: [leaf] }, { n: 2, evidence: [leaf, manifest] }];
+  let prevHash = null, lines = "";
+  for (const [i, state] of legacy.entries()) {
+    const header = { schemaVersion: 1, seq: i + 1, prevHash, opId: `legacy-${i + 1}`,
+      payloadDigest: hash(canonical(["hstack.transaction/v1", "Changed", {}])), type: "Changed",
+      body: { refs: [...refsIn(state)], stateUri: await put(canonical(state)), response: { receipt: state.n } } };
+    prevHash = hash(canonical(header));
+    lines += `${canonical({ ...header, recordHash: prevHash })}\n`;
+  }
+  await fs.mkdir(dirname(wal(root)), { recursive: true });
+  await fs.writeFile(wal(root), lines);
+  const fresh = await put("fresh");
+  const evidence = [leaf, manifest, fresh];
+  await transaction(root, "r", request("incremental-3"), async (prev, io) => {
+    assert.deepEqual(prev, legacy[1]);
+    return { state: { n: 3, evidence }, refs: [await io.put("result")], response: { receipt: 3 } };
+  });
+  await transaction(root, "r", request("incremental-4"), async (_, io) => {
+    await io.put("orphan");
+    return { state: { n: 4, evidence }, response: { receipt: 4 } };
+  });
+  const frames = (await fs.readFile(wal(root), "utf8")).trimEnd().split("\n").map(line => JSON.parse(line));
+  const sorted = (uris) => [...uris].sort();
+  assert.deepEqual(frames.map(f => sorted(f.body.refs)),
+    [[leaf], sorted([leaf, manifest]), sorted([fresh, `cas://sha256/${hash("result")}`]), []]);
+  const union = (bodies) => sorted(new Set(bodies.flatMap(body => [...refsIn(body)])));
+  const states = await Promise.all(frames.map(async f => JSON.parse(await fs.readFile(casFile(f.body.stateUri)))));
+  // The roots a full-refs writer would have journaled for the same commits.
+  const full = union(frames.map((f, i) => ({ ...f.body, refs: [...refsIn(states[i]), ...f.body.refs] })));
+  assert.deepEqual(union(frames.map(f => f.body)), full);
+  assert.deepEqual(await recover(root, "r"), { n: 4, evidence });
+  assert.deepEqual(sorted(JSON.parse(await fs.readFile(join(root, "gcroots", "r.pin.json"))).refs), full);
+  assert.equal((await collectGarbage(root)).removed, 1);
+  await assert.rejects(fs.stat(blob(root, "orphan")), { code: "ENOENT" });
+  for (const uri of [...evidence, child, `cas://sha256/${hash("result")}`]) await fs.stat(casFile(uri));
+});
+
+test("a commit traces only roots first seen after its verified checkpoint; resume and GC trace them all", async t => {
+  const root = await fixture(t);
+  await transaction(root, "r", request("1"), async (_, io) => ({ ...result(1), refs: [await io.put("historical")] }));
+  await transaction(root, "r", request("2"), () => result(2));
+  await fs.writeFile(blob(root, "historical"), "other");
+  assert.deepEqual(await transaction(root, "r", request("3"), async (_, io) => ({
+    ...result(3), refs: [await io.put("recent")],
+  })), { receipt: 3 });
+  await assert.rejects(recover(root, "r"), corrupt);
+  await assert.rejects(collectGarbage(root), corrupt);
+  await fs.writeFile(blob(root, "historical"), "historical");
+  // A crash between the WAL fsync and checkpoint 3 leaves frame 3's roots unverified.
+  await fs.unlink(join(root, "runs", "r", "snapshots", "3.json"));
+  await fs.writeFile(blob(root, "recent"), "other");
+  await assert.rejects(transaction(root, "r", request("4"), () => result(4)), corrupt);
+  await fs.writeFile(blob(root, "recent"), "recent");
+  assert.deepEqual(await transaction(root, "r", request("4"), () => result(4)), { receipt: 4 });
+});
+
 test("a verified earlier v1 checkpoint remains readable without modifying the retained chain", async t => {
   const root = await fixture(t);
   await transaction(root, "r", request("first"), () => result(1));
