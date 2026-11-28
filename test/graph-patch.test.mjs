@@ -334,3 +334,35 @@ test('only a NodeRevalidated transaction restores prior receipt and advances ver
   assert.deepEqual([events[1].body.graphRev, events[1].body.priorReceiptUri], [4, uri]);
   assert.ok(events[1].body.reason);
 });
+
+test('inject-repair accepts an omitted patch via applyPatch and the public CLI', async t => {
+  const s = graph(node('scan', { status: 'failed_logic', receiptUri: uri, prompt: 'scan carefully' }));
+  const { state, body } = await mutate(s, 'inject-repair', 'scan', undefined);
+  assert.equal(body.nodeId, 'scan::repair::e1');
+  assert.equal(state.nodes['scan::repair::e1'].prompt, 'scan carefully');
+
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const { writeFile } = await import('node:fs/promises');
+  const root = await mkdtemp(join(tmpdir(), 'patch-repair-cli-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const data = join(root, 'graph');
+  await mkdir(data, { mode: 0o700 });
+  const cli = fileURLToPathForTest();
+  const run = args => promisify(execFile)(process.execPath, [cli, ...args, '--root', data, '--workspace', root], { encoding: 'utf8' });
+  await writeFile(join(root, 'source'), 'evidence\n');
+  await writeFile(join(root, 'spec.json'), JSON.stringify({ schemaVersion: 1, nodes: [{ id: 'a', kind: 'read', prompt: 'read source' }] }));
+  await run(['init']);
+  await run(['compile', '--run', 'r1', '--spec', 'spec.json', '--op-id', 'c1']);
+  const claim = JSON.parse((await run(['claim', '--run', 'r1', '--node', 'a', '--expected-rev', '1', '--op-id', 'k1'])).stdout);
+  await run(['start', '--token', claim.result.instructionPath, '--host-handle', 'h1', '--op-id', 's1']);
+  await writeFile(join(root, 'fail.json'), JSON.stringify({ workerReportedStatus: 'failed' }));
+  await run(['settle', '--token', claim.result.instructionPath, '--outcome', 'logic_terminal', '--receipt', 'fail.json', '--op-id', 't1']);
+  const repaired = JSON.parse((await run(['inject-repair', '--run', 'r1', '--node', 'a', '--expected-rev', '1', '--op-id', 'rep1'])).stdout);
+  assert.equal(repaired.ok, true);
+  assert.equal(repaired.result.nodeId, 'a::repair::e1');
+});
+
+function fileURLToPathForTest() {
+  return new URL('../scripts/graph/cli.mjs', import.meta.url).pathname;
+}

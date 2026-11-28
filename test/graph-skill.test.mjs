@@ -69,4 +69,48 @@ describe("hstack-graph skill example", () => {
       }
     }
   });
+
+  it("documents --gate-log for ungated nodes, optional inject-repair --patch, and gateKey in cli.md", async (t) => {
+    const cliDoc = readFileSync(join(SKILL_DIR, "references", "cli.md"), "utf8");
+    const exampleBlock = cliDoc.match(/```sh\ngraph start[\s\S]*?```/)?.[0] ?? "";
+    assert.match(exampleBlock, /--gate-log\b/, "cli.md settle example must illustrate --gate-log for nodes without gateArgv");
+    assert.match(cliDoc, /held_blocked/, "cli.md must warn that omitting --gate-log without gateArgv settles as held_blocked");
+    assert.match(cliDoc, /inject-repair[^\n]*\[--patch FILE\]/, "cli.md must mark inject-repair --patch as optional");
+    assert.match(cliDoc, /gateKey/, "cli.md gate log guidance must mention gateKey");
+
+    // Behavior check: a node without gateArgv blocks without --gate-log and accepts with a measured --gate-log.
+    const repo = mkdtempSync(join(tmpdir(), "hstack-skill-cli-doc-"));
+    t.after(() => rmSync(repo, { recursive: true, force: true }));
+    execFileSync("git", ["init", "-q", repo]);
+    writeFileSync(join(repo, "notes.txt"), "alpha\nbeta\n");
+    writeFileSync(join(repo, "spec.json"), JSON.stringify({
+      schemaVersion: 1,
+      nodes: [
+        { id: "ungated-a", kind: "read", prompt: "read", readScope: ["notes.txt"], estimatedMinutes: 5 },
+        { id: "ungated-b", kind: "read", prompt: "read", readScope: ["notes.txt"], estimatedMinutes: 5 },
+      ],
+    }));
+    const blocks = namedBlocks(readFileSync(EXAMPLE, "utf8"));
+    const receipt = JSON.parse(blocks.get("receipt.json"));
+    writeFileSync(join(repo, "worker.json"), JSON.stringify(receipt));
+    const cli = join(PLUGIN_ROOT, "scripts", "graph", "cli.mjs");
+    const env = cleanEnv("antigravity");
+    const call = (args) => JSON.parse(execFileSync(process.execPath, [cli, ...args], { cwd: repo, env, encoding: "utf8" }));
+    call(["init"]);
+    call(["compile", "--run", "doc-check", "--spec", "spec.json", "--op-id", "c1"]);
+
+    const claimA = call(["claim", "--run", "doc-check", "--node", "ungated-a", "--expected-rev", "1", "--op-id", "ca"]);
+    call(["start", "--token", claimA.result.instructionPath, "--host-handle", "h-a", "--op-id", "sa"]);
+    const blocked = call(["settle", "--token", claimA.result.instructionPath, "--outcome", "accepted", "--receipt", "worker.json", "--op-id", "ta"]);
+    assert.equal(blocked.result.status, "held_blocked");
+
+    const { measureGate } = await import("../scripts/graph/verify-gate.mjs");
+    const gateLog = await measureGate({ argv: ["test", "-s", "notes.txt"], cwd: repo, subjectDigest: receipt.provenance.factDigest });
+    writeFileSync(join(repo, "host-gate.json"), JSON.stringify(gateLog));
+    const claimB = call(["claim", "--run", "doc-check", "--node", "ungated-b", "--expected-rev", "1", "--op-id", "cb"]);
+    call(["start", "--token", claimB.result.instructionPath, "--host-handle", "h-b", "--op-id", "sb"]);
+    const accepted = call(["settle", "--token", claimB.result.instructionPath, "--outcome", "accepted",
+      "--receipt", "worker.json", "--gate-log", "host-gate.json", "--op-id", "tb"]);
+    assert.equal(accepted.result.status, "accepted");
+  });
 });

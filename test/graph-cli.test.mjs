@@ -567,7 +567,7 @@ describe("graph CLI settle runs the trusted policy gate", () => {
 });
 
 describe("graph CLI against the real engine", () => {
-  it("reaches accepted through the public CLI alone, with host gate evidence from --gate-log", async () => {
+  it("reaches accepted through the public CLI alone, with the policy gate", async () => {
     const repo = gitRepo();
     const root = join(createTempDir("hstack-graph-e2e-"), "graph");
     const runId = "e2e";
@@ -682,5 +682,43 @@ describe("graph CLI against the real engine", () => {
       "--patch", "expand.json"]);
     assert.equal(reopen.out.ok, false, "an old revision cannot reopen the closed membership");
     assert.deepEqual(cli(["status"]).out.result.joinMembers.b, members);
+  });
+
+  it("binds external --gate-log metadata to the current run, node, revision, and epoch", async () => {
+    const { repo, cli, json } = compiledRun([gated("a"), nodeSpec("plain"), nodeSpec("other")]);
+    const rPlain = await workerReceipt();
+    const rPlainFile = json("r-plain.json", rPlain);
+    const foreignGate = cli(["gate", "--node", "a", "--receipt", rPlainFile, "--out", "foreign-gate.json"]);
+    assert.equal(foreignGate.status, 0, JSON.stringify(foreignGate.out));
+
+    const tPlain = startedAttempt(cli, "plain", "plain");
+    const wrongNode = cli(["settle", "--token", tPlain, "--outcome", "accepted", "--receipt", rPlainFile,
+      "--gate-log", "foreign-gate.json", "--op-id", "settle-wrong-node"]);
+    assert.equal(wrongNode.status, 0, JSON.stringify(wrongNode.out));
+    assert.equal(wrongNode.out.result.status, "failed_logic");
+    assert.equal(cli(["status"]).out.result.nodes.plain.attempt.failureClass, "ERR_FORGED_EVIDENCE");
+
+    const baseLog = JSON.parse(readFileSync(join(repo, "foreign-gate.json"), "utf8"));
+    for (const [tag, bad] of [
+      ["run", { ...baseLog, runId: "other-run", nodeId: "other", graphRev: 1, epoch: 1 }],
+      ["rev", { ...baseLog, runId: "host", nodeId: "other", graphRev: 2, epoch: 1 }],
+      ["epoch", { ...baseLog, runId: "host", nodeId: "other", graphRev: 1, epoch: 99 }],
+    ]) {
+      const tok = startedAttempt(cli, "other", tag);
+      const res = cli(["settle", "--token", tok, "--outcome", "accepted", "--receipt", rPlainFile,
+        "--gate-log", json(`bad-${tag}.json`, bad), "--op-id", `s-${tag}`]);
+      assert.equal(res.out.result.status, "failed_logic", tag);
+    }
+
+    const { repo: repo2, cli: cli2, json: json2 } = compiledRun([nodeSpec("ok")]);
+    const tOk = startedAttempt(cli2, "ok", "ok");
+    const rOkFile = json2("r-ok.json", rPlain);
+    const { measureGate } = await import("../scripts/graph/verify-gate.mjs");
+    const measured = await measureGate({ argv: PASSING_GATE, cwd: repo2, subjectDigest: rPlain.provenance.factDigest });
+    const bound = { ...measured, runId: "host", nodeId: "ok", graphRev: 1, epoch: 1 };
+    const accepted = cli2(["settle", "--token", tOk, "--outcome", "accepted", "--receipt", rOkFile,
+      "--gate-log", json2("ok-gate.json", bound), "--op-id", "settle-ok"]);
+    assert.equal(accepted.status, 0, JSON.stringify(accepted.out));
+    assert.equal(accepted.out.result.status, "accepted");
   });
 });
