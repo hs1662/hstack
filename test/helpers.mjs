@@ -1,28 +1,22 @@
 // Shared fixtures for the domain test files (node --test runs each file in its own process).
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 import { after, afterEach, beforeEach } from "node:test";
-import { fileURLToPath } from "node:url";
 
 import { PRE_TOOL_DENIAL_NEEDLE } from "../scripts/transcript.mjs";
+import { PLUGIN_ROOT } from "./fixtures.mjs";
 
-const TEST_DIR = dirname(fileURLToPath(import.meta.url));
-export const PLUGIN_ROOT = resolve(TEST_DIR, "..");
+export { PLUGIN_ROOT, createTempDir } from "./fixtures.mjs";
 export const HOOK_SCRIPT = join(PLUGIN_ROOT, "scripts", "post-invocation.mjs");
 export const STOP_HOOK_SCRIPT = join(PLUGIN_ROOT, "scripts", "stop.mjs");
 export const PRE_TOOL_HOOK_SCRIPT = join(PLUGIN_ROOT, "scripts", "pre-tool-use.mjs");
 export const RULES_PATH = join(PLUGIN_ROOT, "rules", "AGENTS.md");
 export const HOOKS_JSON_PATH = join(PLUGIN_ROOT, "hooks.json");
 
-const tempDirs = [];
-
 after(() => {
-  for (const dir of tempDirs) {
-    rmSync(dir, { recursive: true, force: true });
-  }
   try {
     rmdirSync(SHARED_LOCK_DIR);
   } catch {
@@ -30,15 +24,10 @@ after(() => {
   }
 });
 
-export function createTempDir(prefix = "hstack-test-") {
-  const dir = mkdtempSync(join(tmpdir(), prefix));
-  tempDirs.push(dir);
-  return dir;
-}
-
 // node --test runs test files in parallel. Every test of every file importing this module holds the CPU lock
 // shared; wall-clock perf tests and the 16-process lock stress test take it exclusive through withCpuLock, so
-// a timing waits for in-flight tests to finish and no other test starts until it ends.
+// a timing waits for in-flight tests to finish and no other test starts until it ends. Graph tests import the
+// lock-free fixtures.mjs instead: their long real-engine cases would otherwise convoy every timing behind them.
 const CPU_LOCK_DIR = join(tmpdir(), `hstack-test-cpu-${createHash("sha1").update(PLUGIN_ROOT).digest("hex").slice(0, 12)}.lock`);
 const CPU_LOCK_STALE_MS = 120_000;
 const SLEEP_CELL = new Int32Array(new SharedArrayBuffer(4));

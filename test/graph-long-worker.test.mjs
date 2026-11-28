@@ -37,11 +37,11 @@ const PASS = 'import { it } from "node:test"; it("ok", () => {});\n';
 const HANG = 'import { it } from "node:test"; it("hang", () => { for (;;) {} });\n';
 
 describe("long-worker doc sample wrapper", () => {
-  it("--fast picks the same deterministic subset; default mode runs every file", (t) => {
+  it("--sample picks the same deterministic subset; default mode runs every file", (t) => {
     const dir = fixture(t, Object.fromEntries(["a", "b", "c", "d", "e"].map((n) => [`${n}.test.mjs`, PASS])));
-    const env = { FAST_N: "2", CHECK_TIMEOUT: "20" };
-    const first = run(dir, ["--fast"], env);
-    const second = run(dir, ["--fast"], env);
+    const env = { SAMPLE_N: "2", CHECK_TIMEOUT: "20" };
+    const first = run(dir, ["--sample"], env);
+    const second = run(dir, ["--sample"], env);
     const full = run(dir, [], env);
     assert.equal(first.status, 0, first.stderr + first.stdout);
     assert.equal(full.status, 0, full.stderr + full.stdout);
@@ -54,7 +54,7 @@ describe("long-worker doc sample wrapper", () => {
   it("kills a hung suite at the hard timeout and records one ERROR index line", (t) => {
     const dir = fixture(t, { "hang.test.mjs": HANG });
     const started = Date.now();
-    const r = run(dir, ["--fast"], { FAST_N: "5", CHECK_TIMEOUT: "2" });
+    const r = run(dir, ["--sample"], { SAMPLE_N: "5", CHECK_TIMEOUT: "2" });
     assert.ok(Date.now() - started < 20_000, "timeout must bound the run");
     assert.equal(r.status, 124, r.stderr + r.stdout);
     const index = readFileSync(join(dir, "out", "ERROR.index"), "utf8").trim().split("\n");

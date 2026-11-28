@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import "./helpers.mjs";
 
+// The fault tier runs the real-engine case at 64 shards; full keeps it at 8 (SSOT D25).
+const shardCount = Number(process.env.HSTACK_TEST_MASS_SHARDS ?? 8);
+if (!Number.isSafeInteger(shardCount) || shardCount < 2) throw new Error("HSTACK_TEST_MASS_SHARDS must be an integer >= 2");
 const evidenceFile = "sample.txt";
 const gateArgv = [process.execPath, "-e",
   `process.exitCode = require("node:fs").readFileSync(${JSON.stringify(evidenceFile)}, "utf8").length > 0 ? 0 : 1`];
@@ -70,12 +72,13 @@ test("accepted state with invalid receipt bytes cannot complete the reducer", as
   assert.notEqual(next.nodes.join.status, "accepted");
 });
 
-test("complete coverage supplies proof without accepting a running or gate-controlled reducer", async () => {
+test("complete coverage supplies proof without accepting a running or gate-controlled reducer", async (t) => {
   const { reduceRun } = await import("../scripts/graph/mass.mjs");
   const { factDigest, validateReceipt } = await import("../scripts/graph/reducer.mjs");
   const { measureGate } = await import("../scripts/graph/verify-gate.mjs");
   const io = memoryCas();
   const workspace = await mkdtemp(join(tmpdir(), "hstack-mass-gate-"));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
   await writeFile(join(workspace, evidenceFile), "Sourced fixture evidence\n");
   const provenance = {
     evidenceSpans: [{ spanId: "source", path: evidenceFile, startLine: 1, endLine: 1 }],
@@ -182,6 +185,7 @@ test("reduction follows the expanded parent's closed membership through physical
   const { dispatch } = await import("../scripts/graph/state-machine.mjs");
   const { getBlob } = await import("../scripts/graph/gc.mjs");
   const fixture = await mkdtemp(join(tmpdir(), "hstack-mass-patch-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
   const workspace = join(fixture, "workspace");
   const root = join(fixture, "graph");
   await Promise.all([mkdir(workspace), mkdir(root)]);
@@ -221,12 +225,13 @@ test("reduction follows the expanded parent's closed membership through physical
   assert.deepEqual(index.missing, [{ shardId: replacement, validEpoch: 0, obligationId: "required" }]);
 });
 
-test("64 real engine shards leave the final partial until the last sealed receipt, with all evidence indexed", async (t) => {
+test(`${shardCount} real engine shards leave the final partial until the last sealed receipt, with all evidence indexed`, async (t) => {
   const { dispatch } = await import("../scripts/graph/state-machine.mjs");
   const { compileMassSpec } = await import("../scripts/graph/mass.mjs");
   const { factDigest } = await import("../scripts/graph/reducer.mjs");
   const { getBlob } = await import("../scripts/graph/gc.mjs");
   const fixture = await mkdtemp(join(tmpdir(), "hstack-mass-"));
+  t.after(() => rm(fixture, { recursive: true, force: true }));
   const workspace = join(fixture, "workspace");
   const root = join(fixture, "graph");
   await mkdir(workspace);
@@ -234,7 +239,7 @@ test("64 real engine shards leave the final partial until the last sealed receip
   t.diagnostic(`mass engine evidence root: ${root}`);
   const run = "many";
   const shared = { root, workspace, run };
-  const ids = Array.from({ length: 64 }, (_, i) => `shard-${String(i + 1).padStart(2, "0")}`);
+  const ids = Array.from({ length: shardCount }, (_, i) => `shard-${String(i + 1).padStart(2, "0")}`);
   const shards = ids.map((id) => ({ id, obligationId: `required-${id}`, readScope: [evidenceFile], gateArgv }));
   const spec = compileMassSpec({ shards });
   const final = spec.nodes.at(-1);
@@ -327,10 +332,10 @@ test("64 real engine shards leave the final partial until the last sealed receip
   assert.equal(JSON.parse(await getBlob(root, accepted.workerReceiptUri)).verifierEvidence.exit, 0);
   assert.equal(completed.status, "completed");
   const index = JSON.parse(await getBlob(root, result.receiptUri));
-  assert.equal(index.expected.length, 64);
+  assert.equal(index.expected.length, shardCount);
   assert.deepEqual(index.expected.sort((a, b) => a.shardId.localeCompare(b.shardId)),
     ids.map((shardId) => ({ shardId, validEpoch: 1, obligationId: `required-${shardId}` })));
-  assert.equal(index.clusterIndexes.length, 8);
+  assert.equal(index.clusterIndexes.length, Math.ceil(shardCount / 8));
   const indexed = JSON.parse(await getBlob(root, index.indexRoot));
   assert.deepEqual(indexed.dispositions.map(({ claimId }) => claimId).sort(), ids.map((id) => `claim-${id}`));
   assert.equal(indexed.dispositions.find(({ shardId }) => shardId === ids.at(-1)).target.shardId, ids[0]);

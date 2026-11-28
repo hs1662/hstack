@@ -26,7 +26,8 @@
 
 - 모든 로컬 검사에는 강제 시간 제한을 건다. 시간이 지나면 프로세스를 끝내고 실패로 기록한다.
 - 큰 묶음은 결정적 표본으로 먼저 돌릴 수 있다. 같은 파일 목록이면 언제나 같은 파일이 뽑힌다.
-- node:test 자체에는 --fast 옵션이 없다. 여기서 말하는 `--fast` 는 아래 셸 래퍼의 동작 방식일 뿐이다. 래퍼가 파일을 골라서 `node --test` 에 넘긴다.
+- node:test 자체에는 --sample 옵션이 없다. 여기서 말하는 `--sample` 은 아래 셸 래퍼의 동작 방식일 뿐이다. 래퍼가 파일을 골라서 `node --test` 에 넘긴다.
+- `--sample` 은 비용 계층이 아니다. 경로의 sha256 순서로 고른 표본이다. 테스트 실행 계층(fast, full, fault)과는 별개다.
 - 실패하면 한 줄짜리 ERROR 색인을 남기고 전체 로그는 따로 보관한다. 색인 줄에는 종료 코드, 오류 코드, 로그 경로가 들어간다.
 - 오류 코드는 공통 규약대로 `Error.code` 문자열을 쓴다. 시간 초과는 `E_CHECK_TIMEOUT`, 그 밖의 실패는 `E_CHECK_FAILED` 이다.
 
@@ -35,15 +36,15 @@
 ```sh
 # hstack-long-worker-sample
 set -u
-FAST_N="${FAST_N:-8}"
+SAMPLE_N="${SAMPLE_N:-8}"
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-300}"
 TEST_GLOB="${TEST_GLOB:-test/*.test.mjs}"
 OUT_DIR="${OUT_DIR:-${TMPDIR:-/tmp}/long-worker}"
 mkdir -p "$OUT_DIR"
 
-# 인자 없이 부르면 전체를 돌리고, --fast 를 주면 표본만 돌린다.
+# 인자 없이 부르면 전체를 돌리고, --sample 을 주면 표본만 돌린다.
 limit=0
-[ "${1:-}" = "--fast" ] && limit="$FAST_N"
+[ "${1:-}" = "--sample" ] && limit="$SAMPLE_N"
 
 # 경로의 sha256 순서로 정렬해 앞의 limit 개를 고른다. 0 이면 전부 쓴다.
 mapfile -t picked < <(node -e '
@@ -73,13 +74,13 @@ exit "$code"
 사용 예:
 
 ```sh
-FAST_N=4 CHECK_TIMEOUT=120 TEST_GLOB='test/graph-*.test.mjs' bash sample.sh --fast
+SAMPLE_N=4 CHECK_TIMEOUT=120 TEST_GLOB='test/graph-*.test.mjs' bash sample.sh --sample
 CHECK_TIMEOUT=900 bash sample.sh
 ```
 
 이 스크립트를 `node:test` 안에서 띄울 때는 자식 환경에서 `NODE_TEST_CONTEXT`를 지운다. 중첩 실행의 동작은 버전에 따라 다르다. Node 22.23.5에서는 이 값이 남으면 안쪽 검사가 파일을 실행하지 않고 0으로 끝났고, Node 18.20.8에서는 파일을 실행했다.
 
-표본 통과는 전체 통과가 아니다. 완료를 주장하려면 `--fast` 없이 전체를 시간 제한 안에서 다시 돌린다.
+표본 통과는 전체 통과가 아니다. 완료를 주장하려면 `--sample` 없이 전체를 시간 제한 안에서 다시 돌린다.
 
 ## 4. 이탈 감지 (k=2)
 

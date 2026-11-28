@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
-import "./helpers.mjs";
 import { computeWorkspaceKey, listPinnedSnapshots, saveHandoffSnapshot } from "../scripts/governance/handoff-store.mjs";
 
 const moduleUrl = new URL("../scripts/graph/state-machine.mjs", import.meta.url).href;

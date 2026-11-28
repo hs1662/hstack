@@ -6,7 +6,7 @@ import { join, relative } from "node:path";
 import { describe, it } from "node:test";
 
 import { EXIT_CODES, runCli } from "../scripts/graph/cli.mjs";
-import { PLUGIN_ROOT, createTempDir } from "./helpers.mjs";
+import { PLUGIN_ROOT, createTempDir } from "./fixtures.mjs";
 
 const CLI = join(PLUGIN_ROOT, "scripts", "graph", "cli.mjs");
 const CLEAN_ENV = Object.fromEntries(Object.entries(process.env).filter(([key]) =>

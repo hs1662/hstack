@@ -5,7 +5,7 @@ import { test } from "node:test";
 import { canaryStats, contextRotAbort, hostCaps, pinCarryover, recheckSuspect } from "../scripts/graph/host-bridge.mjs";
 import * as store from "../scripts/governance/handoff-store.mjs";
 import { getHostCapabilities } from "../scripts/host/host-adapter.mjs";
-import { createTempDir } from "./helpers.mjs";
+import { createTempDir } from "./fixtures.mjs";
 
 const drift = "The next step is to compare the two files and check whether the missing value can be restored.";
 const korean = "두 파일을 비교한 뒤 누락된 값을 복원할 수 있는지 확인하겠습니다. 확인 결과를 이어서 정리해서 알려 드리겠습니다.";
