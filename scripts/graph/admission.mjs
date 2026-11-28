@@ -153,7 +153,8 @@ function width(ids, ancestry) {
   return ids.length - matching.size;
 }
 
-const covers = (a, b) => a === '.' || a === b || b.startsWith(`${a}/`);
+// Admission and the v2 sealer share this one scope rule (SSOT 4.4).
+export const covers = (a, b) => a === '.' || a === b || b.startsWith(`${a}/`);
 const overlap = (a, b) => a.some(x => b.some(y => covers(x, y) || covers(y, x)));
 
 function scopeCompatibleFraction(nodes, ancestry) {

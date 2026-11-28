@@ -26,6 +26,7 @@ export const FAST = [
   "governance-hardening-p6.test.mjs",
   "governance-hardening-p7.test.mjs",
   "graph-admission.test.mjs",
+  "graph-git.test.mjs",
   "graph-host.test.mjs",
   "graph-mass.test.mjs",
   "graph-metrics.test.mjs",
