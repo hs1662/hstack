@@ -345,12 +345,12 @@ describe("B a passing superset clears a narrower failure only on runners whose t
 });
 
 describe("release version", () => {
-  it("both manifests and the MCP server report 0.3.0", () => {
+  it("both manifests and the MCP server report 0.4.0", () => {
     for (const manifest of ["plugin.json", ".claude-plugin/plugin.json"]) {
-      assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, manifest), "utf8")).version, "0.3.0");
+      assert.equal(JSON.parse(readFileSync(join(PLUGIN_ROOT, manifest), "utf8")).version, "0.4.0");
     }
     const init = createMcpServerHandler({ dataDir: createTempDir("hstack-p2-ver-") })({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
-    assert.equal(init.result.serverInfo.version, "0.3.0");
+    assert.equal(init.result.serverInfo.version, "0.4.0");
   });
 });
 

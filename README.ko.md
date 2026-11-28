@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-`hstack` (v0.3.0)는 외부 npm 의존성이 없는 순수 Node.js 18+ ESM 기반 거버넌스 플러그인으로, Antigravity CLI(`agy`)와 Claude Code를 함께 지원합니다. 하나의 플러그인 안에 한국어 모국어 사고·UI·응답 가드, 표결 우회 차단을 포함한 결정론적 증거 기반 완료 게이트, 위험도 기반 읽기 전용 독립 감사관, 팩트 증류 핸드오프, 명령어 없는 완전 자율 거버넌스(`smart` 모드), 그리고 무데몬 로컬 POSIX 그래프 워크플로(`hstack:graph` v1)를 통합합니다. 호스트별 로드 방식은 [이중 호스트 지원](#이중-호스트-지원)을 보세요.
+`hstack` (v0.4.0)는 외부 npm 의존성이 없는 순수 Node.js 18+ ESM 기반 거버넌스 플러그인으로, Antigravity CLI(`agy`)와 Claude Code를 함께 지원합니다. 하나의 플러그인 안에 한국어 모국어 사고·UI·응답 가드, 표결 우회 차단을 포함한 결정론적 증거 기반 완료 게이트, 위험도 기반 읽기 전용 독립 감사관, 팩트 증류 핸드오프, 명령어 없는 완전 자율 거버넌스(`smart` 모드), 그리고 무데몬 로컬 POSIX 그래프 워크플로(`hstack:graph` v2.0)를 통합합니다. 호스트별 로드 방식은 [이중 호스트 지원](#이중-호스트-지원)을 보세요.
 
 ## 번들 구성요소 (Agy 매니페스트)
 
@@ -27,7 +27,7 @@
 
 ### Layer 2: 결정론적 증거 기반 완료 게이트
 
-- 즉시 로드 MCP 서버(`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.3.0"`)가 `mcp_hstack_gate_verify_completion` (`verify_completion`) 도구를 노출합니다.
+- 즉시 로드 MCP 서버(`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.4.0"`)가 `mcp_hstack_gate_verify_completion` (`verify_completion`) 도구를 노출합니다.
 - `PreToolUse` (`scripts/pre-tool-gate.mjs`)가 `^mcp_hstack_.*$` 호출을 가로채 `decision: "auto_approve"`를 반환하고, 한국어 `toolSummary`와 은닉 `_session` 정보(`conversationId`, `transcriptPath`, `cwd`)를 주입합니다.
 - `scripts/governance/fact-ledger.mjs`와 `scripts/governance/decide-gate.mjs`는 보고된 `modified_files`, `inspected_files`, `verification_runs`, `unverified_scope`, `self_assessment`를 트랜스크립트 열람·수정·실행·사전검토·표결 원장과 Git 작업 트리(`git status --porcelain`, `git diff --numstat`)에 결정론적으로 대조합니다. `PreToolUse` `deny`로 거부된 쓰기 호출이나 `ERROR`·`FAILED`로 실패한 쓰기 호출은 `turnWrittenFiles`, `turnCodeWrittenFiles`, `fileEditCounts`에 편입하지 않습니다.
 - `run_command`뿐 아니라 `mcp_agy-fast_fast_run_checks`(검증 실행)와 `mcp_agy-fast_fast_apply_edits`·`mcp_agy-fast_apply_edits`(파일 수정) 같은 외부 MCP 도구도 원장에서 직접 인식합니다.
@@ -65,14 +65,15 @@
 
 하나의 트리에 매니페스트 두 벌이 있습니다. Agy는 `plugin.json`, `hooks.json`, `mcp_config.json`을 읽습니다. Claude Code는 `.claude-plugin/plugin.json`을 읽고, 이 매니페스트가 `./.claude-plugin/hooks.json`, `./.claude-plugin/mcp.json`, `./.claude-plugin/agents/`의 에이전트 파일을 명시적으로 참조합니다. 경로를 명시하면 Agy가 Claude 기본 위치인 `.mcp.json`과 `hooks/hooks.json`을 경고하지 않습니다. 위 섹션 중 Agy 도구 이름(`invoke_subagent`, `PostInvocation`, `agy -p`)이 나오는 부분은 Agy 전용입니다.
 
-### 무데몬 그래프 워크플로 (`hstack:graph` v1)
+### 무데몬 그래프 워크플로 (`hstack:graph` v2.0)
 
-- **스킬 등록 (`skills/hstack-graph/`):** Agy에서는 `hstack-graph`, Claude Code에서는 `hstack:hstack-graph`로 등록되며 `skills/hstack-graph/references/` 아래에 CLI, 예제, 대량 팬인, 장기 워커, 복구, 실제 호스트 점검 참조 문서를 제공합니다.
+- **스킬 등록 (`skills/hstack-graph/`):** Agy에서는 `hstack-graph`, Claude Code에서는 `hstack:hstack-graph`로 등록되며 `skills/hstack-graph/references/` 아래에 CLI, 예제, 대량 팬인, 장기 워커, 복구, v2 쓰기 통합(`references/v2-write.md`), 실제 호스트 점검 참조 문서를 제공합니다.
 - **무데몬 로컬 POSIX 그래프 엔진 (`scripts/graph/*`):** 상주 데몬 없이 짧은 `node .../scripts/graph/cli.mjs` 호출 단위로 동작합니다.
-	- **입학 제어기 (`compile`):** DAG 무결성·규모 제한을 검증하고 `single_session` 또는 `dag_approved` 읽기 팬아웃 권고를 산출합니다.
-	- **영속 상태와 펜싱:** 단조 `epoch` 펜싱 토큰(`claim`/`start`/`settle`), `fsync` 기반 WAL(`wal-store.mjs`), 무덤 락 회수(`lock.mjs`), IO 불확실 동결, CAS 루트 핀 GC(`gc.mjs`)를 강제합니다.
-	- **무손실 팬인 (`mass`):** 최대 64샤드를 샤드 → 클러스터 리듀서 → 최종 리듀서(`mass.mjs`, `reducer.mjs`)로 축약하며, 필수 샤드·의무·역참조가 하나라도 빠지면 누락 증거를 보존한 채 `partial`로 유지합니다.
-	- **이원 예산, 카나리아 연동 및 계측:** 동적 `W_eff` 토큰 예산과 바이트 모드를 분리 적용하고, 카나리아 `probe` 및 핀 보존 `context_rot_abort` 인계(`host-bridge.mjs`)를 연결하며, `metrics.mjs`는 호스트 관측 사용량이 없으면 토큰·비용을 `null`로 보고합니다.
+	- **입학·영속 WAL (`compile`, `wal-store.mjs`):** DAG 무결성 검사, `single_session`·`dag_approved` 판정, 단조 `epoch` 펜싱(`claim`/`start`/`settle`), 증분 루트 추적을 적용한 `fsync` WAL, 무덤 락 회수(`lock.mjs`), IO 불확실 동결, CAS 루트 핀 GC(`gc.mjs`)를 수행합니다. `schemaVersion: 1` Run은 v1 의미를 유지하며 병렬 쓰기·`integrate` 요청을 `ERR_V2_WRITE_INTEGRATION_NOT_ENABLED`(`69`)로 거절합니다.
+	- **v2 격리 쓰기 시도 (`schemaVersion: 2`, `worktree.mjs`, `write-attempts.mjs`):** 엔진이 잠근 분리 워크트리(`--detach --lock --reason hstack:...`), 워크트리 밖 `TMPDIR` 및 캐시 분리, 호스트 네이티브 워크트리 격리 미사용(`dispatch.isolation: "none"`), 수신함 원자적 영수증 수거 및 멱등적 `release`를 제공합니다.
+	- **비공개 인덱스 봉인기와 단일 Git 래퍼 (`seal.mjs`, `git.mjs`):** 고정 설정 `execFile` Git 래퍼(`repoConfigDigest`)와 비공개 `GIT_INDEX_FILE` 봉인기(`hash-object --no-filters`, `diff-tree --no-renames -z`)가 `writeScope` 채택 필터를 강제하고 심링크·하드링크·중첩 저장소·상한 초과를 fail-closed 차단합니다.
+	- **`merge-tree` 단일 통합자와 착륙 (`merge-tree.mjs`, `integrator.mjs`, `land.mjs`, `gc.mjs`):** 직렬(`B=1`) 후보 전용 워크트리 게이트 검증, 2단계 CAS 게시(`PublishIntended`/`Published`/`PublishRepaired`) 기반 2부모 병합 보존 사슬(`refs/hstack/runs/<runId>/accepted`), 무덤+`abandoned` intent 검증 기반 stale `.lock` 회수, `land` 4모드(`ff-only`/`branch`/`merge`/`patch`, 체크아웃 전 `repoConfigDigest` 선검사 및 무시 파일 교집합 보호 `ERR_LAND_DIRTY`), `gc --scope git`을 수행합니다.
+	- **무손실 팬인 및 계측 (`mass.mjs`, `reducer.mjs`, `host-bridge.mjs`, `metrics.mjs`):** 최대 64샤드 샤드→클러스터→최종 리듀서 축약, 이원 `W_eff`/바이트 예산, 카나리아 인계, 미관측 사용량 `null` 보고, 3계층 테스트 러너(`test/tiers.mjs`: `fast`/`full`/`fault`)를 포함합니다.
 
 ### Claude Code에서 불러오기와 검증
 
@@ -110,16 +111,17 @@ Claude Code에서는 `_session`이 도구 호출에 실리지 않습니다. `Pre
 | --- | :---: | :---: | :---: |
 | `host` | `"antigravity"` | `"claude-code"` | `"unknown"` |
 | `spawn` | `true` | `true` | `false` |
-| `readOnlySubagent` | `true` | `true` | `false` |
-| `isolatedWrite` | `false` | `false` | `false` |
+| `readOnlySubagent` | `"prompt"` | `"enforced"` | `false` |
+| `isolatedWrite` | `true` | `true` | `true` |
+| `nativeWorktree` | `null` | `true` | `null` |
 | `cancel` | `false` | `false` | `false` |
 | `resume` | `false` | `false` | `false` |
 | `usageTelemetry` | `null` | `null` | `null` |
 
 이 값은 패키지의 기능이지 특정 세션에서 받은 권한이 아닙니다.
 
-- `readOnlySubagent`는 읽기 전용 검토 에이전트를 제공한다는 뜻입니다. Claude에서는 검토 도구를 `Read`, `Glob`, `Grep`으로 제한하고 작업자에게는 `Edit`, `Write`, `Bash`도 제공합니다. Agy에서는 역할 지시문과 `PreToolUse` 훅으로 검토 역할의 관리 대상 파일 쓰기와 명령 실행을 차단합니다.
-- 따로 지시받은 작업자는 파일 시스템 샌드박스가 아니므로 `isolatedWrite`는 `false`입니다.
+- `readOnlySubagent`는 강제 수준을 구분합니다. Claude에서는 검토 도구를 `Read`, `Glob`, `Grep`으로 호스트가 제한하므로 `"enforced"`이고, Agy에서는 역할 지시문과 `PreToolUse` 훅으로 제어하므로 `"prompt"`입니다.
+- `isolatedWrite`는 v2 CLI 그래프 엔진이 자체 루트 아래에 잠긴 시도별 워크트리를 제공하므로 `true`입니다. `nativeWorktree`는 정보 표시용이며 v2 쓰기 시도에는 사용하지 않습니다.
 - `cancel`과 `resume`은 모든 호스트에서 `false`, `usageTelemetry`는 `null`입니다. hstack은 이 기능을 내세우지 않으며 세션 ID로 추정하지도 않습니다.
 
 ### 핸드오프 보존 지정과 정리
@@ -318,7 +320,9 @@ node ./scripts/audit-report.mjs --file /path/to/audit.jsonl
 저장소 루트에서 단위·통합 테스트, 양 호스트 엄격 플러그인 검증, 격리된 실전 모델 검증을 실행합니다.
 
 ```sh
-env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs
+env -u PLUGIN_DATA -u PLUGIN_ROOT node test/tiers.mjs fast
+env -u PLUGIN_DATA -u PLUGIN_ROOT node test/tiers.mjs full
+env -u PLUGIN_DATA -u PLUGIN_ROOT node test/tiers.mjs fault
 agy plugin validate --strict --json .
 claude plugin validate --strict --json .
 claude --plugin-dir /path/to/hstack
@@ -327,21 +331,26 @@ node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 
 `test/verify-live.mjs`는 전역 플러그인 간섭을 차단하기 위해 격리된 임시 `HOME`과 앱 데이터 디렉터리에서 실행되며 종료 시 임시 로그를 자동 정리합니다.
 
-### 실측 기준선 및 릴리즈 노트 (v0.3.0)
+### 실측 기준선 및 릴리즈 노트 (v0.4.0)
 
-아래 수치는 `v0.3.0` `main` 기준선에서 실측한 결과입니다(기존 `v0.2.0` 기준선은 153 스위트 / 817 테스트였습니다).
+아래 수치는 `v0.4.0` `main` 기준선에서 실측한 결과입니다(기존 `v0.3.0` 162 스위트 / 1,136 테스트, `v0.2.0` 153 스위트 / 817 테스트, Node `18.20.8` 실기동 검증에서 확장).
 
-- 단위·통합 테스트: `env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs` 실행 시 **162 스위트 / 1,136 테스트 통과(`fail 0`)**. `hstack:graph` v1 엔진·스킬 검증(`test/graph-*.test.mjs`), Node `18.20.8` 실기동·크래시 복구 검증, 듀얼 호스트 어댑터와 Claude Code 트랜스크립트·훅·MCP 세션 참조 계약, 워크스페이스 오너 핀 기반 스냅샷 보호(`pin`/`unpin`/`list_pinned`/`clear`), `k=2`/`k=3` 언어 카나리아, UI·`PowerShell` 추적 및 기존 거버넌스·분석기·하드닝 스위트 전체를 검증합니다.
+- 3계층 단위·통합·장애 테스트(`test/tiers.mjs`):
+	- `fast` (`env -u PLUGIN_DATA -u PLUGIN_ROOT node test/tiers.mjs fast`): **347 pass / 0 fail** (25개 파일, 36개 스위트).
+	- `full` (`env -u PLUGIN_DATA -u PLUGIN_ROOT node test/tiers.mjs full`): **1,280 pass / 0 fail** (62개 파일, 166개 스위트). `hstack:graph` v2.0 워크트리·비공개 봉인기·`merge-tree`·2단계 CAS 게시·`land`·`release`·`gc --scope git`, WAL 증분 루트 검증 및 기존 v1·거버넌스 스위트 전체를 검증합니다.
+	- `fault` (`env -u PLUGIN_DATA -u PLUGIN_ROOT node test/tiers.mjs fault`): **77 pass / 0 fail** (7개 파일). SIGKILL 주입, stale `.lock` 복구, 동시 프로세스 claim, 64샤드 무손실 팬인을 포함합니다.
 - 양 호스트 엄격 플러그인 검증: `agy plugin validate --strict --json .` 종료 코드 `0`, `"findings": []`, `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 3 }`. `claude plugin validate --strict --json .` 종료 코드 `0`, `"success": true`, 오류·경고 각 `0`건.
-- 양 호스트 실세션 라이브 검증(`hstack:graph` v1 L1~L4 및 독립 감사): Agy `1.5.19`(격리 `HOME`/`PLUGIN_DATA`, 실제 `invoke_subagent(research)` 실왕복, 위조·무게이트 차단, 카나리아 핀 인계 후 별도 새 세션 `manage_handoff` 복원 및 폐기 토큰 종료 코드 `49`, `mass` `partial`/`complete` 팬인, 미관측 계측 `null`, v2 종료 코드 `69`)와 Claude Code `2.1.332`(`--plugin-dir`, 실제 `Agent(Explore)` 실왕복, `hstack-inline` 새 세션 `manage_handoff` 복원 및 코드 `49`, `mass` 팬인, v2 코드 `69`)에서 모두 확인하고 양 호스트 `hstack-auditor` 독립 감사(`[감사 판정: 통과]`)를 마쳤습니다.
+- 양 호스트 실세션 라이브 검증(`hstack:graph` v2.0 V1~V5 및 독립 감사): Agy `1.5.19`(격리 `HOME`/`PLUGIN_DATA`, 실제 `invoke_subagent` `Workspace: "inherit"`, `O-H-3` 코드 `65` 경합 및 동일 `opId` 재전송 봉인, `ERR_SCOPE_VIOLATION` 차단, 다이아몬드 2부모 병합 사슬, `gc --scope git`, `O-L-4` 무시 충돌 차단, `ff-only` 착륙)과 Claude Code `2.1.332`(`--plugin-dir`, 실제 `Agent` `isolation` 미지정, 동일 V1~V5 절차 및 기존 훅 통과)에서 실측하고 양 호스트 읽기 전용 `hstack-auditor` 독립 감사(`[감사 판정: 통과]`)를 마쳤습니다.
 - 거버넌스 실전 기준선(v0.2.0): Antigravity CLI(`test/verify-live.mjs`, `gemini-4-neon-xhigh`)에서 `L1`, `L3`, `L5`, `L16` `4/4 pass`(`drifted: 0`, `hookcaller` 패닉 `0`건), Claude Code(`claude --plugin-dir`, v2.1.332)에서 C1~C4를 검증했습니다.
 - 알려진 제약:
 	1. Claude Code 헤드리스 모드(`claude -p`)에서는 대화형 `AskUserQuestion` 선택 UI와 권한 확인 프롬프트를 직접 조작할 수 없습니다. Claude `AskUserQuestion` 응답 정규화(`toolUseResult.answers`, `"User has answered your questions: ..."`)는 단위 테스트(`test/claude-transcript.test.mjs`)로 검증했습니다.
 	2. Claude Code는 `PreToolUse`의 `updatedInput`(일회용 `_hstackContext` 문자열 포함)을 자체 세션 트랜스크립트(`hook_success.stdout`)에 기록합니다. 다만 MCP 서버가 교환 즉시 토큰 파일을 삭제하므로 기록된 토큰 재사용은 항상 실패(`isError: true`)하며 `audit.jsonl`에는 토큰 평문이 남지 않습니다.
 	3. 외부 npm 의존성이 없는 Node.js 18+ 환경에서 OS `flock` 바이너리가 없는 플랫폼(Windows 또는 최소 컨테이너)은 커널 `flock` 대신 inode 검증 `.reclaim` 가드 파일 기반 대체 회수 경로로 폴백합니다.
-	4. **v1 쓰기·통합 절단선:** 병렬 코드 `write` 명세와 `integrate` 명령은 v2 범위이며 v1에서는 `ERR_V2_WRITE_INTEGRATION_NOT_ENABLED`(종료 코드 `69`)로 fail-closed 거절됩니다.
-	5. **동일 UID 워커 경계:** 워커가 사용자와 같은 UID를 공유할 때 `writeScope`와 저장소 폴백 지시서는 OS 샌드박스가 아닙니다. 적대적 워커 격리에는 별도 UID나 컨테이너 경계가 필요합니다.
-	6. **Claude Code Bash 셸 환경 변수:** Claude Code는 `CLAUDE_PLUGIN_ROOT`와 `CLAUDE_PLUGIN_DATA`를 훅·MCP 프로세스에는 주입하지만 Bash 도구 셸에는 자동 주입하지 않으므로, 그래프 CLI 호출 시 `<workspace>/.hstack/graph` 폴백을 피하려면 훅·MCP와 동일한 경로를 명시해야 합니다.
-	7. **Agy 감사관 읽기 전용 경계:** Claude Code의 호스트 강제(`tools: Read, Glob, Grep`)와 달리 Agy `hstack-auditor`는 프롬프트·훅 수준의 읽기 전용이므로 감사 전후 `git status`와 `git diff --stat` 동일성을 함께 확인해야 합니다.
+	4. **v1 쓰기·통합 절단선:** `schemaVersion: 1` 병렬 코드 `write` 명세와 `integrate` 명령은 v2에서도 `ERR_V2_WRITE_INTEGRATION_NOT_ENABLED`(종료 코드 `69`)로 fail-closed 거절됩니다.
+	5. **M3 배치 및 v2 재검증:** v2.0은 `B=1` 직렬 통합만 수행하며, v2.1(`B=1..4` AIMD 배치·접두사 이분 탐색·`ddmin`)과 v2 `revalidate`는 아직 지원하지 않습니다.
+	6. **기존 `160000` gitlink 저장소:** 기본 트리에 이미 `160000` gitlink가 포함된 저장소는 봉인 단계에서 `ERR_SCOPE_VIOLATION`으로 fail-closed 거절됩니다.
+	7. **동일 UID 워커 경계:** 워커가 사용자와 같은 UID를 공유할 때 `writeScope`와 저장소 폴백 지시서는 OS 샌드박스가 아닙니다. 적대적 워커 격리에는 별도 UID나 컨테이너 경계가 필요합니다.
+	8. **Claude Code Bash 셸 환경 변수:** Claude Code는 `CLAUDE_PLUGIN_ROOT`와 `CLAUDE_PLUGIN_DATA`를 훅·MCP 프로세스에는 주입하지만 Bash 도구 셸에는 자동 주입하지 않으므로, 그래프 CLI 호출 시 `<workspace>/.hstack/graph` 폴백을 피하려면 훅·MCP와 동일한 경로를 명시해야 합니다.
+	9. **Agy 감사관 읽기 전용 경계:** Claude Code의 호스트 강제(`tools: Read, Glob, Grep`)와 달리 Agy `hstack-auditor`는 프롬프트·훅 수준의 읽기 전용이므로 감사 전후 `git status`와 `git diff --stat` 동일성을 함께 확인해야 합니다.
 
 릴리스 절차는 [배포 가이드](docs/PUBLISHING.md)에서 확인할 수 있으며 라이선스는 [MIT 라이선스](LICENSE)를 따릅니다.
