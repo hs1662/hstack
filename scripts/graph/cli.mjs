@@ -53,6 +53,7 @@ const COMMAND_SET = new Set(COMMANDS);
 
 // flag -> [option key, value kind]. A Map, so "--__proto__" or "--constructor" can never match an inherited key.
 const FLAGS = new Map([
+  ["scope", ["scope", "string"]],
   ["root", ["root", "path"]], ["workspace", ["workspace", "path"]], ["run", ["run", "string"]],
   ["spec", ["spec", "json"]], ["patch", ["patch", "json"]], ["receipt", ["receipt", "json"]],
   ["node", ["node", "string"]], ["expected-rev", ["expectedRev", "int"]], ["op-id", ["opId", "string"]],
@@ -64,6 +65,7 @@ export const FLAG_NAMES = Object.freeze([...FLAGS.keys()]);
 // Flags restricted to some commands; everything else is common to all commands.
 const ATTEMPT_COMMANDS = ["claim", "start", "settle"];
 const COMMAND_ONLY_FLAGS = new Map([
+  ["scope", ["gc"]],
   ["gate-log", ["settle"]], ["telemetry", ATTEMPT_COMMANDS], ["probe", ATTEMPT_COMMANDS], ["out", ["gate"]],
 ]);
 // Graph patches run inside one GraphPatched transaction keyed by the current physical node and revision.
@@ -360,7 +362,9 @@ async function execute(command, flags, { cwd, env, dispatch }) {
   options.workspace = paths.workspace;
   if (command === "integrate") {
     const [{ readState }, { STATE_SCHEMA_V2 }] = await Promise.all([import("./wal-store.mjs"), import("./schema.mjs")]);
-    const state = await readState(paths.root, options.run);
+    const { withLock } = await import("./lock.mjs");
+    if (!existsSync(paths.root)) unavailableIntegration();
+    const state = await withLock(paths.root, () => readState(paths.root, options.run));
     if (state?.schemaVersion !== STATE_SCHEMA_V2) unavailableIntegration();
   }
   if (Object.hasOwn(options.telemetry?.usage ?? {}, "costUsd")) {
@@ -373,6 +377,12 @@ async function execute(command, flags, { cwd, env, dispatch }) {
     return { root: await initializeRoot(paths.root, paths.workspace), workspace: paths.workspace, source: paths.source };
   }
   if (command === "gc") {
+    if (options.scope === "git") {
+      if (!options.run) fail("ERR_CLI_MISSING_FLAG", "gc --scope git needs --run");
+      const { collectGit } = await import("./integrator.mjs");
+      return collectGit(paths.root, options.run);
+    }
+    if (options.scope !== undefined && options.scope !== "cas") fail("ERR_CLI_FLAG_VALUE", "--scope needs git or cas");
     const { collectGarbage } = await import("./gc.mjs");
     return collectGarbage(paths.root);
   }

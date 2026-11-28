@@ -6,7 +6,7 @@ import { graphError, isRecord, nonempty } from "./schema.mjs";
 import { withLock } from "./lock.mjs";
 import {
   atomicFile, casUri, corrupt, digest, directory, entries, getBlob, optionalFile,
-  pendingIntent, putBlob, refsIn, syncDir, trace, uncertain, validateUris, withIntent,
+  pendingIntent, putBlob, reclaimRefLocks, refsIn, syncDir, trace, uncertain, validateUris, withIntent,
 } from "./gc.mjs";
 
 function paths(root, runId) {
@@ -181,18 +181,20 @@ export async function writeHeartbeats(root, runId, progress) {
   const bytes = canonical(progress);
   assertPublic(progress);
   if (!await directory(root, ["runs", runId], false)) throw graphError("ERR_RUN_NOT_FOUND", "Unknown run");
-  return withLock(root, () => withIntent(root, runId, async () => {
+  return withLock(root, () => withIntent(root, runId, async ({ abandoned }) => {
+    if (abandoned) await reclaimRefLocks((await inspect(paths(root, runId))).state);
     const runtime = await directory(root, ["runs", runId, "runtime"]);
     await atomicFile(join(runtime, "heartbeats.json"), bytes, true);
   }));
 }
 
-export async function recover(root, runId) {
+export async function recover(root, runId, { reclaim = reclaimRefLocks } = {}) {
   const p = paths(root, runId);
   return withLock(root, async () => {
     await pendingIntent(root, runId);
     const log = await inspect(p);
-    return withIntent(root, runId, async () => {
+    return withIntent(root, runId, async ({ abandoned }) => {
+      if (abandoned) await reclaim(log.state);
       await stabilize(p, log);
       if (log.last && log.checkpointSeq !== log.last.seq) await checkpoint(p, log.last, log.state);
       if (log.last || await optionalFile(p.pin)) await pins(p, log);
@@ -201,7 +203,7 @@ export async function recover(root, runId) {
   });
 }
 
-export async function transaction(root, runId, { opId, type, payload, guard, beforeReplay }, callback) {
+export async function transaction(root, runId, { opId, type, payload, guard, beforeReplay, reclaim = reclaimRefLocks }, callback) {
   const p = paths(root, runId);
   nonempty(opId, "opId");
   nonempty(type, "type");
@@ -215,13 +217,15 @@ export async function transaction(root, runId, { opId, type, payload, guard, bef
       throw graphError("ERR_OP_CONFLICT", "Operation ID already committed with different input");
     }
     if (prior && beforeReplay) await beforeReplay(log.state);
-    return withIntent(root, runId, async () => {
+    return withIntent(root, runId, async ({ abandoned }) => {
+    if (abandoned) await reclaim(log.state);
     if (prior || log.offset !== log.bytes.length) await stabilize(p, log);
     if (prior) return prior.body.response;
 
     const staging = new Set();
     let pending = Promise.resolve(), open = true;
     const io = {
+      abandoned, responseOf: id => log.ops.get(id)?.body.response,
       get: (uri) => getBlob(root, uri),
       put(bytes) {
         if (!open) throw graphError("ERR_TRANSACTION_CLOSED", "Transaction already closed");

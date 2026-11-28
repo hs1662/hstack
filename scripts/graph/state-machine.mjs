@@ -8,6 +8,7 @@ import { artifactDigest, canonical, crossRunCacheDisabled, gateKey } from "./fin
 import { git, repoConfigDigest, revParse, treeBytes } from "./git.mjs";
 import { canaryStats, pinCarryover, recheckSuspect } from "./host-bridge.mjs";
 import { recordVerified, revalidateNode } from "./incremental.mjs";
+import { integrate, recoverPublication } from "./integrator.mjs";
 import { captureBaseline, captureCanary, captureClaim, captureFinish, captureReady, captureStart } from "./metrics.mjs";
 import { compileMassSpec, reduceRun } from "./mass.mjs";
 import { applyPatch } from "./patch.mjs";
@@ -308,16 +309,16 @@ export async function dispatch(command, options = {}) {
   if (typeof o.opId === "string" && RESERVED_OP_PREFIXES.some(prefix => o.opId.startsWith(prefix))) {
     throw bad("Reserved operation ID");
   }
-  if (command === "integrate") throw graphError(V2_WRITE_ERROR, "Write integration is reserved for v2");
+  if (command === "integrate" && !o.run) throw graphError(V2_WRITE_ERROR, "Write integration requires a v2 run");
   const authorized = command === "start" || command === "settle" || command === "release";
   if (authorized) o.run = locate(o.root, o.token, o.run);
   const run = nonempty(o.run, "run");
-  if (command === "resume") return runState(await recover(o.root, run));
+  if (command === "resume") return recoverPublication({ root: o.root, run, refresh }, runState(await recover(o.root, run)));
   if (command === "status" || command === "ready") {
     const s = runState(await readState(o.root, run));
     return command === "status" ? s : ready(s, o);
   }
-  const type = types.get(command);
+  const type = command === "integrate" ? "Integrated" : types.get(command);
   if (!type) throw bad("Unknown graph command");
   if (command === "compile") o.opId ??= "compile";
   if (command === "start") o.opId ??= `start-${artifactDigest(o.token)}`;
@@ -333,6 +334,7 @@ export async function dispatch(command, options = {}) {
       throw graphError("ERR_OP_CONFLICT", "Request differs from the reserved verification");
   };
   const effects = { root, run, opId, payload, requestDigest, refresh, guard };
+  if (command === "integrate") return integrate(effects);
   let compiledV2, evidence, releaseRecorded = false;
   const commit = () => transaction(root, run, { opId, payload, type, guard }, async (state, store) => {
     const io = { ...store, evidence, budgetContext: o.telemetry?.budgetContext ?? o.hostBudget,

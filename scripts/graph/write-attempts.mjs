@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import { issue } from "./attempts.mjs";
 import { canonical } from "./fingerprint.mjs";
-import { directory } from "./gc.mjs";
-import { git, gitOk, isAncestor, repoConfigDigest, revParse, zeroOid } from "./git.mjs";
+import { directory, reclaimRefLocks, updateRef } from "./gc.mjs";
+import { git, isAncestor, repoConfigDigest, revParse, zeroOid } from "./git.mjs";
 import { withLock } from "./lock.mjs";
 import { validateEvidence } from "./reducer.mjs";
 import { graphError, validateRunRecords } from "./schema.mjs";
@@ -63,7 +63,7 @@ async function exclusive(ctx, id, fn) {
 
 function reserved(ctx, type, callback) {
   const prefix = type === "AttemptSealed" ? "@hstack-seal/" : "@hstack-worktree/";
-  return transaction(ctx.root, ctx.run, { type, opId: prefix + ctx.opId, payload: ctx.payload }, async s => {
+  return transaction(ctx.root, ctx.run, { type, opId: prefix + ctx.opId, payload: ctx.payload, reclaim: reclaimRefLocks }, async s => {
     const response = await callback(s);
     ctx.refresh(s);
     return { state: validateRunRecords(s), response };
@@ -125,7 +125,7 @@ export class SealWork extends Error {
         if (!failure) {
           try {
             const old = await revParse(s.workspace, ref);
-            if (old === null) await gitOk(["update-ref", ref, sealed.commit, zeroOid(sealed.commit.length === 64 ? "sha256" : "sha1")], { cwd: s.workspace });
+            if (old === null) await updateRef(s.workspace, [ref, sealed.commit, zeroOid(sealed.commit.length === 64 ? "sha256" : "sha1")]);
             else if (old !== sealed.commit) failure = { code: diverged };
           } catch (err) {
             if (err.code !== "ERR_GIT_FAILED") throw err;

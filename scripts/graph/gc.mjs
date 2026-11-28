@@ -2,6 +2,8 @@ import * as fs from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { graphError } from "./schema.mjs";
+import { commonDir, gitOk } from "./git.mjs";
+import { acceptedRef, candRef, nodeKey, pinRef } from "./worktree.mjs";
 import { withLock } from "./lock.mjs";
 import { markJournal } from "./wal-store.mjs";
 
@@ -96,7 +98,7 @@ export async function withIntent(root, runId, fn) {
   try {
     await syncDir(root);
     for (const prior of abandoned) await fs.rmdir(prior);
-    const result = await fn();
+    const result = await fn({ abandoned: abandoned.length > 0 });
     // No further commit IO after disarming. A reappearing intent after power
     // loss conservatively holds rather than trusting an ambiguous device.
     await fs.rmdir(path);
@@ -113,6 +115,38 @@ export async function withIntent(root, runId, fn) {
     }
     await fs.rmdir(path);
     throw err;
+  }
+}
+
+export const nextCandidateId = s => `g${s.integrationGeneration}.${1 + Object.values(s.candidates)
+  .filter(c => c.generation === s.integrationGeneration).length}`;
+
+// Only names derived from the verified run identity are eligible, never arbitrary paths in a record.
+export async function reclaimRefLocks(s) {
+  if (s?.schemaVersion !== 2) return;
+  if (typeof s.runId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(s.runId)) throw corrupt("Invalid ref namespace");
+  const dir = await commonDir(s.workspace), refs = [candRef(s.runId, nextCandidateId(s))];
+  if (s.pendingPublish?.ref === acceptedRef(s.runId)) refs.push(s.pendingPublish.ref);
+  for (const n of Object.values(s.nodes)) {
+    if (n.kind === "write" && n.status === "running") refs.push(pinRef(s.runId, nodeKey(n.id), n.attempt.epoch));
+  }
+  for (const c of Object.values(s.candidates)) {
+    if (["built", "gating"].includes(c.state) && /^g\d+(?:\.\d+)+$/.test(c.candidateId)) refs.push(candRef(s.runId, c.candidateId));
+  }
+  for (const ref of refs) {
+    const parent = await directory(dir, dirname(ref).split("/"), false);
+    if (!parent) continue;
+    try { await fs.unlink(join(dir, `${ref}.lock`)); }
+    catch (error) { if (error.code === "ENOENT") continue; throw error; }
+    await syncDir(parent);
+  }
+}
+
+export async function updateRef(workspace, args) {
+  try { await gitOk(["update-ref", "--no-deref", ...args], { cwd: workspace }); }
+  catch (error) {
+    if (error.code === "ERR_GIT_FAILED" && /\.lock['":].*File exists/.test(error.stderr)) throw graphError("ERR_LOCK_BUSY", "Git ref lock is busy");
+    throw error;
   }
 }
 

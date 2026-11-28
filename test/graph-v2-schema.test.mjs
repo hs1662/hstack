@@ -180,7 +180,7 @@ test("v2 compile records Git context, policy, and include paths and rejects inva
     { spec: { ...defaults, policy: { seal: { allowSymlinks: 1 } } } },
   ]) await assert.rejects(dispatch("compile", { ...options, run: "invalid", spec: defaults, ...request }), invalid);
   assert.ok((await dispatch("claim", { ...options, node: "a", opId: "write", expectedRev: 1 })).worktreePath);
-  await assert.rejects(dispatch("integrate", options), unavailable);
+  assert.deepEqual(await dispatch("integrate", { ...options, opId: "idle" }), { status: "idle" });
   await dispatch("claim", { ...options, node: "read", opId: "reader", expectedRev: 1 });
   assert.equal((await dispatch("status", options)).nodes.read.status, "claimed");
 });
