@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // allow: SIZE_OK - CLI command and input parsing share one JSON protocol boundary.
-// Graph v1 command line: parses flags, resolves root/workspace, and prints exactly one JSON line per call.
+// Graph command line: parses flags, resolves root/workspace, and prints exactly one JSON line per call.
 // The engine (state-machine.mjs dispatch) owns every state decision; this file only validates the boundary.
 //
 // Positive read-node flow, public CLI only (no CAS writes by hand):
@@ -12,6 +12,12 @@
 //   cli.mjs settle  --token T --outcome accepted --receipt worker.json --op-id s1  # engine runs the policy gate
 //   cli.mjs status  --run RUN
 //   cli.mjs metrics --run RUN                                          # read-only, metrics.mjs over the journal
+//
+// v2 write integration:
+//   cli.mjs integrate --run RUN --op-id i1                             # publish the next sealed write
+//   cli.mjs release --token T --op-id r1                               # release an eligible worktree
+//   cli.mjs land --run RUN --op-id l1 [--mode ff-only|branch|merge|patch] [--branch NAME] [--out FILE] [--allow partial,dirty-nonoverlap]
+//   cli.mjs gc --scope git --run RUN                                   # collect obsolete Git refs
 // Patches (amend | expand | inject-repair) need --run --node --expected-rev --op-id, plus --patch for amend/expand.
 // A gate-only amend of an accepted node makes the next claim a revalidation of the pinned artifact; claim, start
 // and settle it like any attempt; the engine measures the gate again against that artifact's factDigest.
@@ -47,13 +53,14 @@ export const EXIT_CODES = Object.freeze({ ok: 0, engine: 1, stale: 49, usage: 64
 
 export const COMMANDS = Object.freeze([
   "init", "compile", "ready", "claim", "start", "settle", "status", "resume", "retry", "amend", "expand",
-  "inject-repair", "reduce", "revalidate", "gc", "host-caps", "metrics", "gate", "integrate", "release",
+  "inject-repair", "reduce", "revalidate", "gc", "host-caps", "metrics", "gate", "integrate", "release", "land",
 ]);
 const COMMAND_SET = new Set(COMMANDS);
 
 // flag -> [option key, value kind]. A Map, so "--__proto__" or "--constructor" can never match an inherited key.
 const FLAGS = new Map([
-  ["scope", ["scope", "string"]],
+  ["scope", ["scope", "string"]], ["mode", ["mode", "string"]],
+  ["branch", ["branch", "string"]], ["allow", ["allow", "list"]],
   ["root", ["root", "path"]], ["workspace", ["workspace", "path"]], ["run", ["run", "string"]],
   ["spec", ["spec", "json"]], ["patch", ["patch", "json"]], ["receipt", ["receipt", "json"]],
   ["node", ["node", "string"]], ["expected-rev", ["expectedRev", "int"]], ["op-id", ["opId", "string"]],
@@ -66,11 +73,18 @@ export const FLAG_NAMES = Object.freeze([...FLAGS.keys()]);
 const ATTEMPT_COMMANDS = ["claim", "start", "settle"];
 const COMMAND_ONLY_FLAGS = new Map([
   ["scope", ["gc"]],
-  ["gate-log", ["settle"]], ["telemetry", ATTEMPT_COMMANDS], ["probe", ATTEMPT_COMMANDS], ["out", ["gate"]],
+  ["mode", ["land"]], ["branch", ["land"]], ["allow", ["land"]],
+  ["gate-log", ["settle"]], ["telemetry", ATTEMPT_COMMANDS], ["probe", ATTEMPT_COMMANDS], ["out", ["gate", "land"]],
+]);
+const FLAG_VALUES = new Map([
+  ["mode", ["ff-only", "branch", "merge", "patch"]],
+  ["allow", ["partial", "dirty-nonoverlap"]],
+  ["scope", ["git", "cas"]],
 ]);
 // Graph patches run inside one GraphPatched transaction keyed by the current physical node and revision.
 const REQUIRED_FLAGS = new Map([
   ["release", ["token", "op-id"]],
+  ["land", ["run", "op-id"]],
   ["amend", ["node", "expected-rev", "op-id", "patch"]],
   ["expand", ["node", "expected-rev", "op-id", "patch"]],
   ["inject-repair", ["node", "expected-rev", "op-id"]],
@@ -209,8 +223,14 @@ export async function buildOptions(flags, cwd) {
     } else if (kind === "json") {
       options[key] = await readJsonFile(raw, cwd, flag);
       HOST_DATA.get(flag)?.(options[key]);
+    } else {
+      const values = kind === "list" ? raw.split(",") : [raw];
+      const allowed = FLAG_VALUES.get(flag);
+      if (allowed && values.some(value => !allowed.includes(value))) {
+        fail("ERR_CLI_FLAG_VALUE", `--${flag} accepts ${allowed.join(", ")}`);
+      }
+      options[key] = kind === "list" ? values : raw;
     }
-    else options[key] = raw;
   }
   return options;
 }
@@ -315,14 +335,13 @@ async function measurePolicyGate(state, node, receipt, env) {
     checkedSpans: Array.isArray(provenance.evidenceSpans) ? provenance.evidenceSpans : [] };
 }
 
-async function runGateCommand(options, root, env, cwd) {
+async function runGateCommand(options, root, env) {
   const state = await readRun(root, options.run);
   const node = ownNode(state, options.node);
   if (!node) fail("ERR_GRAPH_SCHEMA", "Unknown graph node");
   const log = await measurePolicyGate(state, node, options.receipt, env);
-  const out = resolve(cwd, options.out);
   try {
-    writeFileSync(out, `${JSON.stringify(log)}\n`, { flag: "wx", mode: 0o600 });
+    writeFileSync(options.out, `${JSON.stringify(log)}\n`, { flag: "wx", mode: 0o600 });
   } catch (error) {
     fail("ERR_CLI_PATH", `Cannot create --out ${options.out}: ${error.code ?? error.message}`);
   }
@@ -360,6 +379,7 @@ async function execute(command, flags, { cwd, env, dispatch }) {
   const paths = await resolveGraphPaths(options, { cwd, env });
   options.root = paths.root;
   options.workspace = paths.workspace;
+  if (options.out !== undefined) options.out = resolve(cwd, options.out);
   if (command === "integrate") {
     const [{ readState }, { STATE_SCHEMA_V2 }] = await Promise.all([import("./wal-store.mjs"), import("./schema.mjs")]);
     const { withLock } = await import("./lock.mjs");
@@ -382,7 +402,6 @@ async function execute(command, flags, { cwd, env, dispatch }) {
       const { collectGit } = await import("./integrator.mjs");
       return collectGit(paths.root, options.run);
     }
-    if (options.scope !== undefined && options.scope !== "cas") fail("ERR_CLI_FLAG_VALUE", "--scope needs git or cas");
     const { collectGarbage } = await import("./gc.mjs");
     return collectGarbage(paths.root);
   }
@@ -394,7 +413,7 @@ async function execute(command, flags, { cwd, env, dispatch }) {
     const baseline = typeof baselineRunId === "string" ? await readState(paths.root, baselineRunId) : null;
     return metrics(state, baseline ?? undefined);
   }
-  if (command === "gate") return runGateCommand(options, paths.root, env, cwd);
+  if (command === "gate") return runGateCommand(options, paths.root, env);
   return (dispatch ?? (await loadDispatch()))(command, options);
 }
 

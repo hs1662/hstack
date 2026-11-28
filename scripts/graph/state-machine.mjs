@@ -9,6 +9,7 @@ import { git, repoConfigDigest, revParse, treeBytes } from "./git.mjs";
 import { canaryStats, pinCarryover, recheckSuspect } from "./host-bridge.mjs";
 import { recordVerified, revalidateNode } from "./incremental.mjs";
 import { integrate, recoverPublication } from "./integrator.mjs";
+import { land } from "./land.mjs";
 import { captureBaseline, captureCanary, captureClaim, captureFinish, captureReady, captureStart } from "./metrics.mjs";
 import { compileMassSpec, reduceRun } from "./mass.mjs";
 import { applyPatch } from "./patch.mjs";
@@ -33,6 +34,9 @@ export const RESERVED_OP_PREFIXES = Object.freeze([
   reservePrefix, measuredPrefix, "@hstack-worktree/", "@hstack-seal/", "@hstack-publish/", "@hstack-published/",
 ]);
 class CompileWork extends Error {}
+class LandWork extends Error {
+  constructor(state) { super("Landing needed"); this.state = state; }
+}
 class GateWork extends Error {
   constructor(policy) { super("Host verification needed"); this.policy = policy; }
 }
@@ -47,8 +51,48 @@ const runState = state => {
 };
 const types = new Map(Object.entries({
   compile: "GraphCompiled", claim: "AttemptClaimed", start: "AttemptStarted", settle: "AttemptSettled", release: "Released",
+  land: "Landed",
   retry: "RetryOpened", reduce: "RunReduced", revalidate: "NodeRevalidated", amend: "GraphPatched", expand: "GraphPatched", "inject-repair": "GraphPatched",
 }));
+
+function landingGate(state) {
+  const nodes = Object.values(state.nodes).filter(n => n.status === "accepted" && n.kind === "write")
+    .sort((a, b) => a.topoRank - b.topoRank || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const gates = new Map();
+  for (const node of nodes) {
+    const { gateArgv: argv, timeoutMs } = gatePolicy(node);
+    gates.set(canonical([argv, timeoutMs]), { argv, timeoutMs });
+  }
+  if (!gates.size) return undefined;
+  return async cwd => {
+    const subjectDigest = artifactDigest(await revParse(cwd, "HEAD^{tree}", { scope: "user" }));
+    for (const policy of gates.values()) {
+      const result = await measureGate({ ...policy, cwd, subjectDigest });
+      if (result.exitCode !== 0 || result.signal || result.timedOut) return false;
+    }
+    return true;
+  };
+}
+
+async function landRun({ root, run, ...request }, { mode, branch, out, allow }) {
+  let response;
+  const commit = () => transaction(root, run, request, state => {
+    const s = runState(state);
+    if (s.schemaVersion !== STATE_SCHEMA_V2) throw graphError(V2_WRITE_ERROR, "Landing requires a v2 run");
+    // Let transaction resolve committed replays before planning any checkout work.
+    if (!response) throw new LandWork(s);
+    return { state: s, body: response, response };
+  });
+  try {
+    return await commit();
+  } catch (work) {
+    if (!(work instanceof LandWork)) throw work;
+    const { state } = work;
+    response = await land({ root, workspace: state.workspace, state, mode, branch, out, allow,
+      gate: mode === "merge" ? landingGate(state) : undefined });
+    return commit();
+  }
+}
 
 async function v2CompileState(workspace, { run, spec }) {
   const opts = { cwd: workspace };
@@ -335,6 +379,7 @@ export async function dispatch(command, options = {}) {
   };
   const effects = { root, run, opId, payload, requestDigest, refresh, guard };
   if (command === "integrate") return integrate(effects);
+  if (command === "land") return landRun({ root, run, opId, payload, type, guard }, o);
   let compiledV2, evidence, releaseRecorded = false;
   const commit = () => transaction(root, run, { opId, payload, type, guard }, async (state, store) => {
     const io = { ...store, evidence, budgetContext: o.telemetry?.budgetContext ?? o.hostBudget,
