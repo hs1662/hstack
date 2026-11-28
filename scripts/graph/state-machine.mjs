@@ -1,22 +1,25 @@
 // allow: SIZE_OK — command transitions share a single locked protocol and storage boundary.
 import { randomInt } from "node:crypto";
-import { realpath } from "node:fs/promises";
-import { isAbsolute } from "node:path";
-import { compileGraph } from "./admission.mjs";
+import { readFile, realpath } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { compileGraph, pathSet } from "./admission.mjs";
 import { authenticate, currentLocalKey, failureRecord, gatePolicy, inputs, issue, locate, projectionEligible, validatedArtifact } from "./attempts.mjs";
 import { artifactDigest, canonical, crossRunCacheDisabled, gateKey } from "./fingerprint.mjs";
+import { git, repoConfigDigest, revParse, treeBytes } from "./git.mjs";
 import { canaryStats, pinCarryover, recheckSuspect } from "./host-bridge.mjs";
 import { recordVerified, revalidateNode } from "./incremental.mjs";
 import { captureBaseline, captureCanary, captureClaim, captureFinish, captureReady, captureStart } from "./metrics.mjs";
 import { compileMassSpec, reduceRun } from "./mass.mjs";
 import { applyPatch } from "./patch.mjs";
 import { validateReceipt } from "./reducer.mjs";
-import { graphError, isRecord, nonempty, Receipt, safeInteger, validateRunRecords, V2_WRITE_ERROR } from "./schema.mjs";
+import { graphError, isRecord, isRunSchemaVersion, nonempty, normalizeV2Policy, Receipt, safeInteger,
+  STATE_SCHEMA_V2, validateRunRecords, V2_WRITE_ERROR } from "./schema.mjs";
 import { readState, recover, transaction } from "./wal-store.mjs";
 import { measureGate } from "./verify-gate.mjs";
+import { acceptedRef, defaultMaxOpenWorktrees } from "./worktree.mjs";
 
 const own = (map, id) => Object.hasOwn(map, id) ? map[id] : undefined;
-const held = new Set(["held_blocked", "held_infra", "held_upstream", "failed_logic", "held_flaky"]);
+const held = new Set(["held_blocked", "held_infra", "held_upstream", "failed_logic", "held_flaky", "held_conflict", "held_integration"]);
 const active = n => n.status === "claimed" || n.status === "running";
 const pending = (n, now) => n.status === "pending" || n.status === "fresh_reset_ready" ||
   (n.status === "retry_wait" && now >= Date.parse(n.notBefore));
@@ -24,6 +27,10 @@ const bad = msg => graphError("ERR_GRAPH_SCHEMA", msg);
 const notReady = msg => graphError("ERR_NOT_READY", msg);
 const reservePrefix = "@hstack-verifier/";
 const measuredPrefix = "@hstack-gate-proof/";
+export const RESERVED_OP_PREFIXES = Object.freeze([
+  reservePrefix, measuredPrefix, "@hstack-worktree/", "@hstack-seal/", "@hstack-publish/", "@hstack-published/",
+]);
+class CompileWork extends Error {}
 class GateWork extends Error {
   constructor(policy) { super("Host verification needed"); this.policy = policy; }
 }
@@ -33,7 +40,7 @@ const getNode = (state, id) => {
 };
 const runState = state => {
   if (!state) throw graphError("ERR_RUN_NOT_FOUND", "No such graph run");
-  if (state.schemaVersion !== 1) throw bad("Unknown run schema version");
+  if (!isRunSchemaVersion(state.schemaVersion)) throw bad("Unknown run schema version");
   return state;
 };
 const types = new Map(Object.entries({
@@ -41,12 +48,42 @@ const types = new Map(Object.entries({
   retry: "RetryOpened", reduce: "RunReduced", revalidate: "NodeRevalidated", amend: "GraphPatched", expand: "GraphPatched", "inject-repair": "GraphPatched",
 }));
 
+async function v2CompileState(workspace, { run, spec }) {
+  const opts = { cwd: workspace };
+  const top = await git(["rev-parse", "--show-toplevel"], opts);
+  if (top.code !== 0 || top.stdout.toString("utf8").replace(/\n$/, "") !== workspace) {
+    throw bad("v2 workspace must equal the Git toplevel");
+  }
+  const integrationRef = acceptedRef(run);
+  if ((await git(["check-ref-format", integrationRef], opts)).code !== 0) throw bad("Invalid v2 run ref");
+  const { baseSha } = spec;
+  if (baseSha !== undefined && (typeof baseSha !== "string" || !/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/.test(baseSha))) {
+    throw bad("baseSha must be a commit OID");
+  }
+  const startBase = await revParse(workspace, `${baseSha ?? "HEAD"}^{commit}`);
+  if (!startBase || (baseSha !== undefined && baseSha !== startBase)) throw bad("baseSha must identify a commit");
+  const policy = normalizeV2Policy(spec.policy, defaultMaxOpenWorktrees());
+  const [include, configDigest, checkoutBytes] = await Promise.all([
+    readFile(join(workspace, ".worktreeinclude"), "utf8").catch(error => {
+      if (error.code !== "ENOENT") throw error;
+      return "";
+    }),
+    repoConfigDigest(workspace),
+    treeBytes(workspace, startBase),
+  ]);
+  const worktreeInclude = pathSet(include.split(/\r?\n/).filter(line => line.trim() && !line.trimStart().startsWith("#")), ".worktreeinclude");
+  return { startBase, acceptedTip: null, integrationGeneration: 0, integrationRef, repoConfigDigest: configDigest,
+    worktrees: {}, candidates: {}, worktreeInclude, checkoutBytes, pendingPublish: null, lastPublished: null,
+    publishRepairs: 0, policy };
+}
+
 async function compile(opts) {
   const { run: runId, spec } = opts;
-  if (!isRecord(spec) || (spec.schemaVersion !== undefined && spec.schemaVersion !== 1) ||
-      !isAbsolute(opts.workspace ?? "")) throw bad("compile needs a v1 spec and absolute workspace");
+  if (!isRecord(spec) || (spec.schemaVersion !== undefined && !isRunSchemaVersion(spec.schemaVersion)) ||
+      !isAbsolute(opts.workspace ?? "")) throw bad("compile needs a supported spec and absolute workspace");
   const workspace = await realpath(opts.workspace);
-  const source = spec.preset === "mass" ? compileMassSpec(spec) : spec;
+  const v2 = spec.schemaVersion === STATE_SCHEMA_V2 ? await v2CompileState(workspace, opts) : {};
+  const source = spec.preset === "mass" ? { ...compileMassSpec(spec), schemaVersion: spec.schemaVersion ?? 1 } : spec;
   const { maxPins = 1024, maxAttempts = Number.MAX_SAFE_INTEGER, maxInfraRetries = 3 } = source.limits ?? {};
   for (const [key, value] of Object.entries({ maxPins, maxAttempts, maxInfraRetries })) safeInteger(value, key);
   if (maxInfraRetries > 3) throw bad("maxInfraRetries cannot exceed 3");
@@ -68,11 +105,11 @@ async function compile(opts) {
     if (!n.dependsOn.length) throw bad("A reducer needs a nonempty sealed membership");
     return [n.id, n.dependsOn.map(shardId => ({ shardId, obligationId: nodes[shardId].obligationId ?? shardId }))];
   }));
-  const state = { schemaVersion: 1, runId, workspace, graphRev: 1, status: "open", nodes,
+  const state = { schemaVersion: admitted.schemaVersion, runId, workspace, graphRev: 1, status: "open", nodes,
     logicalOutputMap: Object.fromEntries(Object.keys(nodes).map(id => [id, id])), joinMembers,
     limits: { ...admitted.limits, maxPins, maxAttempts, maxInfraRetries }, metrics: admitted.metrics,
     recommendation: admitted.recommendation, attemptsIssued: 0, hostProfile: spec.hostProfile ?? null,
-    baseSha: spec.baseSha ?? null, environment: spec.environment ?? {}, policy: spec.policy ?? null };
+    baseSha: spec.baseSha ?? null, environment: spec.environment ?? {}, policy: spec.policy ?? null, ...v2 };
   const now = Date.now();
   if (spec.baselineComparison) captureBaseline(state, spec.baselineComparison);
   captureReadiness(state, now);
@@ -83,7 +120,12 @@ function capacity(s, n) {
   if (s.attemptsIssued >= s.limits.maxAttempts) return "attempt budget exhausted";
   const peers = Object.values(s.nodes).filter(active);
   const readSlots = s.recommendation === "dag_approved" ? s.limits.readConcurrency : 1;
-  if (n.kind === "write" ? peers.length : peers.some(n => n.kind === "write") || peers.length >= readSlots) {
+  if (s.schemaVersion === STATE_SCHEMA_V2) {
+    if (n.kind === "write") {
+      const open = Object.values(s.worktrees).filter(worktree => worktree.phase !== "released").length;
+      if (open >= s.policy.integration.maxOpenWorktrees) return "worktree slots";
+    } else if (peers.filter(peer => peer.kind !== "write").length >= readSlots) return "no read slot";
+  } else if (n.kind === "write" ? peers.length : peers.some(n => n.kind === "write") || peers.length >= readSlots) {
     return "no exclusive write/read slot";
   }
   const pins = peers.reduce((sum, peer) => sum + peer.attempt.pinSlots, 0);
@@ -109,7 +151,8 @@ function refresh(s) {
   }
   const blockers = live.some(n => n.required !== false && held.has(n.status));
   const unfinished = live.some(n => n.status !== "accepted" && !held.has(n.status));
-  const progress = live.some(n => active(n) || (["pending", "retry_wait", "fresh_reset_ready"].includes(n.status) &&
+  const progress = live.some(n => active(n) || ["sealed", "integrating"].includes(n.status) ||
+    (["pending", "retry_wait", "fresh_reset_ready"].includes(n.status) &&
     parentsAccepted(s, n) && !capacity(s, n)));
   s.status = !blockers && !unfinished ? (live.some(n => held.has(n.status)) ? "degraded" : "completed") : progress ? "open" : "held";
 }
@@ -254,6 +297,9 @@ async function settle(s, n, o, io, now) {
 export async function dispatch(command, options = {}) {
   if (!isAbsolute(options.root ?? "")) throw bad("root must be an absolute directory");
   const o = { ...options, root: await realpath(options.root) };
+  if (typeof o.opId === "string" && RESERVED_OP_PREFIXES.some(prefix => o.opId.startsWith(prefix))) {
+    throw bad("Reserved operation ID");
+  }
   if (command === "integrate") throw graphError(V2_WRITE_ERROR, "Write integration is reserved for v2");
   const authorized = command === "start" || command === "settle";
   if (authorized) o.run = locate(o.root, o.token, o.run);
@@ -268,7 +314,6 @@ export async function dispatch(command, options = {}) {
   if (command === "compile") o.opId ??= "compile";
   if (command === "start") o.opId ??= `start-${artifactDigest(o.token)}`;
   nonempty(o.opId, "opId");
-  if (o.opId.startsWith(reservePrefix) || o.opId.startsWith(measuredPrefix)) throw bad("Reserved operation ID");
   const { root, opId, ...args } = o;
   const payload = { command, ...Object.fromEntries(Object.entries(args).filter(([, v]) => v !== undefined)) };
   const requestDigest = artifactDigest(payload);
@@ -279,11 +324,16 @@ export async function dispatch(command, options = {}) {
     if (owner && owner.attempt.verifierRequestDigest !== requestDigest)
       throw graphError("ERR_OP_CONFLICT", "Request differs from the reserved verification");
   };
+  let compiledV2;
   const commit = () => transaction(root, run, { opId, payload, type, guard }, async (state, store) => {
     const io = { ...store, budgetContext: o.telemetry?.budgetContext ?? o.hostBudget,
       maxInlineBytesPerNode: state?.limits?.maxInlineBytesPerNode, maxInlineBytesPerWave: state?.limits?.maxInlineBytesPerWave };
     if (command === "compile") {
       if (state) throw graphError("ERR_RUN_EXISTS", "Run already compiled");
+      if (o.spec?.schemaVersion === STATE_SCHEMA_V2) {
+        if (!compiledV2) throw new CompileWork();
+        return compiledV2;
+      }
       return compile(o);
     }
     const s = runState(state);
@@ -311,6 +361,9 @@ export async function dispatch(command, options = {}) {
       const n = getNode(s, o.node);
       switch (command) {
         case "claim": {
+          if (s.schemaVersion === STATE_SCHEMA_V2 && n.kind === "write") {
+            throw graphError(V2_WRITE_ERROR, "v2 write claims are not enabled");
+          }
           if (o.expectedRev !== s.graphRev) throw graphError("ERR_STALE_GRAPH_REV", "Graph revision changed");
           if (!pending(n, now) || !parentsAccepted(s, n)) throw notReady("Node or prerequisites not ready");
           const reason = capacity(s, n);
@@ -352,6 +405,10 @@ export async function dispatch(command, options = {}) {
   });
   try { return await commit(); }
   catch (err) {
+    if (err instanceof CompileWork) {
+      compiledV2 = await compile(o);
+      return commit();
+    }
     if (!(err instanceof GateWork)) throw err;
     // Reserve the external side effect before releasing the journal mutex. A lost
     // verifier is not safe to repeat: an operator can fence it with an amendment.
@@ -401,6 +458,9 @@ function observeHost(s, n, o) {
   const event = o.telemetry?.canaryEvent;
   const kinds = new Map([["load_failure", "loadFailures"], ["suspect", "suspects"], ["recovered", "recoveries"]]);
   if (kinds.has(event)) captureCanary(s, kinds.get(event));
+  if (o.telemetry?.dispatch === "headless-process" && o.telemetry.usageSource === "host-json") {
+    n.attempt.usageSource = "host-json";
+  }
   if (o.telemetry?.usage) n.attempt.observedUsage = { ...n.attempt.observedUsage,
     ...Object.fromEntries(["inputTokens", "outputTokens", "costUsd"].filter(k =>
       Number.isFinite(o.telemetry.usage[k]) && o.telemetry.usage[k] >= 0).map(k => [k, o.telemetry.usage[k]])) };

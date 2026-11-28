@@ -1,6 +1,9 @@
+// allow: SIZE_OK - protocol record schemas and their shared parsing vocabulary.
 import { isAbsolute } from 'node:path';
 
 export const SCHEMA_VERSION = 1;
+export const STATE_SCHEMA_V2 = 2;
+export const isRunSchemaVersion = value => value === SCHEMA_VERSION || value === STATE_SCHEMA_V2;
 export const V2_WRITE_ERROR = 'ERR_V2_WRITE_INTEGRATION_NOT_ENABLED';
 
 export function graphError(code, message) {
@@ -79,6 +82,27 @@ const oneOf = (...values) => (value, label) => {
 };
 const fields = schema => (value, label) => { object(value, label); validateFields(value, schema, label); };
 const positive = (value, label) => safeInteger(value, label, 1);
+const maxWorktrees = (value, label) => {
+  if (positive(value, label) > 64) throw schemaError(`${label} must not exceed 64`);
+};
+const integrationPolicy = fields({ B0: oneOf(1), Bmax: oneOf(1), K: oneOf(5), maxOpenWorktrees: maxWorktrees });
+const sealPolicy = fields({ maxChangedPaths: positive, maxBlobBytes: positive, allowSymlinks: oneOf(true, false) });
+
+export function normalizeV2Policy(input = {}, defaultMaxOpenWorktrees) {
+  object(input, 'policy');
+  const { integration = {}, seal = {} } = input;
+  object(integration, 'policy.integration');
+  object(seal, 'policy.seal');
+  const policy = {
+    ...input,
+    integration: { B0: 1, Bmax: 1, K: 5, ...integration,
+      maxOpenWorktrees: Object.hasOwn(integration, 'maxOpenWorktrees') ? integration.maxOpenWorktrees : defaultMaxOpenWorktrees },
+    seal: { maxChangedPaths: 2000, maxBlobBytes: 1048576, allowSymlinks: false, ...seal },
+  };
+  integrationPolicy(policy.integration, 'policy.integration');
+  sealPolicy(policy.seal, 'policy.seal');
+  return policy;
+}
 
 export function normalizeGateCommand({ gateArgv, timeoutMs }) {
   const policy = {};
@@ -152,6 +176,45 @@ const provenance = fields({
   })), edgeCases: items(object), failureEvidence: items(object),
 });
 const workerClaim = { workerReportedStatus: oneOf('completed'), inlineSummary: string, provenance };
+const integrationStatuses = ['sealed', 'integrating', 'held_conflict', 'held_integration'];
+const worktreeLocation = { path: absolute, lockReason: nonempty, phase: oneOf('planned', 'ready', 'released') };
+const worktreeRecord = value => {
+  const label = 'Run.worktrees entry';
+  object(value, label);
+  const attemptField = value.kind === 'candidate' ? optional : validator => validator;
+  validateFields(value, { ...worktreeLocation, kind: oneOf('worker', 'candidate'), tmpDir: absolute,
+    nodeId: attemptField(nonempty), epoch: attemptField(positive), instructionPath: attemptField(absolute),
+    directiveDigest: attemptField(hash), settled: oneOf(true, false),
+  }, label);
+};
+const candidateId = matching(/^g[0-9]+(?:\.[0-9]+)+$/);
+const candidateItems = (validate, min = 1) => (value, label) => {
+  items(validate)(value, label);
+  if (value.length < min || value.length > 1) throw schemaError(`${label} exceeds the M2 candidate size`);
+};
+const integrationCandidate = {
+  ...records.IntegrationCandidate, candidateId, generation: safeInteger, gateKey: nullable(hash), promotionOp: nonempty,
+  orderedAttempts: candidateItems(producer), workerOids: candidateItems(gitOid), pinRefs: candidateItems(nonempty),
+  checkReceiptIds: candidateItems(hash, 0),
+  state: oneOf('built', 'gating', 'green', 'red', 'bisecting', 'published', 'discarded'), measuredUri: optional(casAddress),
+};
+const publishIntent = fields({
+  promotionOp: nonempty, ref: nonempty, old: gitOid, new: gitOid, candidateId, generation: safeInteger, requestDigest: hash,
+});
+const entries = validate => (value, label) => {
+  object(value, label);
+  for (const [id, record] of Object.entries(value)) validate(record, id);
+};
+const v2Run = {
+  startBase: gitOid, acceptedTip: nullable(gitOid), integrationGeneration: safeInteger, integrationRef: nonempty,
+  repoConfigDigest: hash, worktrees: entries(worktreeRecord), candidates: entries((value, id) => {
+    validateRuntime('IntegrationCandidate', value);
+    if (value.candidateId !== id) throw schemaError('Candidate does not match its persisted identity');
+  }),
+  worktreeInclude: items(nonempty), checkoutBytes: safeInteger, pendingPublish: nullable(publishIntent),
+  lastPublished: nullable(publishIntent), publishRepairs: safeInteger,
+  policy: fields({ integration: integrationPolicy, seal: sealPolicy }),
+};
 const runtimeRecords = {
   Run: {
     runId, workspace: absolute, graphRev: positive, status: runStatus, nodes: object,
@@ -164,7 +227,7 @@ const runtimeRecords = {
   Node: {
     id: nonempty, logicalId: nonempty, kind: nodeKind, status: oneOf('pending', 'claimed', 'running',
       'accepted', 'retry_wait', 'fresh_reset_ready', 'held_blocked', 'held_infra', 'held_upstream',
-      'failed_logic', 'held_flaky', 'superseded_by_repair'),
+      'failed_logic', 'held_flaky', 'superseded_by_repair', ...integrationStatuses),
     highestIssuedEpoch: safeInteger, infraRetries: safeInteger, topoRank: safeInteger, topologicalRank: safeInteger,
     estimatedMinutes: positive, priority: (value, label) => safeInteger(value, label, Number.MIN_SAFE_INTEGER),
     dependsOn: items(nonempty), inputUris: optional(items(casAddress)), attempt: nullable(object),
@@ -178,6 +241,13 @@ const runtimeRecords = {
     receiptPhase: oneOf('prepared', 'delivered', 'checked'), hostHandle: optional(nonempty),
     settleOp: optional(nonempty), verifierOp: optional(nonempty), verificationStartedAtMs: optional(safeInteger),
     gateLogUri: optional(casAddress), deliveredUri: optional(casAddress),
+    usageSource: optional(oneOf('host-json')), baseSha: optional(gitOid),
+    worktree: optional(fields({ id: nonempty, ...worktreeLocation })), tmpDir: optional(absolute),
+    inboxPath: optional(absolute), repoConfigDigest: optional(hash), claimSec: optional(safeInteger),
+    includeManifest: optional(items(fields({ path: nonempty, sha256: hash, mode: safeInteger }))),
+    sealedCommit: optional(gitOid), sealedTree: optional(gitOid), scopeDiffDigest: optional(hash), pinRef: optional(nonempty),
+    sealFailure: optional(fields({ code: nonempty, violations: optional(items(fields({ path: nonempty, reason: nonempty }))) })),
+    candidateId: optional(candidateId),
   },
   Receipt: {
     ...workerClaim, workerClaim: fields(workerClaim), gateEvidence: fields({ logUri: casAddress }),
@@ -191,12 +261,14 @@ const runtimeRecords = {
       maxInlineBytesPerNode: safeInteger, maxInlineBytesPerWave: safeInteger,
     }),
   },
+  IntegrationCandidate: integrationCandidate,
 };
 const runtimeKeys = {
   Run: ['workspace', 'nodes', 'attemptsIssued'],
   Node: ['id', 'logicalId', 'highestIssuedEpoch'],
   Attempt: ['instructionPath', 'nonceHash', 'receiptPhase'],
   Receipt: ['workerClaim', 'verifierEvidence', 'gateEvidence'],
+  IntegrationCandidate: ['generation'],
 };
 
 function validateFields(value, fields, label) {
@@ -211,21 +283,31 @@ function validateVersion(name, value, required) {
   }
 }
 
-function validateRuntime(name, value) {
+function validateRuntime(name, value, runVersion = SCHEMA_VERSION) {
   object(value, name);
-  validateVersion(name, value, true);
+  if (name === 'Run') {
+    if (!isRunSchemaVersion(value.schemaVersion)) throw schemaError('Unknown run schema version');
+  } else validateVersion(name, value, name !== 'IntegrationCandidate');
   validateFields(value, runtimeRecords[name], name);
   if (name === 'Run') {
+    if (value.schemaVersion === STATE_SCHEMA_V2) {
+      validateFields(value, v2Run, name);
+    }
     for (const [id, node] of Object.entries(value.nodes)) {
-      validateRuntime('Node', node);
+      validateRuntime('Node', node, value.schemaVersion);
       if (node.id !== id || (node.attempt && (node.attempt.runId !== value.runId || node.attempt.graphRev > value.graphRev))) {
         throw schemaError(`Run.nodes[${JSON.stringify(id)}] does not match its persisted identity`);
       }
     }
-  } else if (name === 'Node' && value.attempt) {
-    validateRuntime('Attempt', value.attempt);
-    if (value.attempt.nodeId !== value.id || value.attempt.epoch > value.highestIssuedEpoch) {
-      throw schemaError('Node.attempt does not match its persisted identity');
+  } else if (name === 'Node') {
+    if (integrationStatuses.includes(value.status) && (runVersion !== STATE_SCHEMA_V2 || value.kind !== 'write')) {
+      throw schemaError('Integration-only status requires a v2 write node');
+    }
+    if (value.attempt) {
+      validateRuntime('Attempt', value.attempt);
+      if (value.attempt.nodeId !== value.id || value.attempt.epoch > value.highestIssuedEpoch) {
+        throw schemaError('Node.attempt does not match its persisted identity');
+      }
     }
   } else if (name === 'Receipt' && (value.verifierEvidence.logUri !== value.gateEvidence.logUri
       || value.verifierEvidence.subjectDigest !== value.provenance.factDigest)) {

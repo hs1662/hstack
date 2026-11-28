@@ -1,5 +1,6 @@
+// allow: SIZE_OK - graph admission shares dependency analysis across v1 coalescing and v2 scheduling.
 import { graphError, immutable, isRecord, nonempty, normalizeGateCommand,
-  normalizeVolatility, safeInteger, schemaError, SCHEMA_VERSION, V2_WRITE_ERROR } from './schema.mjs';
+  normalizeVolatility, safeInteger, schemaError, isRunSchemaVersion, STATE_SCHEMA_V2, V2_WRITE_ERROR } from './schema.mjs';
 
 const defaults = Object.freeze({
   maxNodes: 256, maxWidth: 64, maxDepth: 64, readConcurrency: 6,
@@ -41,7 +42,7 @@ function strings(value, label) {
   return Array.from(value, entry => nonempty(entry, label));
 }
 
-function pathSet(value, label) {
+export function pathSet(value, label) {
   return uniqueSorted(strings(value, label).map(path => {
     if (path === '.') return path;
     const relative = path.replace(/\/$/, '');
@@ -53,15 +54,18 @@ function pathSet(value, label) {
   }));
 }
 
-function normalizeNode(input) {
+function normalizeNode(input, schemaVersion) {
   if (!isRecord(input)) throw schemaError('node must be an object');
-  if (Object.hasOwn(input, 'schemaVersion') && input.schemaVersion !== SCHEMA_VERSION) {
-    throw schemaError(`node.schemaVersion must be ${SCHEMA_VERSION}`);
+  if (Object.hasOwn(input, 'schemaVersion') && input.schemaVersion !== schemaVersion) {
+    throw schemaError(`node.schemaVersion must be ${schemaVersion}`);
   }
   const id = nonempty(input.id, 'node.id');
   const kind = input.kind;
   if (kind === 'integrate') throw v2Error(`integration is reserved for v2: ${id}`);
   if (!['read', 'verify', 'reducer', 'write'].includes(kind)) throw schemaError(`invalid kind for ${id}`);
+  if (schemaVersion === STATE_SCHEMA_V2 && kind === 'write' && input.gateArgv === undefined) {
+    throw schemaError('v2 write nodes need gateArgv');
+  }
   const deps = strings(input.dependsOn ?? [], `${id}.dependsOn`);
   const dependsOn = uniqueSorted(deps);
   if (deps.length !== dependsOn.length) throw duplicate(`duplicate dependency for ${id}`);
@@ -234,15 +238,16 @@ function coalesce(ordered, ancestry) {
 }
 
 export function compileGraph(spec) {
-  if (!isRecord(spec) || spec.schemaVersion !== SCHEMA_VERSION) throw schemaError('graph schemaVersion must be 1');
+  if (!isRecord(spec) || !isRunSchemaVersion(spec.schemaVersion)) throw schemaError('graph schemaVersion must be 1 or 2');
+  const { schemaVersion } = spec;
   if (!Array.isArray(spec.nodes) || spec.nodes.length === 0) throw schemaError('graph must have at least one node');
   const limits = normalizeLimits(spec.limits);
   if (spec.nodes.length > limits.maxNodes) throw limitError(`graph count exceeds ${limits.maxNodes}`);
-  const original = analyze(Array.from(spec.nodes, normalizeNode), limits);
+  const original = analyze(Array.from(spec.nodes, node => normalizeNode(node, schemaVersion)), limits);
   if (width(original.ordered.map(node => node.id), original.ancestry) > limits.maxWidth) {
     throw limitError(`graph width exceeds ${limits.maxWidth}`);
   }
-  const normalized = coalesce(original.ordered, original.ancestry);
+  const normalized = schemaVersion === STATE_SCHEMA_V2 ? original.ordered : coalesce(original.ordered, original.ancestry);
   const analysis = normalized === original.ordered ? original : analyze(normalized, limits);
   const { ordered: nodes, ancestry, estimatedMinutes, criticalPathMinutes } = analysis;
   const nodeCount = nodes.length;
@@ -257,5 +262,5 @@ export function compileGraph(spec) {
   const recommendation = f >= limits.minParallelFraction && d < limits.maxEdgeDensity
     && estimatedMinutes >= limits.minEstimatedMinutes && independent >= limits.minIndependent
     && limits.readConcurrency >= 2 ? 'dag_approved' : 'single_session';
-  return immutable({ schemaVersion: SCHEMA_VERSION, nodes, metrics, limits, recommendation });
+  return immutable({ schemaVersion, nodes, metrics, limits, recommendation });
 }

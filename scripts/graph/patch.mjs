@@ -2,7 +2,7 @@ import { compileGraph } from './admission.mjs';
 import { artifactDigest, canonical, crossRunCacheDisabled } from './fingerprint.mjs';
 import { markDirty } from './incremental.mjs';
 import { captureFinish } from './metrics.mjs';
-import { graphError, immutable, isRecord, safeInteger, V2_WRITE_ERROR } from './schema.mjs';
+import { graphError, immutable, isRecord, isRunSchemaVersion, safeInteger, STATE_SCHEMA_V2, V2_WRITE_ERROR } from './schema.mjs';
 
 const invalid = message => graphError('ERR_GRAPH_PATCH', message);
 const retired = 'superseded_by_repair';
@@ -117,11 +117,17 @@ async function repair(state, source, patch, io) {
 
 // Traverse the newly admitted DAG in topological order. Invalidating only direct
 // consumers leaves old grandchild tokens (and previously accepted results) valid.
-function invalidate(node, reuse) {
+function invalidate(state, node, reuse) {
   // Fencing a token cannot stop a host that is already writing to the v1
   // workspace. Its slot must stay occupied until the host settles the attempt.
-  if (node.kind === 'write' && ['claimed', 'running'].includes(node.status)) {
+  if (state.schemaVersion !== STATE_SCHEMA_V2 && node.kind === 'write' && ['claimed', 'running'].includes(node.status)) {
     throw graphError(V2_WRITE_ERROR, 'cannot invalidate an active workspace writer');
+  }
+  if (node.status === 'integrating') {
+    for (const candidate of Object.values(state.candidates)) {
+      if (candidate.orderedAttempts.some(attempt => attempt.nodeId === node.id &&
+          attempt.epoch === node.attempt?.epoch)) candidate.state = 'discarded';
+    }
   }
   if (node.highestIssuedEpoch > 0 || node.attempt) {
     node.highestIssuedEpoch = safeInteger(node.highestIssuedEpoch + 1, 'fencing epoch', 1);
@@ -132,6 +138,11 @@ function invalidate(node, reuse) {
   for (const key of ['revalidateReceiptUri', 'notBefore', 'handoffCarryoverUri', 'reductionUri', 'workerReceiptUri']) {
     delete node[key];
   }
+  if (state.schemaVersion === STATE_SCHEMA_V2 && node.kind === 'write') {
+    delete node.sealedCommit;
+    delete node.conflict;
+    delete node.heldReason;
+  }
   if (reuse) node.revalidateReceiptUri = reuse;
 }
 
@@ -140,7 +151,7 @@ const commands = { expand: ['shards'], amend: ['exec', 'gate'], 'inject-repair':
 /** Compute one GraphPatched WAL transaction; never publish or mutate the caller's state. */
 export async function applyPatch(previous, command, options, io) {
   if (!Object.hasOwn(commands, command)) throw invalid('unknown patch command');
-  if (previous?.schemaVersion !== 1) throw invalid('expected v1 run state');
+  if (!isRunSchemaVersion(previous?.schemaVersion)) throw invalid('expected supported run state');
   if (!Number.isSafeInteger(options.expectedRev) || options.expectedRev !== previous.graphRev) {
     throw graphError('ERR_STALE_GRAPH_REV', 'expectedRev does not match the current graph revision');
   }
@@ -170,7 +181,8 @@ export async function applyPatch(previous, command, options, io) {
       break;
   }
   const live = Object.values(state.nodes).filter(n => n.status !== retired);
-  const admitted = compileGraph({ schemaVersion: 1, limits: state.limits, nodes: live });
+  const admitted = compileGraph({ schemaVersion: state.schemaVersion, limits: state.limits,
+    nodes: state.schemaVersion === STATE_SCHEMA_V2 ? live.map(({ schemaVersion, ...spec }) => spec) : live });
   if (admitted.nodes.length !== live.length) throw graphError(V2_WRITE_ERROR, 'patch would merge live writer identities');
   const affected = markDirty(previous, state, [...new Set([source.id, target.id])]);
   const retiredAtMs = Date.now();
@@ -180,7 +192,7 @@ export async function applyPatch(previous, command, options, io) {
       if (node.attempt && ['claimed', 'running'].includes(node.status)) {
         captureFinish(state, { nodeId: node.id, atMs: retiredAtMs, outcome: 'superseded' });
       }
-      invalidate(node, node.id === target.id ? reuse : null);
+      invalidate(state, node, node.id === target.id ? reuse : null);
     }
     if (affected.has(node.id) || !Object.hasOwn(previous.nodes, node.id)) {
       Object.assign(node, spec, { volatile: crossRunCacheDisabled(state.hostProfile, spec.volatility) });
@@ -190,7 +202,7 @@ export async function applyPatch(previous, command, options, io) {
   state.metrics = admitted.metrics;
   state.recommendation = admitted.recommendation;
   const newGraphHash = artifactDigest({
-    schemaVersion: 1, nodes: admitted.nodes.map(n => pick(state.nodes[n.id], definition)),
+    schemaVersion: state.schemaVersion, nodes: admitted.nodes.map(n => pick(state.nodes[n.id], definition)),
     limits: state.limits, joinMembers: state.joinMembers, logicalOutputMap: state.logicalOutputMap,
   });
   const ops = [{ op: command, node: source.id, ...pick(patch, commands[command]) }];

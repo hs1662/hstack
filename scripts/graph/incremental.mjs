@@ -1,5 +1,5 @@
 import { artifactDigest, canonical, crossRunCacheDisabled } from './fingerprint.mjs';
-import { graphError, schemaError, SCHEMA_VERSION } from './schema.mjs';
+import { graphError, isRunSchemaVersion, schemaError, SCHEMA_VERSION } from './schema.mjs';
 
 const hash = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const lookup = (map, id) => Object.hasOwn(map, id) ? map[id] : null;
@@ -74,7 +74,7 @@ function discharge(state, parent) {
 
 /** Called only after trusted verification of the new receipt in the transaction draft. */
 export function recordVerified(state, node, checkedReceipt) {
-  if (state.schemaVersion !== SCHEMA_VERSION) throw schemaError('verification requires a v1 run');
+  if (!isRunSchemaVersion(state.schemaVersion)) throw schemaError('verification requires a supported run');
   if (!hash(node.execKey)) throw schemaError('verification requires the issued execution key');
   if (node.status !== 'accepted' || !hash(node.artifactDigest)) throw needsWork('missing verified artifact');
   const old = node.priorVerified ?? node.verifiedResult;

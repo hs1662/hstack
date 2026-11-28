@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// allow: SIZE_OK - CLI command and input parsing share one JSON protocol boundary.
 // Graph v1 command line: parses flags, resolves root/workspace, and prints exactly one JSON line per call.
 // The engine (state-machine.mjs dispatch) owns every state decision; this file only validates the boundary.
 //
@@ -154,6 +155,14 @@ const HOST_DATA = new Map([
         inputTokens: n, outputTokens: n,
         costUsd: (cost, l) => { if (!Number.isFinite(cost) || cost < 0) hostDataError("telemetry", `${l} must be a finite non-negative number`); },
       }),
+      usageSource: (source, label) => {
+        if (source !== "host-json" || value.dispatch !== "headless-process") {
+          hostDataError("telemetry", `${label} must be host-json with headless-process dispatch`);
+        }
+      },
+      dispatch: (dispatch, label) => {
+        if (!["headless-process", "subagent"].includes(dispatch)) hostDataError("telemetry", `${label} is not a known dispatch`);
+      },
       canaryEvent: (event, label) => {
         if (!["load_failure", "suspect", "recovered"].includes(event)) hostDataError("telemetry", `${label} is not a known canary event`);
       },
@@ -334,11 +343,13 @@ export function exitCodeFor(error) {
   return EXIT_CODES.engine;
 }
 
+function unavailableIntegration() {
+  fail("ERR_V2_WRITE_INTEGRATION_NOT_ENABLED", "integrate is only available for v2 runs");
+}
+
 async function execute(command, flags, { cwd, env, dispatch }) {
   const options = await buildOptions(flags, cwd);
-  if (command === "integrate") {
-    fail("ERR_V2_WRITE_INTEGRATION_NOT_ENABLED", "integrate is a v2 write-integration command and is not enabled in v1");
-  }
+  if (command === "integrate" && options.run === undefined) unavailableIntegration();
   if (command === "host-caps") {
     const [{ hostCaps }, { detectHost }] = await Promise.all([import("./host-bridge.mjs"), import("../host/host-adapter.mjs")]);
     return hostCaps(detectHost(env));
@@ -346,6 +357,15 @@ async function execute(command, flags, { cwd, env, dispatch }) {
   const paths = await resolveGraphPaths(options, { cwd, env });
   options.root = paths.root;
   options.workspace = paths.workspace;
+  if (command === "integrate") {
+    const [{ readState }, { STATE_SCHEMA_V2 }] = await Promise.all([import("./wal-store.mjs"), import("./schema.mjs")]);
+    const state = await readState(paths.root, options.run);
+    if (state?.schemaVersion !== STATE_SCHEMA_V2) unavailableIntegration();
+  }
+  if (Object.hasOwn(options.telemetry?.usage ?? {}, "costUsd")) {
+    const { detectHost } = await import("../host/host-adapter.mjs");
+    if (detectHost(env) === "antigravity") delete options.telemetry.usage.costUsd;
+  }
   if (command === "init") {
     // fs-guard validates both paths and registers the local exclude only for the exact repo fallback.
     const { initializeRoot } = await import("./fs-guard.mjs");

@@ -35,6 +35,7 @@ export const FAST = [
   "graph-run-roots.test.mjs",
   "graph-runtime-records.test.mjs",
   "graph-skill.test.mjs",
+  "graph-v2-schema.test.mjs",
   "graph-worktree.test.mjs",
   "host-mcp-session.test.mjs",
   "tiers.test.mjs",
