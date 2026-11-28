@@ -87,7 +87,9 @@ function amend(node, patch) {
 
 async function repair(state, source, patch, io) {
   const failure = source.receiptUri;
-  if (source.status !== 'failed_logic' || !cas(failure)) throw invalid('repair requires a failed node with CAS evidence');
+  if (!['failed_logic', 'held_conflict'].includes(source.status) || !cas(failure)) {
+    throw invalid('repair requires a failed node with CAS evidence');
+  }
   const depth = safeInteger(source.repairDepth ?? 0, 'repairDepth') + 1;
   if (depth > 2) throw graphError('ERR_REPAIR_DEPTH', 'maximum repair depth is two');
   if (Object.hasOwn(patch, 'prompt') && !text(patch.prompt)) throw invalid('invalid repair prompt');

@@ -112,6 +112,10 @@ async function gate(ctx, cid) {
     } finally { await release({ ...location, sealIndex: sealIndexPath(ctx.root, s.runId, id) }); }
     await transition(ctx, { type: "GateMeasured", opId: `@hstack-gate-proof/${ctx.opId}`, payload: ctx.payload }, async (state, io) => {
       const cand = state.candidates[cid], node = nodeOf(state, cand);
+      if (cand.state === "discarded") {
+        Object.assign(state.worktrees[id], { phase: "released", settled: true });
+        return { ...response(state, node, cid), discarded: true };
+      }
       if (cand.state !== "gating" || node.status !== "integrating" || node.attempt.candidateId !== cid) throw stale();
       cand.measuredUri = await put(io, { first, diagnostics });
       Object.assign(state.worktrees[id], { phase: "released", settled: true });
