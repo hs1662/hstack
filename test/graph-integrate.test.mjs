@@ -73,4 +73,39 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     assert.deepEqual(await f.integrate("no-work"), { status: "idle" });
     assert.deepEqual(await readFile(f.wal), before);
   });
+
+  test("patching an integrating writer while its candidate gate runs still releases the candidate worktree slot", async t => {
+    const gateGate = join(tmpdir(), `gate-pause-${process.pid}-${Date.now()}`);
+    const gateReady = `${gateGate}.ready`;
+    t.after(() => Promise.all([rm(gateGate, { force: true }), rm(gateReady, { force: true })]));
+    const script = [
+      `const fs = require("node:fs");`,
+      `fs.writeFileSync(${JSON.stringify(gateReady)}, "1");`,
+      `const start = Date.now();`,
+      `while (!fs.existsSync(${JSON.stringify(gateGate)}) && Date.now() - start < 5000) {}`,
+      `fs.accessSync("B");`,
+    ].join(" ");
+    const f = await fixture(t, [
+      writer("B", { gateArgv: [process.execPath, "-e", script] }),
+      writer("C"),
+    ]);
+    await f.seal("B");
+    await f.seal("C");
+    const integrating = f.integrate("int-b");
+    const waitReady = async () => {
+      for (let i = 0; i < 200; i++) {
+        try { await readFile(gateReady); return; } catch {}
+        await new Promise(r => setTimeout(r, 10));
+      }
+      throw new Error("candidate gate did not start");
+    };
+    await waitReady();
+    const s1 = await f.call("status");
+    await f.call("amend", { node: "B", expectedRev: s1.graphRev, opId: "amend-mid-gate", patch: { exec: { prompt: "Write B v2" } } });
+    await writeFile(gateGate, "go");
+    await integrating;
+    const after = await f.call("status");
+    assert.equal(after.worktrees["cand-g0.1"].phase, "released");
+    assert.equal(after.worktrees["cand-g0.1"].settled, true);
+  });
 }

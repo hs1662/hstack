@@ -363,6 +363,26 @@ test('inject-repair accepts an omitted patch via applyPatch and the public CLI',
   assert.equal(repaired.result.nodeId, 'a::repair::e1');
 });
 
+test('inject-repair accepts a held_conflict writer node and preserves its writeScope without conflict markers', async () => {
+  const s = graph(node('edit', {
+    schemaVersion: 1, kind: 'write', writeScope: ['src/app.mjs'], gateArgv: ['true'],
+    status: 'held_conflict', heldReason: 'ERR_MERGE_CONFLICT',
+    conflict: { paths: ['src/app.mjs'], messagesUri: uri },
+    receiptUri: uri, highestIssuedEpoch: 1, attempt: { epoch: 1, graphRev: 3, runId: 'demo', nodeId: 'edit' },
+  }));
+  s.schemaVersion = 2;
+  const { state, refs, response } = await mutate(s, 'inject-repair', 'edit', { prompt: 'resolve conflict in app.mjs' });
+  const repaired = state.nodes[response.nodeId];
+  assert.equal(response.nodeId, 'edit::repair::e1');
+  assert.equal(state.nodes.edit.status, 'superseded_by_repair');
+  assert.equal(repaired.kind, 'write');
+  assert.deepEqual(repaired.writeScope, ['src/app.mjs']);
+  assert.equal(repaired.failureReceiptUri, uri);
+  assert.equal(repaired.conflict, undefined);
+  assert.equal(repaired.heldReason, undefined);
+  assert.ok(refs.includes(uri));
+});
+
 function fileURLToPathForTest() {
   return new URL('../scripts/graph/cli.mjs', import.meta.url).pathname;
 }
