@@ -2,7 +2,7 @@
 
 [한국어](README.ko.md)
 
-`hstack` (v0.2.0) is a governance plugin for Antigravity CLI (`agy`) and Claude Code. It's built on Node.js 18+ ESM with zero npm dependencies. It combines a Korean-native thinking, UI, and response guard, a deterministic evidence-grounded completion gate with preflight vote-bypass enforcement, risk-tiered independent code auditing, fact-distilled cross-session handoff, and zero-command autonomous governance (`smart` mode) in one plugin. See [Dual-host surface (v0.2.0)](#dual-host-surface-v020) for how each host loads it.
+`hstack` (v0.3.0) is a governance plugin for Antigravity CLI (`agy`) and Claude Code. It's built on Node.js 18+ ESM with zero npm dependencies. It combines a Korean-native thinking, UI, and response guard, a deterministic evidence-grounded completion gate with preflight vote-bypass enforcement, risk-tiered independent code auditing, fact-distilled cross-session handoff, zero-command autonomous governance (`smart` mode), and the daemonless local POSIX graph workflow (`hstack:graph` v1) in one plugin. See [Dual-host surface](#dual-host-surface) for how each host loads it.
 
 ## Bundled components (Agy manifest)
 
@@ -12,7 +12,7 @@
 | `hooks` | `1` | `hstack-guard` in `hooks.json` (`PreInvocation`, `PreToolUse`, `PostInvocation`, `Stop`) |
 | `mcpServers` | `1` | `gate` in `mcp_config.json` (`verify_completion`, `manage_handoff`) |
 | `agents` | `3` | `hstack-auditor`, `hstack-worker`, `hstack-challenger` |
-| `skills` | `2` | `hstack-handoff`, `hstack-preflight` |
+| `skills` | `3` | `hstack-graph` (`hstack:hstack-graph` on Claude Code), `hstack-handoff`, `hstack-preflight` |
 
 ## Architecture
 
@@ -27,7 +27,7 @@
 
 ### Layer 2: deterministic evidence-grounded completion gate
 
-- Eager MCP server (`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.2.0"`) exposes `mcp_hstack_gate_verify_completion` (`verify_completion`) without requiring schema discovery turns.
+- Eager MCP server (`mcp_config.json`, `scripts/mcp/server.mjs`, `version: "0.3.0"`) exposes `mcp_hstack_gate_verify_completion` (`verify_completion`) without requiring schema discovery turns.
 - `PreToolUse` (`scripts/pre-tool-gate.mjs`) intercepts `^mcp_hstack_.*$` calls to return `decision: "auto_approve"`, set a Korean `toolSummary`, and inject hidden `_session` metadata (`conversationId`, `transcriptPath`, `cwd`) stripped before schema validation.
 - `scripts/governance/fact-ledger.mjs` and `scripts/governance/decide-gate.mjs` cross-check claimed `modified_files`, `inspected_files`, `verification_runs`, `unverified_scope`, and `self_assessment` against transcript read/write/execution/preflight/vote history and Git working tree state (`git status --porcelain`, `git diff --numstat`). Denied write calls (`PreToolUse` `deny`) and failed write tool steps (`ERROR`/`FAILED`) are excluded from `turnWrittenFiles`, `turnCodeWrittenFiles`, and `fileEditCounts`.
 - External MCP verification tools such as `mcp_agy-fast_fast_run_checks` (and `mcp_agy-fast_fast_apply_edits` / `mcp_agy-fast_apply_edits` for writes) are recognized directly in the ledger alongside `run_command`.
@@ -61,9 +61,18 @@
 	- Eager MCP tool `mcp_hstack_gate_manage_handoff` (`manage_handoff`) supports `save`, `load`, and `list` actions per workspace key (`computeWorkspaceKey`), combining distilled facts (`objective`, `verified_facts`, `failed_approaches`, `remaining_tasks`, `open_risks`) with machine evidence (Git branch, HEAD, dirty files, read/written files, verification runs) and flagging stale working trees on load.
 	- Context pollution tracking (`updateSessionPollutionState` in `scripts/post-invocation.mjs`) monitors `inputTokens`, failed executions in turn, and repeated single-file edit churn, appending a non-blocking `[컨텍스트 열화 주의]` notice to gate receipts when thresholds trip.
 
-## Dual-host surface (v0.2.0)
+## Dual-host surface
 
 One tree carries two manifests. Agy reads `plugin.json`, `hooks.json`, and `mcp_config.json`. Claude Code reads `.claude-plugin/plugin.json`, which references `./.claude-plugin/hooks.json`, `./.claude-plugin/mcp.json`, and the agent files in `./.claude-plugin/agents/` explicitly. Explicit paths keep Agy from flagging Claude's default `.mcp.json` and `hooks/hooks.json` locations. Sections above that name Agy tools (`invoke_subagent`, `PostInvocation`, `agy -p`) are Agy-only.
+
+### Daemonless graph workflow (`hstack:graph` v1)
+
+- **Skill surface (`skills/hstack-graph/`):** Registered as `hstack-graph` on Agy and `hstack:hstack-graph` on Claude Code, with CLI, example, mass fan-in, long-worker, recovery, and live-host references under `skills/hstack-graph/references/`.
+- **Local POSIX graph engine (`scripts/graph/*`):** Driven via short-lived `node .../scripts/graph/cli.mjs` calls (no background daemon):
+	- **Admission (`compile`):** DAG validation, topology limits, and single-session vs. `dag_approved` read fan-out recommendation.
+	- **Durable state & fencing:** Monotonic `epoch` fencing tokens (`claim`/`start`/`settle`), `fsync`-backed WAL (`wal-store.mjs`), tombstone lock reclamation (`lock.mjs`), IO-uncertain freeze, and CAS root-pin GC (`gc.mjs`).
+	- **Lossless fan-in (`mass`):** Up to 64 shards across shard → cluster reducer → final reducer (`mass.mjs`, `reducer.mjs`), returning `partial` with preserved missing/failure obligations whenever coverage is incomplete.
+	- **Dual budgets, canary integration & metrics:** Dynamic `W_eff` token or byte-mode wave/node budgets, canary `probe` and pinned `context_rot_abort` handoff carryover (`host-bridge.mjs`), and observed-only telemetry (`metrics.mjs`, reporting `null` when host usage isn't observed).
 
 ### Load and validate in Claude Code
 
@@ -318,17 +327,21 @@ node ./test/verify-live.mjs --models gemini-4-neon-xhigh
 
 `test/verify-live.mjs` executes each scenario in an isolated temporary `HOME` and app-data directory so global plugins cannot interfere and cleans up temporary logs on exit.
 
-### Measured baseline and release notes (v0.2.0)
+### Measured baseline and release notes (v0.3.0)
 
-These numbers were measured at `v0.2.0` on `main` (upgraded from the `v0.1.2` baseline of 149 suites / 760 tests on Agy only).
+These numbers were measured at `v0.3.0` on `main` (upgraded from the `v0.2.0` baseline of 153 suites / 817 tests).
 
-- Unit and integration suite: `env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs` passes **153 suites / 817 tests (`fail 0`)**, covering dual-host adapter and Claude Code transcript/hook/MCP session-reference contracts, workspace-scoped snapshot pins (`pin`/`unpin`/`list_pinned`/`clear`), `k=2`/`k=3` language canary with turn-1 `load_failure` separation, Claude `UserPromptSubmit` turn-snapshot binding, UI/PowerShell transcript tracking, and all existing governance, analyzer, and hardening suites.
-- Strict manifest validation (both hosts): `agy plugin validate --strict --json .` exits `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 2 }`. `claude plugin validate --strict --json .` exits `0` with `"success": true`, `0` errors, and `0` warnings.
-- Antigravity CLI isolated live suite (`test/verify-live.mjs`, `gemini-4-neon-xhigh`): `L1-golden-path`, `L3-bypass-stop-recovery`, `L5-high-risk-audit-pass`, and `L16-shell-edit-stop-gate` pass `4/4` with `drifted: 0` and `hookcaller` panics `0`.
-- Claude Code isolated live verification (`claude --plugin-dir`, v2.1.332): verified C1 (SessionStart rules load, namespaced MCP tools, one-use `_hstackContext` redemption and replay rejection), C2 (unverified `Stop` block and recovery, multi-call `--resume` distinct tokens), C3 (read-only `hstack:hstack-auditor` isolation with `Read`/`Glob`/`Grep` only, non-bypass of default permission checks, clean `Stop` on non-mutating and denied shells), and C4 (`load_failure`, `drift`, `suspect`, and `handoff_required` pinned snapshot lifecycle and gate non-interference via `claude.mjs` and `server.mjs`).
+- Unit and integration suite: `env -u PLUGIN_DATA -u PLUGIN_ROOT node --test test/*.test.mjs` passes **162 suites / 1,136 tests (`fail 0`)**, covering the `hstack:graph` v1 engine and skill walkthroughs (`test/graph-*.test.mjs`), dual-host adapter and Claude Code transcript/hook/MCP session-reference contracts, workspace-scoped snapshot pins (`pin`/`unpin`/`list_pinned`/`clear`), `k=2`/`k=3` language canary with turn-1 `load_failure` separation, Claude `UserPromptSubmit` turn-snapshot binding, UI/`PowerShell` transcript tracking, and all existing governance, analyzer, and hardening suites, including Node `18.20.8` startup and crash-recovery checks.
+- Strict manifest validation (both hosts): `agy plugin validate --strict --json .` exits `0` with `"findings": []` and `components: { agents: 3, hooks: 1, mcpServers: 1, rules: 1, sidecars: 0, skills: 3 }`. `claude plugin validate --strict --json .` exits `0` with `"success": true`, `0` errors, and `0` warnings.
+- Dual-host live session verification (`hstack:graph` v1 L1–L4 & independent audit): verified end-to-end across Agy `1.5.19` (isolated `HOME`/`PLUGIN_DATA`, real `invoke_subagent(research)` round-trip, forged/missing gate rejections, canary pin handoff and cross-session `manage_handoff` restore with stale-token exit `49`, `mass` `partial`/`complete` fan-in, `null` unobserved telemetry, and v2 exit `69` cutoff) and Claude Code `2.1.332` (`--plugin-dir`, real `Agent(Explore)` round-trip, `hstack-inline` `manage_handoff` cross-session restore with exit `49`, `mass` fan-in, and `69` cutoff), plus `[감사 판정: 통과]` from independent `hstack-auditor` reviews on both hosts.
+- Governance live baselines (v0.2.0): Antigravity CLI (`test/verify-live.mjs`, `gemini-4-neon-xhigh`) passed `L1`, `L3`, `L5`, and `L16` `4/4` (`drifted: 0`, `hookcaller` panics `0`), and Claude Code (`claude --plugin-dir`, v2.1.332) verified C1–C4.
 - Known limitations:
 	1. In Claude Code headless mode (`claude -p`), interactive `AskUserQuestion` selection UI and interactive permission prompts cannot be clicked directly. Claude `AskUserQuestion` answer normalization (`toolUseResult.answers` and `"User has answered your questions: ..."`) is verified in `test/claude-transcript.test.mjs`.
 	2. Claude Code writes `PreToolUse` `updatedInput` (including the one-use `_hstackContext` string) into its own session transcript (`hook_success.stdout`). The MCP server deletes the underlying token file immediately on redemption so replaying the recorded token always fails (`isError: true`), and `audit.jsonl` never logs the token.
 	3. On platforms without an OS `flock` binary (such as Windows or minimal containers), stale session lock reclamation falls back to an inode-verified `.reclaim` guard file under zero-dependency Node.js 18+.
+	4. **v1 write/integration cutoff:** parallel code `write` specs and `integrate` belong to v2 and fail closed in v1 with `ERR_V2_WRITE_INTEGRATION_NOT_ENABLED` (exit code `69`).
+	5. **Same-UID worker boundary:** `writeScope` and workspace-fallback directives are not OS sandboxes when workers share the user UID; untrusted workers require separate UID or container isolation.
+	6. **Claude Code Bash shell environment:** Claude Code injects `CLAUDE_PLUGIN_ROOT` and `CLAUDE_PLUGIN_DATA` into hooks and MCP servers rather than the Bash tool shell, so graph CLI calls in Claude Code must set them explicitly to match the hook/MCP data directory instead of falling back to `<workspace>/.hstack/graph`.
+	7. **Agy auditor read-only enforcement:** unlike Claude Code's host-enforced `tools: Read, Glob, Grep`, Agy `hstack-auditor` enforces read-only behavior at the prompt/hook level; verify pre/post `git status` and `git diff --stat` equivalence when auditing on Agy.
 
 See [Publishing guide](docs/PUBLISHING.md) for releases and [MIT License](LICENSE) for licensing.

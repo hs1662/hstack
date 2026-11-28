@@ -28,7 +28,7 @@ import { detectHost } from "../host/host-adapter.mjs";
 
 // Latest first. 2025-03-26 is what the Antigravity client sends; none of these needs batch requests from us.
 const SUPPORTED_PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"];
-const SERVER_INFO = { name: "hstack-gate", version: "0.2.0" };
+const SERVER_INFO = { name: "hstack-gate", version: "0.3.0" };
 const PUBLIC_ARG_KEYS = new Set([
   "modified_files",
   "inspected_files",

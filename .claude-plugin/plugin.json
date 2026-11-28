@@ -1,6 +1,6 @@
 {
   "name": "hstack",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Korean response and tool UI checks, evidence-based completion gating and session handoff.",
   "agents": ["./.claude-plugin/agents/hstack-auditor.md", "./.claude-plugin/agents/hstack-challenger.md", "./.claude-plugin/agents/hstack-worker.md"],
   "author": { "name": "hs1662" },
